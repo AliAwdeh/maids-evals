@@ -1,0 +1,52 @@
+You are given a single conversation (WhatsApp chat snippet) between the hiring chatbot and one Filipina applicant. Your task is to detect whether the applicant at any point expressed that they are no longer interested in the job. You must output exactly one JSON object with two boolean keys: `Found_Another_Job` and `Requested_Cancellation`. Output ONLY the JSON object and nothing else.
+
+Conversation format and parsing rules
+- Messages starting with `Consumer:` are from the applicant.
+- Messages starting with `Bot:` or `System:` or ‘Agent_1’ are from the chatbot/backend.
+- The literal word `null` represents a file/document sent.
+- The conversation is chronological: later lines were sent after earlier lines.
+- Ignore all `System:` messages for content and intent — do not treat them as applicant expressions.
+- Only inspect `Consumer:` messages for indications of no longer being interested.
+
+Definition of the two flags
+- Found_Another_Job (boolean)
+  - Set to true if the applicant explicitly or clearly indicates they have accepted or taken another job or been hired elsewhere. Examples of phrases that should set this to true:
+    - "I found another job", "I already got a job", "I accepted another offer", "I've joined another family", "I am working elsewhere now", "already hired", "I started a job", "I have another employer".
+  - This flag should capture clear statements of acceptance/employment elsewhere. Indirect but unambiguous phrases like "they hired me" or "I signed with another agency" should also count.
+
+- Requested_Cancellation (boolean)
+  - Set to true if the applicant explicitly or clearly withdraws interest or asks to cancel/stop the application for any reason OTHER THAN having found/accepted another job. Examples that should set this to true:
+    - "I am no longer interested", "please cancel my application", "I want to withdraw", "do not consider me", "I can't continue", "I don't want the job anymore", "I want to cancel the interview", "not interested anymore", "I need to cancel", "I will not proceed".
+  - Also includes reasons like family emergency, illness, travel constraints, unwillingness to move, refusal of job terms, or explicit request to not proceed — as long as the applicant did not state they took another job.
+
+Precedence and mutual-exclusion rule
+- Both flags must never be true at the same time.
+- If any applicant message meets the criteria for Found_Another_Job, set Found_Another_Job = true and Requested_Cancellation = false (Found_Another_Job takes precedence).
+- Otherwise, if any applicant message meets the criteria for Requested_Cancellation, set Requested_Cancellation = true and Found_Another_Job = false.
+- If neither condition is met anywhere in the visible snippet, set both flags to false.
+
+Ambiguous or NOT-to-be-flagged cases
+- Do NOT set either flag for tentative, ambiguous, or non-final statements such as:
+  - "I'm not available right now", "I am busy today", "call me later", "I will think about it", "maybe", "not sure", "can I postpone?", "I'll let you know", "I need time", "I might not be able to go".
+- Do NOT set flags for questions about the job or logistics (e.g., "How much is the salary?", "When is the interview?") unless the applicant explicitly withdraws or says they have another job.
+- Do NOT infer cancellation from silence or lack of response.
+
+Detection rules summary
+1. Scan all Consumer: messages in the snippet for explicit statements matching Found_Another_Job or Requested_Cancellation definitions above.
+2. If any message matches Found_Another_Job, set Found_Another_Job = true and Requested_Cancellation = false.
+3. Else if any message matches Requested_Cancellation, set Requested_Cancellation = true and Found_Another_Job = false.
+4. Else set both flags to false.
+
+Output format (strict)
+- Output exactly one JSON object and nothing else, with exactly these two keys (boolean values):
+  {
+    "Found_Another_Job": <true|false>,
+    "Requested_Cancellation": <true|false>
+  }
+
+Examples (for your understanding — do not include in final output)
+- Consumer: "I already got a job last week" → {"Found_Another_Job": true, "Requested_Cancellation": false}
+- Consumer: "Please cancel my application, I can't do this" → {"Found_Another_Job": false, "Requested_Cancellation": true}
+- Consumer: "I will think about it" → {"Found_Another_Job": false, "Requested_Cancellation": false}
+
+Now analyze the conversation and output only the required JSON object.

@@ -6,7 +6,7 @@ import secrets
 import time
 import csv
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import quote
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,12 +42,10 @@ serializer = URLSafeSerializer(SESSION_SECRET, salt="csv-runner")
 sessions: Dict[str, Dict[str, Any]] = {}
 
 OLLAMA_API_BASE = "https://ai.aliawdeh.com/api"
-OPENAI_API_BASE = "https://langcc.maidstech.ai/v1"
 # Cap concurrency to avoid overwhelming providers; frontend supplies default, backend enforces ceiling.
 MAX_REQUEST_WORKERS_CAP = max(1, int(os.getenv("MAX_REQUEST_WORKERS_CAP", "64")))
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 os.makedirs(PROMPTS_DIR, exist_ok=True)
-USAGE_LOG = os.path.join(os.path.dirname(__file__), "token_usage.txt")
 
 # Progress structure stored per session:
 # sessions[sid]["progress"] = {
@@ -143,13 +141,7 @@ def flatten_json(obj: Any, parent_key: str = "", sep: str = ".") -> Dict[str, An
             nk = f"{parent_key}{sep}{k}" if parent_key else str(k)
             out.update(flatten_json(v, nk, sep=sep))
     elif isinstance(obj, list):
-        # Flatten list items with indices to support arrays of objects
-        if obj and all(isinstance(x, dict) for x in obj):
-            for i, v in enumerate(obj):
-                nk = f"{parent_key}{sep}{i}" if parent_key else str(i)
-                out.update(flatten_json(v, nk, sep=sep))
-        else:
-            out[parent_key] = json.dumps(obj, ensure_ascii=False)
+        out[parent_key] = json.dumps(obj, ensure_ascii=False)
     else:
         out[parent_key] = obj
     return out
@@ -187,26 +179,6 @@ def _prompt_has_placeholder(prompt: str, names: List[str]) -> bool:
         if f"{{{name}}}" in prompt or f"{{{{{name}}}}}" in prompt:
             return True
     return False
-
-def _estimate_tokens(text: str) -> int:
-    # Rough estimate: ~4 chars per token
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
-
-def _log_usage(provider: str, model: str, input_text: str, output_text: str):
-    entry = {
-        "ts": datetime.utcnow().isoformat(),
-        "provider": provider,
-        "model": model,
-        "input_tokens": _estimate_tokens(input_text),
-        "output_tokens": _estimate_tokens(output_text),
-    }
-    try:
-        with open(USAGE_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
 
 def _safe_prompt_name(name: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", (name or "").strip())
@@ -263,7 +235,7 @@ def _coerce_bool(value: Any) -> Optional[bool]:
 # ----------------------------
 
 def call_openai(api_key: str, model: str, prompt: str) -> str:
-    client = OpenAI(api_key=api_key, base_url=OPENAI_API_BASE)
+    client = OpenAI(api_key=api_key)
     resp = client.responses.create(model=model, input=prompt)
     return resp.output_text  # SDK convenience for aggregated text :contentReference[oaicite:2]{index=2}
 
@@ -338,53 +310,6 @@ def progress_status(request: Request):
         "error": "",
     }
     resp = JSONResponse(prog)
-    set_session_cookie(resp, sid)
-    return resp
-
-@app.get("/usage")
-def usage(request: Request, days: str = "7"):
-    sid = get_or_create_session_id(request)
-    try:
-        days_int = int(days)
-    except Exception:
-        days_int = 7
-
-    since = None
-    if days_int > 0:
-        since = datetime.utcnow() - timedelta(days=days_int)
-
-    totals = {"input_tokens": 0, "output_tokens": 0}
-    by_model: Dict[str, Dict[str, int]] = {}
-    try:
-        with open(USAGE_LOG, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                ts = entry.get("ts")
-                if since and ts:
-                    try:
-                        if datetime.fromisoformat(ts) < since:
-                            continue
-                    except Exception:
-                        pass
-                model = entry.get("model") or "unknown"
-                inp = int(entry.get("input_tokens") or 0)
-                outp = int(entry.get("output_tokens") or 0)
-                totals["input_tokens"] += inp
-                totals["output_tokens"] += outp
-                if model not in by_model:
-                    by_model[model] = {"input_tokens": 0, "output_tokens": 0}
-                by_model[model]["input_tokens"] += inp
-                by_model[model]["output_tokens"] += outp
-    except FileNotFoundError:
-        pass
-
-    resp = JSONResponse({"totals": totals, "by_model": by_model})
     set_session_cookie(resp, sid)
     return resp
 
@@ -525,6 +450,27 @@ def home(request: Request):
         "Given this row:\n{{row_json}}\n\nReturn JSON with keys: status, note.",
     )
 
+    display_index = idx + 1 if row is not None else 0
+    total_all = len(results)
+    key_options = ['<option value="">All attributes</option>'] + [
+        f'<option value="{html_escape(k)}" {"selected" if k == filter_key else ""}>{html_escape(k)}</option>'
+        for k in detected_keys
+    ]
+    val_options = [
+        ('', 'Any value'),
+        ('true', 'True'),
+        ('false', 'False'),
+    ]
+    val_options_html = "\n".join(
+        [
+            f'<option value="{v}" {"selected" if v == filter_val else ""}>{label}</option>'
+            for v, label in val_options
+        ]
+    )
+    filter_qs = ""
+    if filter_key and target_bool is not None:
+        filter_qs = f"&key={quote(filter_key)}&val={quote(filter_val)}"
+
     page = f"""
 <!doctype html>
 <html>
@@ -644,8 +590,8 @@ def home(request: Request):
 
         <div id="model-text-wrapper">
           <label>Model</label>
-          <input type="text" name="model" id="model-input" value="{html_escape(sess.get('model', 'gpt-5-mini'))}" />
-          <div class="small">Examples: OpenAI gpt-5-mini, Gemini gemini-2.5-flash.</div>
+          <input type="text" name="model" id="model-input" value="{html_escape(sess.get('model', 'gpt-4o-mini'))}" />
+          <div class="small">Examples: OpenAI gpt-4o-mini, Gemini gemini-2.5-flash.</div>
         </div>
 
         <div id="model-select-wrapper" style="display:none;">
@@ -657,7 +603,7 @@ def home(request: Request):
         </div>
 
         <label>API Key (stored only in this browser session)</label>
-        <input type="password" name="api_key" value="{html_escape(sess.get('api_key', ''))}" placeholder="Required for OpenAI via langcc.maidstech.ai or Gemini. Leave empty for Ollama." />
+        <input type="password" name="api_key" value="{html_escape(sess.get('api_key', ''))}" placeholder="Required for OpenAI/Gemini. Leave empty for Ollama." />
 
         <label>Max concurrent requests</label>
         <input type="number" name="max_workers" value="{html_escape(str(sess.get('max_workers', 16)))}" min="1" max="{MAX_REQUEST_WORKERS_CAP}" />
@@ -702,23 +648,6 @@ def home(request: Request):
       <div style="margin-top:12px;">
         <a href="/export"><button>{"Open export options" if has_csv else "Export (upload first)"}</button></a>
       </div>
-    </div>
-  </div>
-  <div class="row" style="margin-top:24px;">
-    <div class="card">
-      <h3>Token Usage</h3>
-      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-        <label style="margin:0;">Days</label>
-        <select id="usage-days" style="width:140px;">
-          <option value="1">Last 1 day</option>
-          <option value="7" selected>Last 7 days</option>
-          <option value="30">Last 30 days</option>
-          <option value="0">All time</option>
-        </select>
-        <button type="button" id="usage-refresh" style="background:#0f766e;">Refresh</button>
-      </div>
-      <div class="small" id="usage-summary" style="margin-top:8px;"></div>
-      <div id="usage-table" style="margin-top:10px;"></div>
     </div>
   </div>
   <div class="overlay" id="progress-overlay">
@@ -779,10 +708,6 @@ def home(request: Request):
       const promptLoad = document.getElementById("prompt-load");
       const promptSave = document.getElementById("prompt-save");
       const promptStatus = document.getElementById("prompt-status");
-      const usageDays = document.getElementById("usage-days");
-      const usageRefresh = document.getElementById("usage-refresh");
-      const usageSummary = document.getElementById("usage-summary");
-      const usageTable = document.getElementById("usage-table");
       const chips = Array.from(document.querySelectorAll(".col-chip"));
       const runForm = document.getElementById("run-form");
       const apiKeyInput = runForm?.querySelector('input[name="api_key"]');
@@ -872,7 +797,7 @@ def home(request: Request):
           modelInput.disabled = false;
           modelSelect.disabled = true;
           if (!modelInput.value) {{
-            modelInput.value = "gpt-5-mini";
+            modelInput.value = "gpt-4o-mini";
           }}
         }}
       }}
@@ -1030,44 +955,6 @@ def home(request: Request):
           }}
         }});
       }}
-
-      async function loadUsage() {{
-        if (!usageDays || !usageSummary || !usageTable) return;
-        const days = usageDays.value || "7";
-        try {{
-          const resp = await fetch(`/usage?days=${{encodeURIComponent(days)}}`, {{ credentials: "same-origin" }});
-          const data = await resp.json();
-          const totals = data?.totals || {{ input_tokens: 0, output_tokens: 0 }};
-          const byModel = data?.by_model || {{}};
-          usageSummary.textContent = `Input tokens: ${{totals.input_tokens}} • Output tokens: ${{totals.output_tokens}}`;
-          const rows = Object.entries(byModel).map(([model, t]) => {{
-            return `<tr><td>${{model}}</td><td>${{t.input_tokens || 0}}</td><td>${{t.output_tokens || 0}}</td></tr>`;
-          }}).join("");
-          if (rows) {{
-            usageTable.innerHTML = `
-              <table style="width:100%; border-collapse:collapse; background:white;">
-                <thead>
-                  <tr>
-                    <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 8px;">Model</th>
-                    <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 8px;">Input tokens</th>
-                    <th style="text-align:left;border-bottom:1px solid #e5e7eb;padding:6px 8px;">Output tokens</th>
-                  </tr>
-                </thead>
-                <tbody>${{rows}}</tbody>
-              </table>
-            `;
-          }} else {{
-            usageTable.innerHTML = "<div class='small'>No usage data yet.</div>";
-          }}
-        }} catch (e) {{
-          usageSummary.textContent = "Failed to load usage.";
-          usageTable.innerHTML = "";
-        }}
-      }}
-
-      if (usageRefresh) usageRefresh.addEventListener("click", loadUsage);
-      if (usageDays) usageDays.addEventListener("change", loadUsage);
-      loadUsage();
 
       window.addEventListener("visibilitychange", () => {{
         if (document.visibilityState === "hidden") {{
@@ -1312,7 +1199,6 @@ async def run(
             text = ""
             err = str(e)
         latency = round(time.time() - t0, 3)
-        _log_usage(provider, model, prompt, text)
 
         out: Dict[str, Any] = {c: row.get(c) for c in csv_cols}
         out["llm_output"] = text
@@ -1457,7 +1343,6 @@ async def test_one(
         t0 = time.time()
         text = call_provider(provider, api_key.strip(), model.strip(), prompt, json_mode=(json_mode == "1"))
         latency = round(time.time() - t0, 3)
-        _log_usage(provider, model, prompt, text)
         parsed, _ = try_parse_json(text)
         if parsed is not None:
             pretty_text = json.dumps(parsed, ensure_ascii=False, indent=2)
@@ -2025,26 +1910,6 @@ def review(request: Request, idx: int = 0, key: str = "", val: str = ""):
 
     prev_idx = max(0, idx - 1) if total > 0 else 0
     next_idx = min(total - 1, idx + 1) if total > 0 else 0
-    display_index = idx + 1 if row is not None else 0
-    total_all = len(results)
-    key_options = ['<option value="">All attributes</option>'] + [
-        f'<option value="{html_escape(k)}" {"selected" if k == filter_key else ""}>{html_escape(k)}</option>'
-        for k in detected_keys
-    ]
-    val_options = [
-        ('', 'Any value'),
-        ('true', 'True'),
-        ('false', 'False'),
-    ]
-    val_options_html = "\n".join(
-        [
-            f'<option value="{v}" {"selected" if v == filter_val else ""}>{label}</option>'
-            for v, label in val_options
-        ]
-    )
-    filter_qs = ""
-    if filter_key and target_bool is not None:
-        filter_qs = f"&key={quote(filter_key)}&val={quote(filter_val)}"
 
     page = f"""
 <!doctype html>
