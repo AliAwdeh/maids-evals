@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}History · Maids Evals{% endblock %}
+{% block body %}
+  <h1>Your history</h1>
+  <p class="lede">Only batches you ran. Other people’s runs are not listed, and they cannot open yours.</p>
+  <form class="search" method="get" action="/runs">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search name, prompt, provider, date…" />
+    <button type="submit" class="secondary">Search</button>
+  </form>
+  {% if runs %}
+  <table class="plain">
+    <thead>
+      <tr>
+        <th>Run</th>
+        <th>Provider / model</th>
+        <th>Prompt</th>
+        <th>Rows</th>
+        <th>Failures</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td>
+          <strong>{{ run.title }}</strong>
+          <div class="small">{{ run.created }} · {{ run.run_id }}</div>
+        </td>
+        <td>{{ run.provider }}<div class="small">{{ run.model }}</div></td>
+        <td>{{ run.prompt_name or "—" }}</td>
+        <td>{{ run.row_count }}</td>
+        <td>{{ run.failed_count }}</td>
+        <td>
+          <form action="/runs/{{ run.run_id }}/open" method="post" style="display:inline;">
+            <button type="submit">Open</button>
+          </form>
+          <a class="btn secondary" href="/runs/{{ run.run_id }}/download/output">CSV</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="card empty">No matching runs. Finish a batch on New run and it will land here.</div>
+  {% endif %}
+{% endblock %}

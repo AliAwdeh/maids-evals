@@ -1,0 +1,9 @@
+{
+  "_comment": "Shape reference for extra users in users.json. The site admin is ADMIN_USERNAME / ADMIN_TOKEN in .env, not this file. Do not commit users.json.",
+  "users": [
+    {
+      "username": "ali",
+      "token_hash": "sha256:replace-with-output-from-manage_users"
+    }
+  ]
+}

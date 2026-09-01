@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Log in · Maids Evals</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login-card" method="post" action="/login" autocomplete="on">
+      <div class="mark">Maids Evals</div>
+      <p class="lede">This tool is locked. Enter the username and access token you were given. Without them, nothing on this platform is reachable.</p>
+      {% if error %}
+      <p class="flash-err">{{ error }}</p>
+      {% endif %}
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" required autofocus />
+      <label for="password">Access token</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <p class="small">Your browser can save this as the site login (Apple Passwords, Google Password Manager, or Bitwarden). It is not your LLM API key.</p>
+      <div class="actions">
+        <button type="submit">Enter</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>

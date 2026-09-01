@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Stats · Maids Evals{% endblock %}
+{% block body %}
+  <div class="actions" style="margin-bottom:12px;">
+    <a class="btn secondary" href="/export">Back to results</a>
+    {% if stats_filter_key %}
+    <form action="/stats" method="post">
+      {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
+      <input type="hidden" name="stats_date_col" value="{{ stats_date_col }}" />
+      <input type="hidden" name="stats_date_from" value="{{ stats_date_from }}" />
+      <input type="hidden" name="stats_date_to" value="{{ stats_date_to }}" />
+      <button type="submit" class="secondary">Clear stat filter</button>
+    </form>
+    {% endif %}
+  </div>
+  <h1>Stats</h1>
+  <section class="card">
+    <form action="/stats" method="post">
+      {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
+      <div class="grid-3">
+        <div>
+          <label>Date column</label>
+          <select name="stats_date_col">
+            <option value="">No date filter</option>
+            {% for col in csv_cols %}
+            <option value="{{ col }}" {% if col == stats_date_col %}selected{% endif %}>{{ col }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>From</label>
+          <input type="date" name="stats_date_from" value="{{ stats_date_from }}" />
+        </div>
+        <div>
+          <label>To</label>
+          <input type="date" name="stats_date_to" value="{{ stats_date_to }}" />
+        </div>
+      </div>
+      <div class="actions"><button type="submit">Apply filter</button></div>
+    </form>
+  </section>
+  <table class="plain" style="margin-top:16px;">
+    <thead>
+      <tr>
+        <th>JSON key</th>
+        <th>Rows</th>
+        <th>True</th>
+        <th>False</th>
+        <th>% True</th>
+        <th>% False</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in stat_rows %}
+      <tr>
+        <td>{{ row.key }}</td>
+        <td>{{ total_rows }}</td>
+        <td>
+          <form action="/stats" method="post" style="display:inline;">
+            {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
+            <input type="hidden" name="stats_date_col" value="{{ stats_date_col }}" />
+            <input type="hidden" name="stats_date_from" value="{{ stats_date_from }}" />
+            <input type="hidden" name="stats_date_to" value="{{ stats_date_to }}" />
+            <input type="hidden" name="stats_filter_key" value="{{ row.key }}" />
+            <input type="hidden" name="stats_filter_val" value="true" />
+            <button type="submit" class="secondary">{{ row.true_count }}</button>
+          </form>
+        </td>
+        <td>
+          <form action="/stats" method="post" style="display:inline;">
+            {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
+            <input type="hidden" name="stats_date_col" value="{{ stats_date_col }}" />
+            <input type="hidden" name="stats_date_from" value="{{ stats_date_from }}" />
+            <input type="hidden" name="stats_date_to" value="{{ stats_date_to }}" />
+            <input type="hidden" name="stats_filter_key" value="{{ row.key }}" />
+            <input type="hidden" name="stats_filter_val" value="false" />
+            <button type="submit" class="secondary">{{ row.false_count }}</button>
+          </form>
+        </td>
+        <td>{{ "%.2f"|format(row.true_pct) }}%</td>
+        <td>{{ "%.2f"|format(row.false_pct) }}%</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6">No JSON keys selected.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="small">Missing or non-boolean values count as false. {{ filter_note }} Total rows: {{ total_rows }}.</p>
+{% endblock %}

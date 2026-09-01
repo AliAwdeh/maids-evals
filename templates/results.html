@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% from "_components.html" import ai_output %}
+{% block title %}Results · Maids Evals{% endblock %}
+{% block body %}
+  <div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+    <div>
+      <h1>Results</h1>
+      <p class="lede">{{ current_run_text }} · {{ results|length }} rows · {{ detected_keys|length }} JSON keys</p>
+    </div>
+    <div class="actions">
+      <a class="btn" href="/review?idx=0">Review rows</a>
+      <button type="button" id="stats-button" class="secondary" {% if not has_results %}disabled{% endif %}>Stats</button>
+      {% if current_run_id %}
+      <a class="btn ghost" href="/runs/{{ current_run_id }}/download/output">Saved CSV</a>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if has_results %}
+  <p class="ok-text">This batch is loaded. Review rows, or download from the sections below.</p>
+  {% else %}
+  <p class="empty-hint">No model results yet. <a href="/">Go to New run</a>, upload a CSV, and click Run.</p>
+  {% endif %}
+
+  <section class="card">
+    <div class="kicker">Filter</div>
+    <form action="/export" method="get">
+      {% for pair in filter_pairs %}
+      <div class="grid-2" style="grid-template-columns:1fr 1fr;margin-top:8px;">
+        <div>
+          <label>JSON attribute</label>
+          <select name="filter_key">
+            <option value="">No filter</option>
+            {% for key in detected_keys %}
+            <option value="{{ key }}" {% if key == pair.key %}selected{% endif %}>{{ key }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Value</label>
+          <select name="filter_val">
+            <option value="">Any</option>
+            <option value="true" {% if pair.val == 'true' %}selected{% endif %}>True</option>
+            <option value="false" {% if pair.val == 'false' %}selected{% endif %}>False</option>
+          </select>
+        </div>
+      </div>
+      {% endfor %}
+      <div class="actions">
+        <button type="submit">Apply filters</button>
+        <a class="btn secondary" href="/export">Clear</a>
+      </div>
+      <p class="small">Showing {{ filtered_count }} of {{ results|length }} rows. Multiple filters use AND.</p>
+    </form>
+  </section>
+
+  {% if has_results %}
+  <section class="card" style="margin-top:14px;">
+    <div class="kicker">Answers</div>
+    <p class="small">First {{ result_choices|length }} of {{ filtered_count }} matching rows. Open a row to see its answer — JSON renders as a tree with a Pretty/Raw toggle.</p>
+    <div class="answer-list">
+      {% for item in result_choices %}
+      {{ ai_output(item.output, mode='disclosure', label='#' ~ (item.idx + 1) ~ '  ' ~ item.label ~ (' · API failed' if item.failed else '')) }}
+      {% else %}
+      <div class="small">No rows match these filters.</div>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  <details class="panel" style="margin-top:14px;">
+    <summary>Create a new batch from selected rows</summary>
+    <form action="/select-results" method="post" style="margin-top:12px;">
+      {% for pair in filter_pairs %}
+        {% if pair.key and pair.val %}
+        <input type="hidden" name="filter_key" value="{{ pair.key }}" />
+        <input type="hidden" name="filter_val" value="{{ pair.val }}" />
+        {% endif %}
+      {% endfor %}
+      <div class="actions">
+        <button type="button" class="secondary toggle-btn" data-target="result_idx" data-action="all">Select all shown</button>
+        <button type="button" class="secondary toggle-btn" data-target="result_idx" data-action="none">Select none</button>
+      </div>
+      <div class="box">
+        {% for item in result_choices %}
+        <label><input type="checkbox" name="result_idx" value="{{ item.idx }}" checked /> #{{ item.idx + 1 }} {{ item.label }}{% if item.failed %} · API failed{% endif %}</label>
+        {% else %}
+        <div class="small">No rows match these filters.</div>
+        {% endfor %}
+      </div>
+      <p class="small">The first 200 matching rows are listed. Applying replaces the active dataset with those original input rows.</p>
+      <div class="actions">
+        <button type="submit" {% if not has_results or not result_choices %}disabled{% endif %}>Use selected as new set</button>
+      </div>
+    </form>
+  </details>
+
+  <details class="panel" style="margin-top:12px;">
+    <summary>Download a custom CSV</summary>
+    <form action="/download" method="post" style="margin-top:12px;">
+      {% for pair in filter_pairs %}
+        {% if pair.key and pair.val %}
+        <input type="hidden" name="filter_key" value="{{ pair.key }}" />
+        <input type="hidden" name="filter_val" value="{{ pair.val }}" />
+        {% endif %}
+      {% endfor %}
+      <div class="grid-2">
+        <div>
+          <h3>Input columns</h3>
+          <div class="actions">
+            <button type="button" class="secondary toggle-btn" data-target="out_csv_cols" data-action="all">All</button>
+            <button type="button" class="secondary toggle-btn" data-target="out_csv_cols" data-action="none">None</button>
+          </div>
+          <div class="box">
+            {% for col in csv_cols %}
+            <label><input type="checkbox" name="out_csv_cols" value="{{ col }}" /> {{ col }}</label>
+            {% endfor %}
+          </div>
+        </div>
+        <div>
+          <h3>Model output</h3>
+          <label>JSON export mode</label>
+          <select name="json_export_mode">
+            <option value="flatten" selected>Flatten selected JSON keys</option>
+            <option value="raw_json">Raw JSON column</option>
+          </select>
+          <label>Output prefix</label>
+          <input type="text" name="out_prefix" value="out_" />
+          <div class="actions">
+            <button type="button" class="secondary toggle-btn" data-target="out_json_keys" data-action="all">All keys</button>
+            <button type="button" class="secondary toggle-btn" data-target="out_json_keys" data-action="none">No keys</button>
+          </div>
+          <div class="box">
+            {% for key in detected_keys %}
+            <label><input type="checkbox" name="out_json_keys" value="{{ key }}" /> {{ key }}</label>
+            {% else %}
+            <div class="small">No JSON keys yet. Run with JSON mode on.</div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+      <div class="actions">
+        <button type="submit" {% if not has_results %}disabled{% endif %}>Download output.csv</button>
+      </div>
+    </form>
+  </details>
+
+  <div class="overlay" id="stats-overlay">
+    <div class="modal">
+      <h3>Stats on JSON keys</h3>
+      <form action="/stats" method="post" id="stats-form">
+        <div class="actions">
+          <button type="button" class="secondary toggle-btn" data-target="stats_keys" data-action="all">All</button>
+          <button type="button" class="secondary toggle-btn" data-target="stats_keys" data-action="none">None</button>
+        </div>
+        <div class="box">
+          {% for key in detected_keys %}
+          <label><input type="checkbox" name="stats_keys" value="{{ key }}" {% if key in stats_keys %}checked{% endif %} /> {{ key }}</label>
+          {% else %}
+          <div class="small">No JSON keys yet.</div>
+          {% endfor %}
+        </div>
+        <div class="actions">
+          <button type="button" id="stats-cancel" class="secondary">Cancel</button>
+          <button type="submit">Run stats</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/ai-output.js"></script>
+<script src="/static/app.js"></script>
+{% endblock %}

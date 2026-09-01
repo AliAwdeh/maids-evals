@@ -1,620 +1,447 @@
 import io
 import json
 import os
-import re
 import secrets
 import threading
 import time
 import csv
 import random
-from datetime import datetime, timedelta
-from urllib.parse import quote
-from typing import Any, Dict, List, Optional, Tuple
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import pandas as pd
-import requests
-from fastapi import FastAPI, File, Form, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, PlainTextResponse, JSONResponse, FileResponse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeSerializer
+import pandas as pd
 
-from openai import OpenAI
-from google import genai
+import auth
+import storage
+from engine import (
+    LANGCC_API_BASE,
+    MAX_REQUEST_WORKERS_CAP,
+    _coerce_bool,
+    _parse_date,
+    _row_is_empty_dict,
+    _row_is_empty_series,
+    _normalize_value,
+    _prompt_has_placeholder,
+    _build_output_dataframe,
+    call_provider,
+    estimate_tokens,
+    fetch_ollama_models,
+    fetch_openai_compatible_models,
+    filter_results_by_json,
+    parse_model_params,
+    process_row,
+    provider_requires_key,
+    render_prompt,
+    result_to_base_row,
+    try_parse_json,
+)
+from prompt_fixer import build_example, build_examples, improve_prompt, unified_diff
 
-app = FastAPI(title="Prompt × CSV Runner")
+load_dotenv()
 
-# ----------------------------
-# Minimal session + job store
-# ----------------------------
-
-SESSION_SECRET = "change-me-" + secrets.token_hex(16)  # set a constant in production
-serializer = URLSafeSerializer(SESSION_SECRET, salt="csv-runner")
-
-# In-memory store:
-# sessions[session_id] = {
-#   "csv_df": pd.DataFrame,
-#   "csv_cols": [...],
-#   "rows": [dict],
-#   "results": [ {input..., llm_output, llm_json_valid, llm_json_parsed/flat...} ],
-#   "detected_json_keys": [...],
-# }
-sessions: Dict[str, Dict[str, Any]] = {}
-
-OLLAMA_API_BASE = "https://ai.aliawdeh.com/api"
-LANGCC_API_BASE = "https://langcc.maidstech.ai/v1"
-# Cap concurrency to avoid overwhelming providers; frontend supplies default, backend enforces ceiling.
-MAX_REQUEST_WORKERS_CAP = max(1, int(os.getenv("MAX_REQUEST_WORKERS_CAP", "64")))
 BASE_DIR = os.path.dirname(__file__)
-PROMPTS_DIR = os.path.join(BASE_DIR, "prompts")
-os.makedirs(PROMPTS_DIR, exist_ok=True)
-RUNS_DIR = os.path.join(BASE_DIR, "runs")
-os.makedirs(RUNS_DIR, exist_ok=True)
-USAGE_LOG = os.path.join(BASE_DIR, "token_usage.txt")
+PUBLIC_EXACT = {"/login", "/logout"}
+PUBLIC_PREFIXES = ("/static",)
+DATA_EXACT = {
+    "/progress",
+    "/usage",
+    "/prompts/get",
+    "/prompts/save",
+    "/session/save",
+    "/provider/models",
+    "/ollama/models",
+    "/credentials",
+    "/credentials/forget",
+    "/review/notes",
+    "/review/prompt",
+    "/review/improve",
+    "/review/improve/status",
+    "/review/accept",
+    "/review/discard",
+    "/test/improve",
+    "/test/improve/status",
+    "/test/accept",
+    "/test/discard",
+    "/prompts/raw",
+}
 
-# Progress structure stored per session:
-# sessions[sid]["progress"] = {
-#   "status": "idle|running|done|error",
-#   "done": int,
-#   "sent": int,   # submitted to provider
-#   "total": int,
-#   "error": str,
-# }
 
-def get_or_create_session_id(request: Request) -> str:
-    cookie = request.cookies.get("sid")
+def _session_secret() -> str:
+    secret = (os.getenv("SESSION_SECRET") or "").strip()
+    if secret:
+        return secret
+    generated = secrets.token_hex(32)
+    print(
+        "WARNING: SESSION_SECRET is not set. Using a one-off secret for this process. "
+        "Logins will not survive a restart. Copy .env.example to .env and set SESSION_SECRET.",
+        flush=True,
+    )
+    return generated
+
+
+SESSION_SECRET = _session_secret()
+if not (os.getenv("SESSION_SECRET") or "").strip():
+    os.environ["SESSION_SECRET"] = SESSION_SECRET
+work_serializer = URLSafeSerializer(SESSION_SECRET, salt="maids-evals-work")
+sessions: Dict[str, Dict[str, Any]] = {}
+WORK_COOKIE = "me_sid"
+
+app = FastAPI(title="Maids Evals")
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
+
+def render(request: Request, name: str, context: Dict[str, Any], status_code: int = 200):
+    ctx = dict(context)
+    if "is_admin" not in ctx:
+        user = getattr(request.state, "user", None) or ctx.get("user")
+        ctx["is_admin"] = bool(user and auth.is_admin(user))
+    try:
+        return templates.TemplateResponse(request, name, ctx, status_code=status_code)
+    except TypeError:
+        return templates.TemplateResponse(name, {"request": request, **ctx}, status_code=status_code)
+
+
+def current_user(request: Request) -> Optional[str]:
+    return auth.load_auth(SESSION_SECRET, request.cookies.get(auth.AUTH_COOKIE, ""))
+
+
+def set_auth_cookie(resp, username: str) -> None:
+    resp.set_cookie(
+        auth.AUTH_COOKIE,
+        auth.dump_auth(SESSION_SECRET, username),
+        httponly=True,
+        samesite="lax",
+        max_age=auth.AUTH_MAX_AGE,
+    )
+
+
+def clear_auth_cookies(resp) -> None:
+    resp.delete_cookie(auth.AUTH_COOKIE)
+    resp.delete_cookie(WORK_COOKIE)
+
+
+def get_work_session(request: Request) -> tuple[str, Dict[str, Any]]:
+    user = request.state.user
+    cookie = request.cookies.get(WORK_COOKIE)
     if cookie:
         try:
-            sid = serializer.loads(cookie)
-            if sid in sessions:
-                return sid
+            sid = work_serializer.loads(cookie)
+            sess = sessions.get(sid)
+            if sess and sess.get("owner") == user:
+                return sid, sess
         except Exception:
             pass
-
     sid = secrets.token_urlsafe(16)
-    sessions[sid] = {}
-    return sid
+    sessions[sid] = {"owner": user}
+    return sid, sessions[sid]
 
-def set_session_cookie(resp, sid: str):
-    resp.set_cookie("sid", serializer.dumps(sid), httponly=True, samesite="lax")
 
-def resolve_sid(request: Request, sid_token: Optional[str] = None) -> str:
-    """Resolve session id from explicit token or cookie; create if missing."""
-    if sid_token:
-        try:
-            sid = serializer.loads(sid_token)
-            if sid in sessions:
-                return sid
-        except Exception:
-            pass
+def set_work_cookie(resp, sid: str) -> None:
+    resp.set_cookie(WORK_COOKIE, work_serializer.dumps(sid), httponly=True, samesite="lax")
 
-    cookie = request.cookies.get("sid")
-    if cookie:
-        try:
-            sid = serializer.loads(cookie)
-            if sid in sessions:
-                return sid
-        except Exception:
-            pass
 
-    sid = get_or_create_session_id(request)
-    return sid
+def attach_session(resp, request: Request, sid: Optional[str] = None):
+    if sid is None:
+        sid, _ = get_work_session(request)
+    set_work_cookie(resp, sid)
+    return resp
 
-# ----------------------------
-# Helpers
-# ----------------------------
 
-def safe_format(template: str, row: Dict[str, Any]) -> str:
-    class SafeDict(dict):
-        def __missing__(self, key):
-            return ""
-
-    try:
-        return template.format_map(SafeDict(row))
-    except ValueError:
-        # Fallback so literal braces (e.g., JSON examples) do not crash formatting
-        pattern = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
-        return pattern.sub(lambda m: str(row.get(m.group(1), "")), template)
-
-def try_parse_json(text: str) -> Tuple[Optional[Any], Optional[str]]:
-    t = (text or "").strip()
-
-    # Strip simple fenced blocks
-    if t.startswith("```"):
-        t = t.strip("`").strip()
-        if t.lower().startswith("json"):
-            t = t[4:].strip()
-
-    # Try strict parse
-    try:
-        return json.loads(t), None
-    except Exception as e:
-        # Fallback: try extract from first { to last }
-        try:
-            i = t.find("{")
-            j = t.rfind("}")
-            if i != -1 and j != -1 and j > i:
-                return json.loads(t[i : j + 1]), None
-        except Exception:
-            pass
-        return None, str(e)
-
-def flatten_json(obj: Any, parent_key: str = "", sep: str = ".") -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            nk = f"{parent_key}{sep}{k}" if parent_key else str(k)
-            out.update(flatten_json(v, nk, sep=sep))
-    elif isinstance(obj, list):
-        # Flatten list items with indices to support arrays of objects
-        if obj and all(isinstance(x, dict) for x in obj):
-            for i, v in enumerate(obj):
-                nk = f"{parent_key}{sep}{i}" if parent_key else str(i)
-                out.update(flatten_json(v, nk, sep=sep))
-        else:
-            out[parent_key] = json.dumps(obj, ensure_ascii=False)
-    else:
-        out[parent_key] = obj
-    return out
-
-def _is_empty_value(v: Any) -> bool:
-    if v is None:
+def is_public(path: str) -> bool:
+    if path in PUBLIC_EXACT:
         return True
-    if isinstance(v, str):
-        return v.strip() == ""
-    try:
-        return pd.isna(v)
-    except Exception:
-        return False
+    return any(path.startswith(prefix) for prefix in PUBLIC_PREFIXES)
 
-def _normalize_value(v: Any) -> Any:
-    # Replace pandas NaN/None with empty string to avoid invalid JSON/CSV artifacts.
-    return "" if _is_empty_value(v) else v
 
-def _row_is_empty_dict(row: Dict[str, Any]) -> bool:
-    return all(_is_empty_value(v) for v in row.values())
+def is_admin_path(path: str) -> bool:
+    return path == "/admin" or path.startswith("/admin/")
 
-def _row_is_empty_series(row) -> bool:
-    return all(_is_empty_value(v) for v in row)
 
-def _normalize_json_root(obj: Any) -> Any:
-    """If the JSON is a single-key dict with a dict value (e.g., {"summary": {...}}), unwrap it."""
-    if isinstance(obj, dict) and len(obj) == 1:
-        only_key, only_val = next(iter(obj.items()))
-        if isinstance(only_val, dict):
-            return only_val
-    return obj
-
-def _prompt_has_placeholder(prompt: str, names: List[str]) -> bool:
-    for name in names:
-        if f"{{{name}}}" in prompt or f"{{{{{name}}}}}" in prompt:
-            return True
+def is_data_request(request: Request) -> bool:
+    path = request.url.path
+    if path in DATA_EXACT:
+        return True
+    if "/download" in path:
+        return True
+    if path == "/run":
+        return True
+    accept = request.headers.get("accept", "")
+    if "application/json" in accept and "text/html" not in accept:
+        return True
     return False
 
-def _estimate_tokens(text: str) -> int:
-    # Rough estimate: ~4 chars per token
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
 
-def _log_usage(provider: str, model: str, input_text: str, output_text: str):
-    entry = {
-        "ts": datetime.utcnow().isoformat(),
-        "provider": provider,
-        "model": model,
-        "input_tokens": _estimate_tokens(input_text),
-        "output_tokens": _estimate_tokens(output_text),
-    }
+@app.middleware("http")
+async def require_auth(request: Request, call_next):
+    if is_public(request.url.path):
+        return await call_next(request)
+    user = current_user(request)
+    if not user:
+        if is_data_request(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return RedirectResponse(url="/login", status_code=303)
+    request.state.user = user
+    if is_admin_path(request.url.path) and not auth.is_admin(user):
+        if is_data_request(request):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        return render(request, "forbidden.html", {"nav": "", "user": user}, status_code=403)
+    return await call_next(request)
+
+
+def filter_pairs(keys: Optional[List[str]], vals: Optional[List[str]], n: int = 3) -> List[Dict[str, str]]:
+    keys = keys or []
+    vals = vals or []
+    pairs = []
+    for i in range(n):
+        pairs.append({"key": keys[i] if i < len(keys) else "", "val": (vals[i] if i < len(vals) else "").lower()})
+    return pairs
+
+
+def filter_qs(pairs: List[Dict[str, str]]) -> str:
+    parts = []
+    for pair in pairs:
+        if pair["key"] and pair["val"] in ("true", "false"):
+            parts.append(f"filter_key={quote(pair['key'])}")
+            parts.append(f"filter_val={quote(pair['val'])}")
+    return ("&" + "&".join(parts)) if parts else ""
+
+
+def run_title(meta: Dict[str, Any]) -> str:
+    name = (meta.get("run_name") or "").strip()
+    created = meta.get("created_at", "")
     try:
-        with open(USAGE_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        created = datetime.fromisoformat(created).strftime("%Y-%m-%d %H:%M")
     except Exception:
         pass
+    return name or created or meta.get("run_id", "run")
 
-def _safe_prompt_name(name: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", (name or "").strip())
-    cleaned = cleaned.strip("._")
-    if not cleaned:
-        raise ValueError("Invalid prompt name.")
-    return cleaned
 
-def _prompt_path(name: str) -> str:
-    safe_name = _safe_prompt_name(name)
-    if not safe_name.endswith(".txt"):
-        safe_name += ".txt"
-    return os.path.join(PROMPTS_DIR, safe_name)
-
-def _list_prompts() -> List[str]:
-    prompts = []
+def pretty_created(meta: Dict[str, Any]) -> str:
+    created = meta.get("created_at", "")
     try:
-        for fname in os.listdir(PROMPTS_DIR):
-            if fname.endswith(".txt"):
-                prompts.append(fname[:-4])
-    except FileNotFoundError:
-        return []
-    return sorted(prompts)
-
-def _parse_date(value: str) -> Optional[datetime.date]:
-    if not value:
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
+        return datetime.fromisoformat(created).strftime("%Y-%m-%d %H:%M")
     except Exception:
-        return None
+        return created
 
-def _coerce_bool(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if value == 1:
-            return True
-        if value == 0:
-            return False
-        return None
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in ("true", "t", "yes", "y", "1", "on"):
-            return True
-        if v in ("false", "f", "no", "n", "0", "off"):
-            return False
-    return None
 
-def _clean_model_params(raw: Dict[str, Any]) -> Dict[str, Any]:
-    params: Dict[str, Any] = {}
-    for key, value in raw.items():
-        if value is None or value == "":
-            continue
+def saved_key_for(user: str, provider: str) -> str:
+    if not provider_requires_key(provider):
+        return ""
+    return storage.load_user_secret(user, provider) or ""
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request, error: str = ""):
+    if current_user(request):
+        return RedirectResponse(url="/", status_code=303)
+    return render(request, "login.html", {"error": error})
+
+
+@app.post("/login")
+async def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    user = auth.authenticate(username, password)
+    if not user:
+        return render(
+            request,
+            "login.html",
+            {"error": "Unknown user or token. Ask whoever runs this instance to add you."},
+            status_code=401,
+        )
+    resp = RedirectResponse(url="/", status_code=303)
+    set_auth_cookie(resp, user)
+    sid, sess = get_work_session_for_user(user, request)
+    sess["owner"] = user
+    set_work_cookie(resp, sid)
+    return resp
+
+
+def get_work_session_for_user(user: str, request: Request) -> tuple[str, Dict[str, Any]]:
+    cookie = request.cookies.get(WORK_COOKIE)
+    if cookie:
         try:
-            if key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
-                params[key] = float(value)
-            elif key in ("max_output_tokens", "seed"):
-                params[key] = int(value)
-            elif key == "reasoning_effort":
-                params[key] = str(value)
-        except Exception:
-            continue
-    return params
-
-def _parse_model_params(
-    send_model_params: Optional[str],
-    enabled_names: Optional[List[str]],
-    temperature: Optional[str],
-    top_p: Optional[str],
-    max_output_tokens: Optional[str],
-    presence_penalty: Optional[str],
-    frequency_penalty: Optional[str],
-    seed: Optional[str],
-    reasoning_effort: Optional[str],
-) -> Dict[str, Any]:
-    if send_model_params != "1":
-        return {}
-    enabled = set(enabled_names or [])
-    raw = {
-        "temperature": temperature if "temperature" in enabled else None,
-        "top_p": top_p if "top_p" in enabled else None,
-        "max_output_tokens": max_output_tokens if "max_output_tokens" in enabled else None,
-        "presence_penalty": presence_penalty if "presence_penalty" in enabled else None,
-        "frequency_penalty": frequency_penalty if "frequency_penalty" in enabled else None,
-        "seed": seed if "seed" in enabled else None,
-        "reasoning_effort": reasoning_effort if "reasoning_effort" in enabled else None,
-    }
-    return _clean_model_params(raw)
-
-def _provider_requires_key(provider: str) -> bool:
-    return provider.lower().strip() in ("openai", "langcc", "gemini")
-
-def _result_to_base_row(row: Dict[str, Any], csv_cols: List[str]) -> Dict[str, Any]:
-    return {c: _normalize_value(row.get(c, "")) for c in csv_cols}
-
-def _filter_results_by_json(
-    results: List[Dict[str, Any]],
-    filter_keys: Optional[List[str]],
-    filter_vals: Optional[List[str]],
-) -> List[int]:
-    keys = filter_keys or []
-    vals = filter_vals or []
-    filters = []
-    for key, val in zip(keys, vals):
-        key = (key or "").strip()
-        val = (val or "").strip().lower()
-        if key and val in ("true", "false"):
-            filters.append((key, val == "true"))
-    if not filters:
-        return list(range(len(results)))
-
-    matched = []
-    for i, row in enumerate(results):
-        flat = row.get("_llm_json_flat", {}) or {}
-        ok = True
-        for key, target in filters:
-            if _coerce_bool(flat.get(key)) is not target:
-                ok = False
-                break
-        if ok:
-            matched.append(i)
-    return matched
-
-def _hidden_json_filters(filter_keys: List[str], filter_vals: List[str]) -> str:
-    parts = []
-    for k, v in zip(filter_keys, filter_vals):
-        if k and v:
-            parts.append(f'<input type="hidden" name="filter_key" value="{html_escape(k)}" />')
-            parts.append(f'<input type="hidden" name="filter_val" value="{html_escape(v)}" />')
-    return "".join(parts)
-
-def _safe_run_id(run_id: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "", run_id or "")
-    if not cleaned:
-        raise ValueError("Invalid run id.")
-    return cleaned
-
-def _run_dir(run_id: str) -> str:
-    return os.path.join(RUNS_DIR, _safe_run_id(run_id))
-
-def _json_default(obj: Any):
-    if hasattr(obj, "item"):
-        try:
-            return obj.item()
+            sid = work_serializer.loads(cookie)
+            sess = sessions.get(sid)
+            if sess and sess.get("owner") == user:
+                return sid, sess
         except Exception:
             pass
-    return str(obj)
+    sid = secrets.token_urlsafe(16)
+    sessions[sid] = {"owner": user}
+    return sid, sessions[sid]
 
-def _build_output_dataframe(
-    results: List[Dict[str, Any]],
-    csv_cols: List[str],
-    out_csv_cols: Optional[List[str]] = None,
-    out_json_keys: Optional[List[str]] = None,
-    json_export_mode: str = "flatten",
-    flatten_sep: str = ".",
-    out_prefix: str = "out_",
-) -> pd.DataFrame:
-    out_csv_cols = [c for c in (out_csv_cols if out_csv_cols is not None else csv_cols) if c in csv_cols]
-    exported_rows: List[Dict[str, Any]] = []
-    column_order: List[str] = []
 
-    def remember_cols(cols):
-        for k in cols:
-            if k not in column_order:
-                column_order.append(k)
+@app.post("/logout")
+async def logout():
+    resp = RedirectResponse(url="/login", status_code=303)
+    clear_auth_cookies(resp)
+    return resp
 
-    remember_cols(out_csv_cols)
-    remember_cols(["llm_output", "llm_api_failed", "llm_api_error", "llm_error", "llm_latency_s"])
 
-    for r in results:
-        row_out: Dict[str, Any] = {}
-        for c in out_csv_cols:
-            row_out[c] = r.get(c, "")
-
-        row_out["llm_output"] = r.get("llm_output", "")
-        row_out["llm_api_failed"] = r.get("llm_api_failed", False)
-        row_out["llm_api_error"] = r.get("llm_api_error", "")
-        row_out["llm_error"] = r.get("llm_error", "")
-        row_out["llm_latency_s"] = r.get("llm_latency_s", "")
-
-        if json_export_mode == "raw_json":
-            row_out["llm_json_raw"] = r.get("llm_json_raw", "")
-            row_out["llm_json_valid"] = r.get("llm_json_valid", False)
-            row_out["llm_json_error"] = r.get("llm_json_error", "")
-        else:
-            flat = r.get("_llm_json_flat", {}) or {}
-            keys = out_json_keys if out_json_keys else list(flat.keys())
-            for k in keys:
-                kk = k.replace(".", flatten_sep) if flatten_sep != "." else k
-                row_out[f"{out_prefix}{kk}"] = flat.get(k, "")
-
-        exported_rows.append(row_out)
-        remember_cols(row_out.keys())
-
-    out_df = pd.DataFrame(exported_rows)
-    if column_order:
-        out_df = out_df.reindex(columns=column_order)
-    return out_df
-
-def _write_csv(path: str, df: pd.DataFrame):
-    df.to_csv(path, index=False, quoting=csv.QUOTE_ALL, lineterminator="\n")
-
-def _save_run_archive(
-    sess: Dict[str, Any],
-    rows: List[Dict[str, Any]],
-    results: List[Dict[str, Any]],
-    detected_keys: List[str],
-    provider: str,
-    model: str,
-    run_name: str,
-    worker_count: int,
-    model_params: Dict[str, Any],
-) -> str:
-    run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(4)
-    run_path = _run_dir(run_id)
-    os.makedirs(run_path, exist_ok=True)
-
-    csv_cols = sess.get("csv_cols") or []
-    input_df = pd.DataFrame(rows).reindex(columns=csv_cols)
-    output_df = _build_output_dataframe(results, csv_cols, out_json_keys=detected_keys)
-
-    _write_csv(os.path.join(run_path, "input.csv"), input_df)
-    _write_csv(os.path.join(run_path, "output.csv"), output_df)
-    with open(os.path.join(run_path, "results.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "csv_cols": csv_cols,
-                "rows": rows,
-                "results": results,
-                "detected_json_keys": detected_keys,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-            default=_json_default,
-        )
-
-    failed_count = sum(1 for r in results if r.get("llm_api_failed"))
-    valid_json_count = sum(1 for r in results if r.get("llm_json_valid"))
-    metadata = {
-        "run_id": run_id,
-        "created_at": datetime.utcnow().isoformat(),
-        "provider": provider,
-        "model": model,
-        "run_name": run_name.strip(),
-        "row_count": len(results),
-        "input_row_count": len(rows),
-        "failed_count": failed_count,
-        "valid_json_count": valid_json_count,
-        "json_key_count": len(detected_keys),
-        "json_keys": detected_keys,
-        "worker_count": worker_count,
-        "json_mode": bool(sess.get("json_mode")),
-        "model_params": model_params,
-        "prompt_name": sess.get("prompt_name", ""),
+def _admin_users_context(
+    request: Request,
+    *,
+    new_user: str = "",
+    new_token: str = "",
+    revoked: str = "",
+    error: str = "",
+) -> Dict[str, Any]:
+    return {
+        "nav": "admin",
+        "user": request.state.user,
+        "users": auth.list_users_detailed(),
+        "env_admin": auth.env_admin_username(),
+        "new_user": new_user,
+        "new_token": new_token,
+        "revoked": revoked,
+        "error": error,
     }
-    with open(os.path.join(run_path, "metadata.json"), "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2, default=_json_default)
-    return run_id
 
-def _list_saved_runs() -> List[Dict[str, Any]]:
-    runs = []
+
+@app.get("/admin/users", response_class=HTMLResponse)
+def admin_users_page(request: Request, revoked: str = "", error: str = ""):
+    return render(
+        request,
+        "admin_users.html",
+        _admin_users_context(request, revoked=revoked, error=error),
+    )
+
+
+@app.post("/admin/users", response_class=HTMLResponse)
+async def admin_create_user(request: Request, username: str = Form(...)):
     try:
-        names = os.listdir(RUNS_DIR)
-    except FileNotFoundError:
-        return []
-    for name in names:
-        path = os.path.join(RUNS_DIR, name, "metadata.json")
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            runs.append(meta)
-        except Exception:
-            continue
-    return sorted(runs, key=lambda r: r.get("created_at", ""), reverse=True)
+        token = auth.add_user(username)
+    except ValueError as e:
+        return render(
+            request,
+            "admin_users.html",
+            _admin_users_context(request, error=str(e)),
+            status_code=400,
+        )
+    return render(
+        request,
+        "admin_users.html",
+        _admin_users_context(request, new_user=username.strip(), new_token=token),
+    )
 
-def _load_run_archive(run_id: str) -> Dict[str, Any]:
-    path = os.path.join(_run_dir(run_id), "results.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-def _load_run_into_session(run_id: str, sess: Dict[str, Any]):
-    data = _load_run_archive(run_id)
-    meta = {}
-    meta_path = os.path.join(_run_dir(run_id), "metadata.json")
+@app.post("/admin/users/revoke")
+async def admin_revoke_user(request: Request, username: str = Form(...)):
     try:
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception:
-        meta = {}
-    csv_cols = data.get("csv_cols") or []
-    rows = data.get("rows") or []
-    sess["csv_cols"] = csv_cols
-    sess["rows"] = rows
-    sess["csv_df"] = pd.DataFrame(rows).reindex(columns=csv_cols)
-    sess["results"] = data.get("results") or []
-    sess["detected_json_keys"] = data.get("detected_json_keys") or []
-    sess["current_run_id"] = _safe_run_id(run_id)
-    sess["run_name"] = meta.get("run_name", "")
-    sess.pop("progress", None)
+        removed = auth.revoke_user(username)
+    except ValueError as e:
+        return RedirectResponse(url=f"/admin/users?error={quote(str(e))}", status_code=303)
+    if not removed:
+        return RedirectResponse(
+            url=f"/admin/users?error={quote(f'No user named {username.strip()!r}.')}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        url=f"/admin/users?revoked={quote(username.strip())}", status_code=303
+    )
 
-# ----------------------------
-# Provider calls
-# ----------------------------
 
-def call_openai(api_key: str, model: str, prompt: str, model_params: Optional[Dict[str, Any]] = None) -> str:
-    client = OpenAI(api_key=api_key)
-    resp = client.responses.create(model=model, input=prompt, **(model_params or {}))
-    return resp.output_text  # SDK convenience for aggregated text :contentReference[oaicite:2]{index=2}
+@app.post("/admin/users/reset-token", response_class=HTMLResponse)
+async def admin_reset_token(request: Request, username: str = Form(...)):
+    try:
+        token = auth.reset_user_token(username)
+    except ValueError as e:
+        return render(
+            request,
+            "admin_users.html",
+            _admin_users_context(request, error=str(e)),
+            status_code=400,
+        )
+    return render(
+        request,
+        "admin_users.html",
+        _admin_users_context(request, new_user=username.strip(), new_token=token),
+    )
 
-def call_langcc(api_key: str, model: str, prompt: str, model_params: Optional[Dict[str, Any]] = None) -> str:
-    client = OpenAI(api_key=api_key, base_url=LANGCC_API_BASE)
-    resp = client.responses.create(model=model, input=prompt, **(model_params or {}))
-    return resp.output_text
 
-def call_gemini(api_key: str, model: str, prompt: str, model_params: Optional[Dict[str, Any]] = None) -> str:
-    # Gemini SDK can pick up env var, but here we pass api_key explicitly
-    client = genai.Client(api_key=api_key)
-    config = {}
-    for src, dst in (("temperature", "temperature"), ("top_p", "top_p"), ("max_output_tokens", "max_output_tokens")):
-        if model_params and src in model_params:
-            config[dst] = model_params[src]
-    resp = client.models.generate_content(model=model, contents=prompt, config=config or None)
-    return resp.text or ""
+@app.get("/", response_class=HTMLResponse)
+def home(request: Request):
+    sid, sess = get_work_session(request)
+    has_csv = "csv_cols" in sess
+    total_rows = len(sess.get("rows", [])) if has_csv else 0
+    last_test = sess.get("last_test_row_idx")
+    if not (has_csv and isinstance(last_test, int) and 0 <= last_test < total_rows):
+        last_test = None
+    recent = []
+    for meta in storage.list_saved_runs(request.state.user)[:5]:
+        recent.append(
+            {
+                "run_id": meta.get("run_id", ""),
+                "title": run_title(meta),
+                "created": pretty_created(meta),
+                "provider": meta.get("provider", ""),
+                "model": meta.get("model", ""),
+                "row_count": meta.get("row_count", 0),
+            }
+        )
+    model_params = sess.get("model_params_form") or {
+        "temperature": "",
+        "top_p": "",
+        "max_output_tokens": "",
+        "presence_penalty": "",
+        "frequency_penalty": "",
+        "seed": "",
+        "reasoning_effort": "",
+    }
+    current_provider = sess.get("provider", "openai")
+    saved_key = saved_key_for(request.state.user, current_provider)
+    resp = render(
+        request,
+        "home.html",
+        {
+            "nav": "run",
+            "user": request.state.user,
+            "has_csv": has_csv,
+            "total_rows": total_rows,
+            "csv_cols": sess.get("csv_cols") or [],
+            "prompts": storage.list_prompts(),
+            "prompt_name": sess.get("prompt_name", ""),
+            "prompt_template": sess.get("prompt_template", "Given this row:\n{row_json}\n\nReturn JSON with keys: status, note."),
+            "run_name": sess.get("run_name", ""),
+            "provider": current_provider,
+            "model": sess.get("model", "gpt-5-mini"),
+            "max_workers": sess.get("max_workers", 16),
+            "workers_cap": MAX_REQUEST_WORKERS_CAP,
+            "json_mode": sess.get("json_mode", True),
+            "send_model_params": sess.get("send_model_params", False),
+            "enabled_params": sess.get("enabled_params") or [],
+            "model_params": model_params,
+            "test_cols": sess.get("test_cols") or [],
+            "last_test_row_idx": last_test,
+            "recent_runs": recent,
+            "sid_token": work_serializer.dumps(sid),
+            "divide_default": min(total_rows, 100) if total_rows else 1,
+            "saved_api_key": saved_key,
+            "saved_key_exists": bool(saved_key),
+        },
+    )
+    return attach_session(resp, request, sid)
 
-def call_ollama(model: str, prompt: str, json_mode: bool, model_params: Optional[Dict[str, Any]] = None) -> str:
-    payload: Dict[str, Any] = {"model": model, "prompt": prompt, "stream": False}
-    # Ollama JSON mode uses "format": "json" (or a schema for structured outputs) :contentReference[oaicite:4]{index=4}
-    if json_mode:
-        payload["format"] = "json"
-    if model_params:
-        options = {}
-        for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty", "seed"):
-            if key in model_params:
-                options[key] = model_params[key]
-        if "max_output_tokens" in model_params:
-            options["num_predict"] = model_params["max_output_tokens"]
-        if options:
-            payload["options"] = options
-
-    r = requests.post(f"{OLLAMA_API_BASE}/generate", json=payload, timeout=600)
-    r.raise_for_status()
-    return r.json().get("response", "")
-
-def fetch_ollama_models() -> List[str]:
-    """Fetch available Ollama models from the API."""
-    r = requests.get(f"{OLLAMA_API_BASE}/tags", timeout=10)
-    r.raise_for_status()
-    data = r.json() or {}
-
-    models: List[str] = []
-    for m in data.get("models", []):
-        name = m.get("model") or m.get("name")
-        if name:
-            models.append(name)
-
-    if not models:
-        raise ValueError("No models returned from Ollama.")
-    # Remove duplicates while preserving order
-    seen = set()
-    deduped = []
-    for name in models:
-        if name not in seen:
-            deduped.append(name)
-            seen.add(name)
-    return deduped
-
-def fetch_openai_compatible_models(api_key: str, base_url: Optional[str] = None) -> List[str]:
-    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
-    models_page = client.models.list()
-    models = [m.id for m in models_page.data if getattr(m, "id", None)]
-    return sorted(models)
-
-def call_provider(provider: str, api_key: str, model: str, prompt: str, json_mode: bool, model_params: Optional[Dict[str, Any]] = None) -> str:
-    p = provider.lower().strip()
-    if p == "openai":
-        return call_openai(api_key, model, prompt, model_params=model_params)
-    if p == "langcc":
-        return call_langcc(api_key, model, prompt, model_params=model_params)
-    if p == "gemini":
-        return call_gemini(api_key, model, prompt, model_params=model_params)
-    if p == "ollama":
-        # Ollama does not need an API key in this local setup
-        return call_ollama(model, prompt, json_mode=json_mode, model_params=model_params)
-    raise ValueError("Unsupported provider")
 
 @app.get("/ollama/models")
 def ollama_models():
     try:
-        models = fetch_ollama_models()
-        return {"models": models}
+        return {"models": fetch_ollama_models()}
     except Exception as e:
         return PlainTextResponse(f"Failed to fetch Ollama models: {e}", status_code=502)
 
+
 @app.post("/provider/models")
-async def provider_models(
-    provider: str = Form(...),
-    api_key: str = Form(""),
-):
+async def provider_models(provider: str = Form(...), api_key: str = Form("")):
     p = provider.lower().strip()
     try:
         if p == "ollama":
@@ -629,72 +456,43 @@ async def provider_models(
             return {"models": fetch_openai_compatible_models(api_key.strip())}
         if p == "gemini":
             return {"models": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]}
+        return PlainTextResponse("Unsupported provider.", status_code=400)
     except Exception as e:
-        return PlainTextResponse(f"Failed to fetch models: {e}", status_code=502)
-    return PlainTextResponse("Unsupported provider.", status_code=400)
+        return PlainTextResponse(str(e), status_code=502)
+
 
 @app.get("/progress")
-def progress_status(request: Request):
-    sid_token = request.query_params.get("sid_token")
-    sid = resolve_sid(request, sid_token)
-
-    prog = sessions.get(sid, {}).get("progress") or {
-        "status": "idle",
-        "done": 0,
-        "sent": 0,
-        "total": 0,
-        "error": "",
-    }
+def progress_status(request: Request, sid_token: Optional[str] = None):
+    sid, sess = resolve_work(request, sid_token)
+    prog = sess.get("progress") or {"status": "idle", "done": 0, "sent": 0, "total": 0, "error": ""}
     resp = JSONResponse(prog)
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
+
+
+def resolve_work(request: Request, sid_token: Optional[str] = None) -> tuple[str, Dict[str, Any]]:
+    user = request.state.user
+    if sid_token:
+        try:
+            sid = work_serializer.loads(sid_token)
+            sess = sessions.get(sid)
+            if sess and sess.get("owner") == user:
+                return sid, sess
+        except Exception:
+            pass
+    return get_work_session(request)
+
 
 @app.get("/usage")
 def usage(request: Request, days: str = "7"):
-    sid = get_or_create_session_id(request)
     try:
         days_int = int(days)
     except Exception:
         days_int = 7
+    since = datetime.utcnow() - timedelta(days=days_int) if days_int > 0 else None
+    data = storage.read_usage(request.state.user, since=since)
+    resp = JSONResponse(data)
+    return attach_session(resp, request)
 
-    since = None
-    if days_int > 0:
-        since = datetime.utcnow() - timedelta(days=days_int)
-
-    totals = {"input_tokens": 0, "output_tokens": 0}
-    by_model: Dict[str, Dict[str, int]] = {}
-    try:
-        with open(USAGE_LOG, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                ts = entry.get("ts")
-                if since and ts:
-                    try:
-                        if datetime.fromisoformat(ts) < since:
-                            continue
-                    except Exception:
-                        pass
-                model = entry.get("model") or "unknown"
-                inp = int(entry.get("input_tokens") or 0)
-                outp = int(entry.get("output_tokens") or 0)
-                totals["input_tokens"] += inp
-                totals["output_tokens"] += outp
-                if model not in by_model:
-                    by_model[model] = {"input_tokens": 0, "output_tokens": 0}
-                by_model[model]["input_tokens"] += inp
-                by_model[model]["output_tokens"] += outp
-    except FileNotFoundError:
-        pass
-
-    resp = JSONResponse({"totals": totals, "by_model": by_model})
-    set_session_cookie(resp, sid)
-    return resp
 
 @app.post("/session/save")
 async def save_session_state(
@@ -702,7 +500,6 @@ async def save_session_state(
     sid_token: Optional[str] = Form(None),
     provider: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    api_key: Optional[str] = Form(None),
     prompt_template: Optional[str] = Form(None),
     json_mode: Optional[str] = Form(None),
     max_workers: Optional[str] = Form(None),
@@ -718,19 +515,15 @@ async def save_session_state(
     seed: Optional[str] = Form(None),
     reasoning_effort: Optional[str] = Form(None),
 ):
-    sid = resolve_sid(request, sid_token)
-    sess = sessions.get(sid, {})
-
+    sid, sess = resolve_work(request, sid_token)
     if provider is not None:
         sess["provider"] = provider
     if model is not None:
         sess["model"] = model
-    if api_key is not None:
-        sess["api_key"] = api_key
     if prompt_template is not None:
         sess["prompt_template"] = prompt_template
     if json_mode is not None:
-        sess["json_mode"] = (json_mode == "1")
+        sess["json_mode"] = json_mode == "1"
     if max_workers is not None:
         try:
             mw = int(max_workers)
@@ -743,7 +536,7 @@ async def save_session_state(
     if run_name is not None:
         sess["run_name"] = run_name
     if send_model_params is not None:
-        sess["send_model_params"] = (send_model_params == "1")
+        sess["send_model_params"] = send_model_params == "1"
         sess["enabled_params"] = enabled_params or []
         sess["model_params_form"] = {
             "temperature": temperature or "",
@@ -754,1071 +547,113 @@ async def save_session_state(
             "seed": seed or "",
             "reasoning_effort": reasoning_effort or "",
         }
-
     resp = JSONResponse({"ok": True})
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
+
+
+@app.get("/credentials")
+def get_credentials(request: Request, provider: str = ""):
+    user = request.state.user
+    name = (provider or "").strip().lower()
+    if name == "ollama":
+        return JSONResponse({"provider": "ollama", "api_key": "", "saved": False, "needed": False})
+    if name not in storage.KEY_PROVIDERS:
+        return JSONResponse({"error": "unsupported provider"}, status_code=400)
+    key = storage.load_user_secret(user, name) or ""
+    return JSONResponse({"provider": name, "api_key": key, "saved": bool(key), "needed": True})
+
+
+@app.post("/credentials")
+async def save_credentials(request: Request, provider: str = Form(...), api_key: str = Form(...)):
+    user = request.state.user
+    try:
+        name = storage.save_user_secret(user, provider, api_key)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "Could not save key."}, status_code=500)
+    return JSONResponse({"ok": True, "provider": name, "saved": True})
+
+
+@app.post("/credentials/forget")
+async def forget_credentials(request: Request, provider: str = Form(...)):
+    user = request.state.user
+    try:
+        deleted = storage.delete_user_secret(user, provider)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "Could not delete key."}, status_code=500)
+    return JSONResponse({"ok": True, "provider": (provider or "").strip().lower(), "saved": False, "deleted": deleted})
+
 
 @app.get("/prompts/get")
-def get_prompt(request: Request, name: str, sid_token: Optional[str] = None):
-    sid = resolve_sid(request, sid_token)
-    sess = sessions.get(sid, {})
+def get_prompt(request: Request, name: str):
+    sid, sess = get_work_session(request)
     try:
-        path = _prompt_path(name)
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
+        content = storage.load_prompt(name)
+        safe_name = storage._safe_prompt_name(name)
     except Exception as e:
         return PlainTextResponse(f"Failed to load prompt: {e}", status_code=400)
-
-    sess["prompt_name"] = _safe_prompt_name(name)
+    sess["prompt_name"] = safe_name
     sess["prompt_template"] = content
-    resp = JSONResponse({"name": sess["prompt_name"], "content": content})
-    set_session_cookie(resp, sid)
-    return resp
+    resp = JSONResponse({"name": safe_name, "content": content})
+    return attach_session(resp, request, sid)
+
 
 @app.post("/prompts/save")
-async def save_prompt(
-    request: Request,
-    prompt_name: str = Form(...),
-    prompt_content: str = Form(...),
-    sid_token: Optional[str] = Form(None),
-):
-    sid = resolve_sid(request, sid_token)
-    sess = sessions.get(sid, {})
+async def save_prompt(request: Request, prompt_name: str = Form(...), prompt_content: str = Form(...)):
+    sid, sess = get_work_session(request)
     try:
-        safe_name = _safe_prompt_name(prompt_name)
-        path = _prompt_path(safe_name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(prompt_content or "")
+        safe_name = storage.save_prompt(prompt_name, prompt_content or "")
     except Exception as e:
         return PlainTextResponse(f"Failed to save prompt: {e}", status_code=400)
-
     sess["prompt_name"] = safe_name
     sess["prompt_template"] = prompt_content or ""
     resp = JSONResponse({"ok": True, "name": safe_name})
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
 
-# ----------------------------
-# HTML builders (simple)
-# ----------------------------
-
-def html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-
-def render_checkbox_list(name: str, options: List[str], selected: Optional[List[str]] = None) -> str:
-    selected = set(selected or [])
-    items = []
-    for opt in options:
-        checked = "checked" if opt in selected else ""
-        items.append(
-            f'<label style="display:block;margin:4px 0;">'
-            f'<input type="checkbox" name="{name}" value="{html_escape(opt)}" {checked}/> '
-            f'{html_escape(opt)}'
-            f"</label>"
-        )
-    return "\n".join(items)
-
-# ----------------------------
-# Routes
-# ----------------------------
-
-@app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    sid = get_or_create_session_id(request)
-    sess = sessions.get(sid, {})
-    has_csv = "csv_cols" in sess
-
-    toolbar_html = ""
-    if has_csv:
-        toolbar_html = "".join(
-            [
-                f'<button type="button" class="col-chip" data-insert="{{{{{html_escape(c)}}}}}">{html_escape(c)}</button>'
-                for c in sess["csv_cols"]
-            ]
-        )
-    toolbar_html += '<button type="button" class="col-chip" data-insert="{{row_json}}">row_json</button>'
-    total_rows = len(sess.get("rows", [])) if has_csv else 0
-    sid_token = serializer.dumps(sid)
-    test_cols_selected = sess.get("test_cols", []) if has_csv else []
-    test_cols_html = (
-        render_checkbox_list("test_cols", sess["csv_cols"], selected=test_cols_selected)
-        if has_csv
-        else "<div class='small'>Upload a CSV first to pick test columns.</div>"
-    )
-    prompt_name = sess.get("prompt_name", "")
-    prompt_options = ['<option value="">Select saved prompt</option>']
-    for name in _list_prompts():
-        sel = "selected" if name == prompt_name else ""
-        prompt_options.append(f'<option value="{html_escape(name)}" {sel}>{html_escape(name)}</option>')
-    prompt_options_html = "\n".join(prompt_options)
-    saved_prompt = sess.get(
-        "prompt_template",
-        "Given this row:\n{{row_json}}\n\nReturn JSON with keys: status, note.",
-    )
-    model_params_form = sess.get("model_params_form", {}) or {}
-    enabled_params = set(sess.get("enabled_params", []))
-    send_model_params_checked = "checked" if sess.get("send_model_params", False) else ""
-    run_name = sess.get("run_name", "")
-    last_test_row_idx = sess.get("last_test_row_idx")
-    last_test_row_arg = "" if last_test_row_idx is None else str(last_test_row_idx)
-    last_test_button_html = ""
-    if has_csv and isinstance(last_test_row_idx, int) and 0 <= last_test_row_idx < total_rows:
-        last_test_button_html = '<button type="button" id="retest-button" class="warning">Test same row</button>'
-    recent_runs_html = ""
-    for meta in _list_saved_runs()[:5]:
-        run_id = meta.get("run_id", "")
-        display_name = (meta.get("run_name") or "").strip()
-        created = meta.get("created_at", "")
-        try:
-            created = datetime.fromisoformat(created).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            pass
-        title = display_name or created
-        recent_runs_html += (
-            "<div class='run-row'>"
-            f"<div><strong>{html_escape(title)}</strong><div class='small'>{html_escape(created)} · {html_escape(meta.get('provider', ''))} / {html_escape(meta.get('model', ''))} · {meta.get('row_count', 0)} rows</div></div>"
-            f"<form action='/runs/{html_escape(run_id)}/open' method='post'><button type='submit' class='secondary'>Open</button></form>"
-            "</div>"
-        )
-    if not recent_runs_html:
-        recent_runs_html = "<div class='small'>Completed runs will be saved here automatically.</div>"
-
-    page = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Batch Runner</title>
-  <style>
-    :root {{
-      --card: #fff;
-      --border: #d9e2ef;
-      --accent: #2563eb;
-      --accent-2: #0f766e;
-      --accent-3: #b45309;
-      --muted: #64748b;
-      --ink: #0f172a;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      padding: 0;
-      font-family: "Inter", "Segoe UI", Arial, sans-serif;
-      background: #eef3f8;
-      color: var(--ink);
-    }}
-    .shell {{ max-width: 1280px; margin:0 auto; padding:24px; }}
-    .topbar {{
-      display:flex;
-      justify-content:space-between;
-      align-items:flex-start;
-      gap:18px;
-      margin-bottom:18px;
-      padding:20px;
-      border-radius:8px;
-      background: linear-gradient(135deg, #10233f, #173f5f 58%, #0f766e);
-      color:white;
-      box-shadow:0 10px 24px rgba(15,23,42,.14);
-    }}
-    .brand h1 {{ margin:0; font-size:30px; letter-spacing:0; }}
-    .topbar .small {{ color:#dbeafe; max-width:620px; }}
-    .nav {{ display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
-    a {{ color:inherit; text-decoration:none; }}
-    h2 {{ margin: 0 0 18px; letter-spacing: 0; }}
-    h3 {{ margin: 0 0 10px; }}
-    .workspace {{ display:grid; grid-template-columns: minmax(270px, .9fr) minmax(430px, 1.45fr) minmax(300px, .95fr); gap:18px; align-items:start; }}
-    .row {{ display:grid; grid-template-columns: minmax(280px, .85fr) minmax(420px, 1.5fr) minmax(280px, .85fr); gap:18px; align-items:start; }}
-    @media (max-width: 980px) {{ .row {{ grid-template-columns:1fr; }} .topbar {{ flex-direction:column; }} .nav {{ justify-content:flex-start; }} }}
-    @media (max-width: 980px) {{ .workspace {{ grid-template-columns:1fr; }} }}
-    .card {{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 18px;
-      min-width: 280px;
-      box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
-    }}
-    .section-title {{ display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }}
-    .section-title h3 {{ margin:0; }}
-    .tag {{ display:inline-flex; align-items:center; border-radius:999px; padding:4px 8px; font-size:12px; font-weight:700; background:#e0f2fe; color:#075985; }}
-    .tag.oktag {{ background:#dcfce7; color:#166534; }}
-    .tag.warntag {{ background:#fef3c7; color:#92400e; }}
-    .status-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:14px 0; }}
-    .status-tile {{ border:1px solid #e5e7eb; border-radius:8px; padding:10px; background:#fbfcfe; }}
-    .status-tile strong {{ display:block; font-size:20px; line-height:1.1; }}
-    .status-tile span {{ color:var(--muted); font-size:12px; }}
-    label {{ display:block; margin-top:12px; font-weight:700; color:#111827; }}
-    input[type="text"], input[type="password"], textarea, select {{
-      width:100%;
-      padding:10px 12px;
-      margin-top:6px;
-      border-radius:8px;
-      border:1px solid var(--border);
-      background:#fdfdff;
-      font-size:14px;
-    }}
-    textarea {{ height:220px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height:1.45; }}
-    .small {{ font-size:12px; color: var(--muted); margin-top:6px; }}
-    .colsbox {{ max-height: 260px; overflow:auto; border:1px solid var(--border); padding:10px; border-radius:8px; background:#f8fafc; }}
-    button {{
-      padding:10px 16px;
-      border:none;
-      background: var(--accent);
-      color:white;
-      border-radius:8px;
-      cursor:pointer;
-      font-weight:700;
-    }}
-    button.secondary {{ background:#e5e7eb; color:#111827; }}
-    button.success {{ background:var(--accent-2); }}
-    button.warning {{ background:var(--accent-3); }}
-    button[disabled] {{ opacity:0.6; cursor:not-allowed; }}
-    .ok {{ color: #0a7; }}
-    .warn {{ color: #b60; }}
-    .overlay {{
-      position: fixed;
-      inset: 0;
-      background: rgba(15, 23, 42, 0.5);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 999;
-    }}
-    .overlay .panel {{
-      background: white;
-      padding: 20px;
-      border-radius: 12px;
-      width: 320px;
-      text-align: center;
-      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.3);
-    }}
-    .overlay h4 {{ margin: 0 0 10px; }}
-    .progress-nums {{ font-size: 14px; color: #334155; margin-top: 8px; }}
-    .error-msg {{ color: #b91c1c; margin-top: 10px; font-size: 13px; }}
-    .modal-panel {{ width: 420px; max-height: 80vh; overflow: auto; }}
-    .modal-actions {{ display:flex; justify-content:flex-end; gap:10px; margin-top:14px; }}
-    .filter {{ border:1px solid #eee; border-radius:10px; padding:12px; margin:12px 0; }}
-    .filter-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-top:8px; }}
-    .filter-row > div {{ flex:1; min-width:160px; }}
-    .run-row {{ display:flex; justify-content:space-between; gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid #eef2f7; }}
-    .run-row:last-child {{ border-bottom:none; }}
-    .usage-panel {{ margin-top:18px; padding-top:14px; border-top:1px solid #e8eef5; }}
-    .usage-controls {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-    .usage-controls label {{ margin:0; }}
-    .mini-table {{ width:100%; border-collapse:collapse; border:1px solid #e5e7eb; border-radius:8px; overflow:hidden; background:white; }}
-    .mini-table th, .mini-table td {{ padding:8px; border-bottom:1px solid #eef2f7; text-align:left; font-size:12px; }}
-    .mini-table th {{ background:#f8fafc; color:#475569; font-weight:700; }}
-    .mini-table tr:last-child td {{ border-bottom:none; }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-  <div class="topbar">
-    <div class="brand">
-      <h1>Batch Runner</h1>
-      <div class="small">Upload rows, run prompts, review results, and revisit every saved batch.</div>
-    </div>
-    <div class="nav">
-      <a href="/runs"><button type="button" class="secondary">Run History</button></a>
-      <a href="/export"><button type="button" class="secondary">Current Results</button></a>
-    </div>
-  </div>
-
-  <div class="workspace">
-    <div class="card">
-      <div class="section-title">
-        <h3>Dataset</h3>
-        {"<span class='tag oktag'>Loaded</span>" if has_csv else "<span class='tag warntag'>Waiting</span>"}
-      </div>
-      <div class="status-grid">
-        <div class="status-tile"><strong>{total_rows}</strong><span>Rows ready</span></div>
-        <div class="status-tile"><strong>{len(sess.get("csv_cols", [])) if has_csv else 0}</strong><span>Columns</span></div>
-      </div>
-      <form action="/upload" method="post" enctype="multipart/form-data">
-        <label>CSV File</label>
-        <input type="file" name="csv_file" accept=".csv" required />
-        <div style="margin-top:12px;">
-          <button type="submit">Upload</button>
-        </div>
-      </form>
-      <div style="margin-top:12px;">
-        <button type="button" id="divide-button" {"disabled" if not has_csv else ""} class="success">Divide rows</button>
-        <div class="small">Keep a random subset before running the prompt.</div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="section-title">
-        <h3>Prompt Run</h3>
-        <span class="tag">Configure</span>
-      </div>
-      <form action="/run" method="post" id="run-form" data-total-rows="{total_rows}" data-sid-token="{sid_token}">
-        <label>Run name</label>
-        <input type="text" name="run_name" id="run-name" value="{html_escape(run_name)}" placeholder="Optional, e.g. May policy audit" />
-        <div class="small">Leave empty and the run will be saved by date and ID.</div>
-
-        <label>Provider</label>
-        <select name="provider" id="provider-select">
-          <option value="openai" {"selected" if sess.get("provider", "openai") == "openai" else ""}>OpenAI</option>
-          <option value="langcc" {"selected" if sess.get("provider") == "langcc" else ""}>LangCC</option>
-          <option value="gemini" {"selected" if sess.get("provider") == "gemini" else ""}>Gemini</option>
-          <option value="ollama" {"selected" if sess.get("provider") == "ollama" else ""}>Ollama</option>
-        </select>
-
-        <div id="model-text-wrapper">
-          <label>Model</label>
-          <input type="text" name="model" id="model-input" value="{html_escape(sess.get('model', 'gpt-5-mini'))}" />
-          <div class="small">Examples: OpenAI gpt-5-mini, LangCC model from the list, Gemini gemini-2.5-flash.</div>
-        </div>
-
-        <div id="model-select-wrapper" style="display:none;">
-          <label>Model</label>
-          <input type="text" id="model-search" placeholder="Search models..." />
-          <select name="model" id="model-select">
-            <option value="">Loading models...</option>
-          </select>
-          <div class="small" id="model-select-help">Pick an available model.</div>
-        </div>
-
-        <label>API Key (stored only in this browser session)</label>
-        <input type="password" name="api_key" value="{html_escape(sess.get('api_key', ''))}" placeholder="Required for OpenAI, LangCC, or Gemini. Leave empty for Ollama." />
-
-        <label>Max concurrent requests</label>
-        <input type="number" name="max_workers" value="{html_escape(str(sess.get('max_workers', 16)))}" min="1" max="{MAX_REQUEST_WORKERS_CAP}" />
-        <div class="small">Controls how many requests run in parallel. Capped by server policy @64.</div>
-
-        <label><input type="checkbox" name="send_model_params" id="send-model-params" value="1" {send_model_params_checked} /> Send model parameters</label>
-        <div class="colsbox" id="model-params-box" style="margin-top:8px;">
-          <label><input type="checkbox" name="enabled_params" value="temperature" {"checked" if "temperature" in enabled_params else ""} /> Temperature</label>
-          <input type="text" name="temperature" value="{html_escape(str(model_params_form.get('temperature', '')))}" placeholder="0.2" />
-          <label><input type="checkbox" name="enabled_params" value="top_p" {"checked" if "top_p" in enabled_params else ""} /> Top P</label>
-          <input type="text" name="top_p" value="{html_escape(str(model_params_form.get('top_p', '')))}" placeholder="0.9" />
-          <label><input type="checkbox" name="enabled_params" value="max_output_tokens" {"checked" if "max_output_tokens" in enabled_params else ""} /> Max output tokens</label>
-          <input type="text" name="max_output_tokens" value="{html_escape(str(model_params_form.get('max_output_tokens', '')))}" placeholder="1024" />
-          <label class="param-openai"><input type="checkbox" name="enabled_params" value="presence_penalty" {"checked" if "presence_penalty" in enabled_params else ""} /> Presence penalty</label>
-          <input class="param-openai" type="text" name="presence_penalty" value="{html_escape(str(model_params_form.get('presence_penalty', '')))}" placeholder="0" />
-          <label class="param-openai"><input type="checkbox" name="enabled_params" value="frequency_penalty" {"checked" if "frequency_penalty" in enabled_params else ""} /> Frequency penalty</label>
-          <input class="param-openai" type="text" name="frequency_penalty" value="{html_escape(str(model_params_form.get('frequency_penalty', '')))}" placeholder="0" />
-          <label class="param-advanced"><input type="checkbox" name="enabled_params" value="seed" {"checked" if "seed" in enabled_params else ""} /> Seed</label>
-          <input class="param-advanced" type="text" name="seed" value="{html_escape(str(model_params_form.get('seed', '')))}" placeholder="1234" />
-          <label class="param-openai"><input type="checkbox" name="enabled_params" value="reasoning_effort" {"checked" if "reasoning_effort" in enabled_params else ""} /> Reasoning effort</label>
-          <select class="param-openai" name="reasoning_effort">
-            <option value="">Default</option>
-            <option value="minimal" {"selected" if model_params_form.get("reasoning_effort") == "minimal" else ""}>minimal</option>
-            <option value="low" {"selected" if model_params_form.get("reasoning_effort") == "low" else ""}>low</option>
-            <option value="medium" {"selected" if model_params_form.get("reasoning_effort") == "medium" else ""}>medium</option>
-            <option value="high" {"selected" if model_params_form.get("reasoning_effort") == "high" else ""}>high</option>
-          </select>
-          <div class="small">Only checked parameters are sent. Unsupported provider/model combinations may reject a run.</div>
-        </div>
-
-        <label>Saved prompts</label>
-        <div style="display:flex; gap:8px; align-items:center;">
-          <select id="prompt-select" style="flex:1;">
-            {prompt_options_html}
-          </select>
-          <button type="button" id="prompt-load" class="success">Load</button>
-        </div>
-        <label>Prompt name</label>
-        <div style="display:flex; gap:8px; align-items:center;">
-          <input type="text" id="prompt-name" value="{html_escape(prompt_name)}" placeholder="My prompt name" />
-          <button type="button" id="prompt-save" class="success">Save</button>
-        </div>
-        <div class="small" id="prompt-status"></div>
-
-        <label>Prompt template</label>
-        <div id="prompt-toolbar" style="margin:6px 0; display:flex; gap:8px; flex-wrap:wrap;">
-          {toolbar_html}
-        </div>
-        <textarea name="prompt_template" id="prompt-template">{html_escape(saved_prompt)}</textarea>
-        <div class="small">Use placeholders like {{name}}, {{age}}, and/or {{row_json}}. Click a column chip to insert.</div>
-
-        <label><input type="checkbox" name="json_mode" value="1" {"checked" if sess.get("json_mode", True) else ""} /> Output is JSON</label>
-
-        <div style="margin-top:14px;">
-          <button type="submit" {"disabled" if not has_csv else ""}>Run</button>
-          <button type="button" id="test-button" {"disabled" if not has_csv else ""} style="margin-left:8px;" class="success">Test row</button>
-          {last_test_button_html}
-        </div>
-      </form>
-    </div>
-
-    <div class="card">
-      <div class="section-title">
-        <h3>Results</h3>
-        {"<span class='tag oktag'>Available</span>" if sess.get("results") else "<span class='tag'>Ready</span>"}
-      </div>
-      <div class="small">
-        Filter rows, review responses, build stats, download CSVs, or start a new batch from selected rows.
-      </div>
-      <div style="margin-top:12px;">
-        <a href="/export"><button>{"Open results" if has_csv else "Results (upload first)"}</button></a>
-      </div>
-      <h3 style="margin-top:18px;">Recent Runs</h3>
-      {recent_runs_html}
-      <div style="margin-top:12px;"><a href="/runs"><button type="button" class="secondary">View all runs</button></a></div>
-
-      <div class="usage-panel">
-        <div class="section-title">
-          <h3>Token Usage</h3>
-          <span class="tag">Estimate</span>
-        </div>
-        <div class="usage-controls">
-          <label>Range</label>
-          <select id="usage-days" style="width:140px;">
-            <option value="1">Last 1 day</option>
-            <option value="7" selected>Last 7 days</option>
-            <option value="30">Last 30 days</option>
-            <option value="0">All time</option>
-          </select>
-          <button type="button" id="usage-refresh" class="success">Refresh</button>
-        </div>
-        <div class="small" id="usage-summary" style="margin-top:8px;"></div>
-        <div id="usage-table" style="margin-top:10px;"></div>
-      </div>
-    </div>
-  </div>
-  </div>
-  <div class="overlay" id="progress-overlay">
-    <div class="panel">
-      <h4>Processing rows…</h4>
-      <div class="progress-nums">
-        Processed: <span id="progress-done">0</span> /
-        <span id="progress-total">0</span><br/>
-        In progress: <span id="progress-running">0</span><br/>
-        Pending: <span id="progress-pending">0</span>
-      </div>
-      <div class="error-msg" id="progress-error"></div>
-    </div>
-  </div>
-  <div class="overlay" id="test-overlay">
-    <div class="panel modal-panel">
-      <h4>Select columns to show</h4>
-      <div style="margin:6px 0; display:flex; gap:8px; flex-wrap:wrap;">
-        <button type="button" class="toggle-btn" data-target="test_cols" data-action="all">Select all</button>
-        <button type="button" class="toggle-btn" data-target="test_cols" data-action="none">Select none</button>
-      </div>
-      <div class="colsbox" style="margin-top:8px; max-height:320px; overflow:auto;">
-        {test_cols_html}
-      </div>
-      <div class="small">Pick which input columns to display on the Test page.</div>
-      <div class="modal-actions">
-        <button type="button" id="test-cancel" style="background:#94a3b8;">Cancel</button>
-        <button type="button" id="test-confirm" style="background:#10b981;">Run Test</button>
-      </div>
-    </div>
-  </div>
-  <div class="overlay" id="divide-overlay">
-    <div class="panel modal-panel">
-      <h4>Divide rows</h4>
-      <form action="/divide" method="post" id="divide-form">
-        <input type="hidden" name="sid_token" value="{html_escape(sid_token)}" />
-        <label>Rows to keep (out of {total_rows})</label>
-        <input type="number" name="divide_rows" min="1" max="{total_rows}" value="{min(total_rows, 100) if total_rows else 1}" />
-        <div class="small">This will randomly keep the selected number of rows and discard the rest.</div>
-        <div class="modal-actions">
-          <button type="button" id="divide-cancel" style="background:#94a3b8;">Cancel</button>
-          <button type="submit" id="divide-confirm" style="background:#0f766e;">Apply</button>
-        </div>
-      </form>
-    </div>
-  </div>
-  <script>
-    (() => {{
-      const providerSel = document.getElementById("provider-select");
-      const modelTextWrap = document.getElementById("model-text-wrapper");
-      const modelSelectWrap = document.getElementById("model-select-wrapper");
-      const modelInput = document.getElementById("model-input");
-      const modelSelect = document.getElementById("model-select");
-      const modelSearch = document.getElementById("model-search");
-      const modelSelectHelp = document.getElementById("model-select-help");
-      const promptBox = document.getElementById("prompt-template");
-      const promptSelect = document.getElementById("prompt-select");
-      const promptName = document.getElementById("prompt-name");
-      const promptLoad = document.getElementById("prompt-load");
-      const promptSave = document.getElementById("prompt-save");
-      const promptStatus = document.getElementById("prompt-status");
-      const runNameInput = document.getElementById("run-name");
-      const usageDays = document.getElementById("usage-days");
-      const usageRefresh = document.getElementById("usage-refresh");
-      const usageSummary = document.getElementById("usage-summary");
-      const usageTable = document.getElementById("usage-table");
-      const chips = Array.from(document.querySelectorAll(".col-chip"));
-      const runForm = document.getElementById("run-form");
-      const apiKeyInput = runForm?.querySelector('input[name="api_key"]');
-      const maxWorkersInput = runForm?.querySelector('input[name="max_workers"]');
-      const jsonModeInput = runForm?.querySelector('input[name="json_mode"]');
-      const sendModelParamsInput = document.getElementById("send-model-params");
-      const modelParamsBox = document.getElementById("model-params-box");
-      const testBtn = document.getElementById("test-button");
-      const retestBtn = document.getElementById("retest-button");
-      const overlay = document.getElementById("progress-overlay");
-      const progDone = document.getElementById("progress-done");
-      const progTotal = document.getElementById("progress-total");
-      const progRunning = document.getElementById("progress-running");
-      const progError = document.getElementById("progress-error");
-      const totalRows = Number(runForm?.dataset?.totalRows || 0);
-      const progPending = document.getElementById("progress-pending");
-      const sidToken = runForm?.dataset?.sidToken || "";
-      const testOverlay = document.getElementById("test-overlay");
-      const testConfirm = document.getElementById("test-confirm");
-      const testCancel = document.getElementById("test-cancel");
-      const divideBtn = document.getElementById("divide-button");
-      const divideOverlay = document.getElementById("divide-overlay");
-      const divideCancel = document.getElementById("divide-cancel");
-      const fallbackOllamaModels = ["llama3", "llama3:70b", "gemma3", "mistral-small"];
-      const fallbackLangccModels = ["gpt-5-mini", "gpt-5", "gpt-4.1-mini", "o4-mini"];
-      let providerModels = {{}};
-      let modelsLoading = {{}};
-      let lastModelKey = "";
-      let pollTimer = null;
-
-      function syncSelectToInput() {{
-        if (modelSelect && modelInput) {{
-          modelInput.value = modelSelect.value;
-        }}
-      }}
-
-      function currentProvider() {{
-        return (providerSel?.value || "openai").toLowerCase();
-      }}
-
-      function modelCacheKey(provider) {{
-        const keyPart = provider === "langcc" || provider === "openai" ? (apiKeyInput?.value || "") : "";
-        return `${{provider}}:${{keyPart}}`;
-      }}
-
-      function filteredModels(models) {{
-        const q = (modelSearch?.value || "").trim().toLowerCase();
-        if (!q) return models;
-        return models.filter((m) => m.toLowerCase().includes(q));
-      }}
-
-      function setModelOptions(models, noteText) {{
-        if (!modelSelect) return;
-        const current = modelInput?.value || "";
-        const visibleModels = filteredModels(models);
-        modelSelect.innerHTML = "";
-        visibleModels.forEach((m) => {{
-          const opt = document.createElement("option");
-          opt.value = m;
-          opt.textContent = m;
-          modelSelect.appendChild(opt);
-        }});
-        if (modelSelectHelp) {{
-          const query = (modelSearch?.value || "").trim();
-          const countText = query ? `${{visibleModels.length}} of ${{models.length}} models match "${{query}}".` : `${{models.length}} models available.`;
-          modelSelectHelp.textContent = `${{countText}} ${{noteText || "Pick an available model."}}`;
-        }}
-        if (visibleModels.length) {{
-          modelSelect.value = visibleModels.includes(current) ? current : visibleModels[0];
-          syncSelectToInput();
-        }} else {{
-          const opt = document.createElement("option");
-          opt.value = "";
-          opt.textContent = "No matching models";
-          modelSelect.appendChild(opt);
-        }}
-      }}
-
-      async function loadProviderModels(provider) {{
-        const cacheKey = modelCacheKey(provider);
-        lastModelKey = cacheKey;
-        if (modelsLoading[cacheKey]) return;
-        if (providerModels[cacheKey]) {{
-          setModelOptions(providerModels[cacheKey], `Pick an available ${{provider}} model.`);
-          return;
-        }}
-        modelsLoading[cacheKey] = true;
-        if (modelSelectHelp) modelSelectHelp.textContent = `Loading models from ${{provider}}...`;
-        if (modelSelect) {{
-          modelSelect.innerHTML = '<option value="">Loading...</option>';
-        }}
-        try {{
-          const form = new FormData();
-          form.append("provider", provider);
-          if (apiKeyInput) form.append("api_key", apiKeyInput.value || "");
-          const resp = await fetch("/provider/models", {{ method: "POST", body: form, credentials: "same-origin" }});
-          if (!resp.ok) {{
-            throw new Error("Failed to load models");
-          }}
-          const data = await resp.json();
-          const models = Array.isArray(data?.models) ? data.models : [];
-          if (!models.length) {{
-            throw new Error("No models returned");
-          }}
-          providerModels[cacheKey] = models;
-          if (lastModelKey === cacheKey) {{
-            setModelOptions(models, `Pick an available ${{provider}} model.`);
-          }}
-        }} catch (err) {{
-          const fallback = provider === "ollama" ? fallbackOllamaModels : fallbackLangccModels;
-          providerModels[cacheKey] = fallback;
-          if (lastModelKey === cacheKey) {{
-            setModelOptions(fallback, "Using fallback model list.");
-          }}
-        }} finally {{
-          modelsLoading[cacheKey] = false;
-        }}
-      }}
-
-      function syncModelForProvider() {{
-        const provider = currentProvider();
-        const usesModelList = provider === "ollama" || provider === "langcc";
-        if (usesModelList) {{
-          modelTextWrap.style.display = "none";
-          modelSelectWrap.style.display = "block";
-          modelInput.disabled = true;
-          modelSelect.disabled = false;
-          loadProviderModels(provider);
-        }} else {{
-          modelTextWrap.style.display = "block";
-          modelSelectWrap.style.display = "none";
-          modelInput.disabled = false;
-          modelSelect.disabled = true;
-          if (!modelInput.value) {{
-            modelInput.value = "gpt-5-mini";
-          }}
-        }}
-        syncParamVisibility();
-      }}
-
-      function syncParamVisibility() {{
-        const enabled = !!sendModelParamsInput?.checked;
-        if (modelParamsBox) modelParamsBox.style.display = enabled ? "block" : "none";
-        const provider = currentProvider();
-        const showOpenAI = provider === "openai" || provider === "langcc";
-        document.querySelectorAll(".param-openai").forEach((el) => {{
-          el.style.display = showOpenAI ? "" : "none";
-        }});
-      }}
-
-      providerSel.addEventListener("change", () => {{
-        syncModelForProvider();
-        syncSelectToInput();
-        queueSaveState();
-      }});
-      modelSelect.addEventListener("change", () => {{
-        syncSelectToInput();
-        queueSaveState();
-      }});
-      if (modelSearch) {{
-        modelSearch.addEventListener("input", () => {{
-          const provider = currentProvider();
-          setModelOptions(providerModels[modelCacheKey(provider)] || [], `Pick an available ${{provider}} model.`);
-        }});
-      }}
-      syncModelForProvider();
-
-      function insertAtCursor(textarea, text) {{
-        if (!textarea) return;
-        const start = textarea.selectionStart ?? textarea.value.length;
-        const end = textarea.selectionEnd ?? textarea.value.length;
-        const before = textarea.value.slice(0, start);
-        const after = textarea.value.slice(end);
-        const newPos = start + text.length;
-        textarea.value = before + text + after;
-        textarea.focus();
-        textarea.setSelectionRange(newPos, newPos);
-      }}
-
-      chips.forEach((btn) => {{
-        btn.addEventListener("click", () => {{
-          const text = btn.getAttribute("data-insert") || "";
-          insertAtCursor(promptBox, text);
-          queueSaveState();
-        }});
-      }});
-
-      if (modelInput) modelInput.addEventListener("input", () => queueSaveState());
-      if (apiKeyInput) apiKeyInput.addEventListener("input", () => {{
-        const provider = currentProvider();
-        if (provider === "langcc" || provider === "openai") {{
-          loadProviderModels(provider);
-        }}
-        queueSaveState();
-      }});
-      if (maxWorkersInput) maxWorkersInput.addEventListener("input", () => queueSaveState());
-      if (promptBox) promptBox.addEventListener("input", () => queueSaveState());
-      if (jsonModeInput) jsonModeInput.addEventListener("change", () => queueSaveState());
-      if (sendModelParamsInput) sendModelParamsInput.addEventListener("change", () => {{
-        syncParamVisibility();
-        queueSaveState();
-      }});
-      document.querySelectorAll('#model-params-box input, #model-params-box select').forEach((el) => {{
-        el.addEventListener("input", () => queueSaveState());
-        el.addEventListener("change", () => queueSaveState());
-      }});
-      if (promptName) promptName.addEventListener("input", () => queueSaveState());
-      if (runNameInput) runNameInput.addEventListener("input", () => queueSaveState());
-      if (promptSelect) promptSelect.addEventListener("change", () => queueSaveState());
-
-      function setModalVisible(el, visible) {{
-        if (!el) return;
-        el.style.display = visible ? "flex" : "none";
-      }}
-
-      let saveTimer = null;
-      function buildStateForm() {{
-        if (!runForm) return null;
-        const form = new FormData();
-        if (sidToken) form.append("sid_token", sidToken);
-        if (providerSel) form.append("provider", providerSel.value);
-        if (modelInput) form.append("model", modelInput.value);
-        if (apiKeyInput) form.append("api_key", apiKeyInput.value);
-        if (promptBox) form.append("prompt_template", promptBox.value);
-        if (jsonModeInput) form.append("json_mode", jsonModeInput.checked ? "1" : "0");
-        if (maxWorkersInput) form.append("max_workers", maxWorkersInput.value);
-        if (promptName) form.append("prompt_name", promptName.value);
-        if (runNameInput) form.append("run_name", runNameInput.value);
-        if (sendModelParamsInput) form.append("send_model_params", sendModelParamsInput.checked ? "1" : "0");
-        document.querySelectorAll('#model-params-box input[name="enabled_params"]:checked').forEach((el) => form.append("enabled_params", el.value));
-        document.querySelectorAll('#model-params-box input:not([name="enabled_params"]), #model-params-box select').forEach((el) => {{
-          if (el.name) form.append(el.name, el.value);
-        }});
-        return form;
-      }}
-      function sendState(immediate = false) {{
-        const form = buildStateForm();
-        if (!form) return;
-        if (immediate && navigator.sendBeacon) {{
-          const params = new URLSearchParams();
-          for (const [k, v] of form.entries()) params.append(k, v);
-          navigator.sendBeacon("/session/save", params);
-          return;
-        }}
-        fetch("/session/save", {{
-          method: "POST",
-          body: form,
-          credentials: "same-origin",
-          keepalive: immediate,
-        }});
-      }}
-      function queueSaveState(immediate = false) {{
-        if (saveTimer) clearTimeout(saveTimer);
-        if (immediate) {{
-          sendState(true);
-          return;
-        }}
-        saveTimer = setTimeout(() => sendState(false), 400);
-      }}
-
-      function setPromptStatus(msg, isError = false) {{
-        if (!promptStatus) return;
-        promptStatus.textContent = msg;
-        promptStatus.style.color = isError ? "#b91c1c" : "#0a7";
-      }}
-
-      if (promptLoad) {{
-        promptLoad.addEventListener("click", async () => {{
-          const name = promptSelect?.value || "";
-          if (!name) {{
-            setPromptStatus("Select a saved prompt to load.", true);
-            return;
-          }}
-          try {{
-            const qs = sidToken ? `&sid_token=${{encodeURIComponent(sidToken)}}` : "";
-            const resp = await fetch(`/prompts/get?name=${{encodeURIComponent(name)}}${{qs}}`, {{ credentials: "same-origin" }});
-            if (!resp.ok) {{
-              throw new Error("Failed to load prompt");
-            }}
-            const data = await resp.json();
-            if (promptBox) promptBox.value = data.content || "";
-            if (promptName) promptName.value = data.name || name;
-            setPromptStatus(`Loaded "${{data.name || name}}"`);
-            queueSaveState();
-          }} catch (e) {{
-            setPromptStatus("Failed to load prompt.", true);
-          }}
-        }});
-      }}
-
-      if (promptSave) {{
-        promptSave.addEventListener("click", async () => {{
-          const name = (promptName?.value || "").trim();
-          if (!name) {{
-            setPromptStatus("Enter a prompt name to save.", true);
-            return;
-          }}
-          const content = promptBox?.value || "";
-          const form = new FormData();
-          form.append("prompt_name", name);
-          form.append("prompt_content", content);
-          if (sidToken) form.append("sid_token", sidToken);
-          try {{
-            const resp = await fetch("/prompts/save", {{
-              method: "POST",
-              body: form,
-              credentials: "same-origin",
-            }});
-            if (!resp.ok) {{
-              throw new Error("Failed to save prompt");
-            }}
-            const data = await resp.json();
-            if (promptSelect) {{
-              let opt = Array.from(promptSelect.options).find((o) => o.value === data.name);
-              if (!opt) {{
-                opt = document.createElement("option");
-                opt.value = data.name;
-                opt.textContent = data.name;
-                promptSelect.appendChild(opt);
-              }}
-              promptSelect.value = data.name;
-            }}
-            if (promptName) promptName.value = data.name;
-            setPromptStatus(`Saved "${{data.name}}"`);
-            queueSaveState();
-          }} catch (e) {{
-            setPromptStatus("Failed to save prompt.", true);
-          }}
-        }});
-      }}
-
-      async function loadUsage() {{
-        if (!usageDays || !usageSummary || !usageTable) return;
-        const days = usageDays.value || "7";
-        try {{
-          const resp = await fetch(`/usage?days=${{encodeURIComponent(days)}}`, {{ credentials: "same-origin" }});
-          const data = await resp.json();
-          const totals = data?.totals || {{ input_tokens: 0, output_tokens: 0 }};
-          const byModel = data?.by_model || {{}};
-          usageSummary.textContent = "Estimated from completed provider calls.";
-          const rows = Object.entries(byModel).map(([model, t]) => {{
-            const input = t.input_tokens || 0;
-            const output = t.output_tokens || 0;
-            return `<tr><td>${{model}}</td><td>${{input}}</td><td>${{output}}</td><td>${{input + output}}</td></tr>`;
-          }}).join("");
-          const totalAll = (totals.input_tokens || 0) + (totals.output_tokens || 0);
-          if (rows || totalAll) {{
-            usageTable.innerHTML = `
-              <table class="mini-table">
-                <thead>
-                  <tr>
-                    <th>Scope</th>
-                    <th>Input</th>
-                    <th>Output</th>
-                    <th>Total</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr><td><strong>Total</strong></td><td>${{totals.input_tokens || 0}}</td><td>${{totals.output_tokens || 0}}</td><td>${{totalAll}}</td></tr>
-                  ${{rows}}
-                </tbody>
-              </table>
-            `;
-          }} else {{
-            usageTable.innerHTML = "<div class='small'>No usage data yet.</div>";
-          }}
-        }} catch (e) {{
-          usageSummary.textContent = "Failed to load usage.";
-          usageTable.innerHTML = "";
-        }}
-      }}
-
-      if (usageRefresh) usageRefresh.addEventListener("click", loadUsage);
-      if (usageDays) usageDays.addEventListener("change", loadUsage);
-      loadUsage();
-
-      window.addEventListener("visibilitychange", () => {{
-        if (document.visibilityState === "hidden") {{
-          queueSaveState(true);
-        }}
-      }});
-
-      if (testBtn && runForm) {{
-        testBtn.addEventListener("click", (e) => {{
-          e.preventDefault();
-          setModalVisible(testOverlay, true);
-        }});
-      }}
-
-      function submitTest(rowIdx = "") {{
-        if (!runForm) return;
-        // Sync selected test columns into hidden inputs on the form
-        runForm.querySelectorAll('input[data-test-copy="1"]').forEach((el) => el.remove());
-        const checkedCols = Array.from(document.querySelectorAll('#test-overlay input[name="test_cols"]:checked'));
-        checkedCols.forEach((chk) => {{
-          const hidden = document.createElement("input");
-          hidden.type = "hidden";
-          hidden.name = "test_cols";
-          hidden.value = chk.value;
-          hidden.setAttribute("data-test-copy", "1");
-          runForm.appendChild(hidden);
-        }});
-        if (rowIdx !== "" && rowIdx !== null && rowIdx !== undefined) {{
-          const hidden = document.createElement("input");
-          hidden.type = "hidden";
-          hidden.name = "test_row_idx";
-          hidden.value = String(rowIdx);
-          hidden.setAttribute("data-test-copy", "1");
-          runForm.appendChild(hidden);
-        }}
-
-        runForm.dataset.mode = "test";
-        const originalAction = runForm.action;
-        runForm.action = "/test";
-        runForm.submit();
-        setModalVisible(testOverlay, false);
-        setTimeout(() => {{
-          runForm.action = originalAction;
-          runForm.dataset.mode = "";
-        }}, 0);
-      }}
-
-      if (testConfirm) {{
-        testConfirm.addEventListener("click", () => submitTest(""));
-      }}
-      if (retestBtn) {{
-        retestBtn.addEventListener("click", (e) => {{
-          e.preventDefault();
-          submitTest("{last_test_row_arg}");
-        }});
-      }}
-      if (testCancel) {{
-        testCancel.addEventListener("click", () => setModalVisible(testOverlay, false));
-      }}
-      if (divideBtn) {{
-        divideBtn.addEventListener("click", (e) => {{
-          e.preventDefault();
-          setModalVisible(divideOverlay, true);
-        }});
-      }}
-      if (divideCancel) {{
-        divideCancel.addEventListener("click", () => setModalVisible(divideOverlay, false));
-      }}
-
-      async function pollProgress() {{
-        try {{
-          const qs = sidToken ? `?sid_token=${{encodeURIComponent(sidToken)}}` : "";
-          const resp = await fetch(`/progress${{qs}}`, {{ credentials: "same-origin" }});
-          const data = await resp.json();
-          const done = data?.done ?? 0;
-          const total = data?.total ?? 0;
-          const sent = data?.sent ?? done;
-          const status = data?.status ?? "idle";
-          const err = data?.error ?? "";
-          if (progDone) progDone.textContent = done;
-          if (progTotal) progTotal.textContent = total;
-          const running = Math.max(sent - done, 0);
-          const pending = Math.max(total - sent, 0);
-          if (progRunning) progRunning.textContent = running;
-          if (progPending) progPending.textContent = pending;
-          if (progError) progError.textContent = status === "error" ? err : "";
-          return status;
-        }} catch (e) {{
-          if (progError) progError.textContent = "Failed to poll progress.";
-          return "error";
-        }}
-      }}
-
-      if (runForm) {{
-        runForm.addEventListener("submit", async (e) => {{
-          if (runForm.dataset.mode === "test") {{
-            runForm.dataset.mode = "";
-            return; // allow default submit for test
-          }}
-          e.preventDefault();
-          if (overlay) overlay.style.display = "flex";
-          if (progDone) progDone.textContent = "0";
-          if (progTotal) progTotal.textContent = String(totalRows || 0);
-          const maxWorkersInput = runForm.querySelector('input[name="max_workers"]');
-          const reqWorkers = Number(maxWorkersInput?.value || totalRows || 0);
-          const initialRunning = Math.max(Math.min(reqWorkers, totalRows || 0), 0);
-          const initialPending = Math.max((totalRows || 0) - initialRunning, 0);
-          if (progRunning) progRunning.textContent = String(initialRunning);
-          if (progPending) progPending.textContent = String(initialPending);
-          if (progError) progError.textContent = "";
-          await pollProgress(); // initialize
-
-          const formData = new FormData(runForm);
-          const resp = await fetch("/run", {{ method: "POST", body: formData, credentials: "same-origin" }}).catch((err) => err);
-          if (!resp || !resp.ok) {{
-            if (progError) progError.textContent = "Run failed. Please check inputs and try again.";
-            return;
-          }}
-          pollTimer = setInterval(pollProgress, 500);
-          let status = await pollProgress();
-          while (status === "running") {{
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            status = await pollProgress();
-          }}
-          clearInterval(pollTimer);
-          if (status === "error") {{
-            if (progError && !progError.textContent) progError.textContent = "Run failed.";
-            return;
-          }}
-          window.location.href = "/export";
-        }});
-      }}
-    }})();
-  </script>
-</body>
-</html>
-"""
-    resp = HTMLResponse(page)
-    set_session_cookie(resp, sid)
-    return resp
 
 @app.post("/upload")
 async def upload(request: Request, csv_file: UploadFile = File(...)):
-    sid = get_or_create_session_id(request)
+    sid, sess = get_work_session(request)
     raw = await csv_file.read()
     try:
         df = pd.read_csv(io.BytesIO(raw))
     except Exception as e:
         return PlainTextResponse(f"Failed to parse CSV: {e}", status_code=400)
-
-    # Drop rows that are entirely empty/whitespace and normalize NaN -> "".
     df = df.loc[~df.apply(_row_is_empty_series, axis=1)].reset_index(drop=True)
-    df = df.applymap(_normalize_value)
+    df = df.map(_normalize_value) if hasattr(df, "map") else df.applymap(_normalize_value)
     if df.empty:
         return PlainTextResponse("Uploaded CSV has no non-empty rows.", status_code=400)
-
-    sessions[sid]["csv_df"] = df
-    sessions[sid]["csv_cols"] = list(df.columns)
-    sessions[sid]["rows"] = df.to_dict(orient="records")
-    sessions[sid].pop("results", None)
-    sessions[sid].pop("detected_json_keys", None)
-    sessions[sid].pop("progress", None)
-    sessions[sid].pop("current_run_id", None)
-    sessions[sid].pop("last_test_row_idx", None)
-
+    sess["csv_df"] = df
+    sess["csv_cols"] = list(df.columns)
+    sess["rows"] = df.to_dict(orient="records")
+    for key in ("results", "detected_json_keys", "progress", "current_run_id", "last_test_row_idx"):
+        sess.pop(key, None)
     resp = RedirectResponse(url="/", status_code=303)
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
+
 
 @app.post("/divide")
-async def divide_rows(
-    request: Request,
-    sid_token: Optional[str] = Form(None),
-    divide_rows: int = Form(...),
-):
-    sid = resolve_sid(request, sid_token)
-    sess = sessions.get(sid, {})
+async def divide_rows(request: Request, sid_token: Optional[str] = Form(None), divide_rows: int = Form(...)):
+    sid, sess = resolve_work(request, sid_token)
     df = sess.get("csv_df")
     if df is None or df.empty:
         return PlainTextResponse("Upload a CSV first.", status_code=400)
-
     total = len(df)
     if divide_rows < 1 or divide_rows > total:
         return PlainTextResponse(f"divide_rows must be between 1 and {total}.", status_code=400)
-
     if divide_rows < total:
         df = df.sample(n=divide_rows, replace=False).reset_index(drop=True)
         sess["csv_df"] = df
         sess["rows"] = df.to_dict(orient="records")
-    # Always keep columns
     sess["csv_cols"] = list(df.columns)
-    sess.pop("results", None)
-    sess.pop("detected_json_keys", None)
-    sess.pop("progress", None)
-    sess.pop("current_run_id", None)
-    sess.pop("last_test_row_idx", None)
-
+    for key in ("results", "detected_json_keys", "progress", "current_run_id", "last_test_row_idx"):
+        sess.pop(key, None)
     resp = RedirectResponse(url="/", status_code=303)
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
+
 
 @app.post("/run")
 async def run(
@@ -1826,7 +661,7 @@ async def run(
     sid_token: Optional[str] = Form(None),
     run_name: str = Form(""),
     provider: str = Form(...),
-    model: str = Form(...),
+    model: Optional[str] = Form(None),
     api_key: str = Form(""),
     prompt_template: str = Form(...),
     json_mode: Optional[str] = Form(None),
@@ -1841,19 +676,20 @@ async def run(
     seed: Optional[str] = Form(None),
     reasoning_effort: Optional[str] = Form(None),
 ):
-    sid = resolve_sid(request, sid_token)
-    sess = sessions.get(sid, {})
+    sid, sess = resolve_work(request, sid_token)
+    user = request.state.user
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Model is required.", status_code=400)
     if "rows" not in sess:
         return PlainTextResponse("Upload a CSV first.", status_code=400)
-
     rows = [r for r in sess["rows"] if not _row_is_empty_dict(r)]
     rows = [{k: _normalize_value(v) for k, v in row.items()} for row in rows]
     if not rows:
         return PlainTextResponse("No usable rows in CSV after dropping empty rows.", status_code=400)
     csv_cols = sess["csv_cols"]
     if not _prompt_has_placeholder(prompt_template, ["row_json"] + csv_cols):
-        return PlainTextResponse("Prompt must include at least one column placeholder or {{row_json}}.", status_code=400)
-
+        return PlainTextResponse("Prompt must include at least one column placeholder or {row_json}.", status_code=400)
     try:
         requested_workers = int(max_workers)
     except Exception:
@@ -1861,16 +697,13 @@ async def run(
     if requested_workers < 1:
         return PlainTextResponse("max_workers must be >= 1.", status_code=400)
     requested_workers = min(requested_workers, MAX_REQUEST_WORKERS_CAP)
-
-    # Persist selections in session
     sess["provider"] = provider
     sess["run_name"] = run_name
     sess["model"] = model
-    sess["api_key"] = api_key
     sess["prompt_template"] = prompt_template
-    sess["json_mode"] = (json_mode == "1")
+    sess["json_mode"] = json_mode == "1"
     sess["max_workers"] = requested_workers
-    sess["send_model_params"] = (send_model_params == "1")
+    sess["send_model_params"] = send_model_params == "1"
     sess["enabled_params"] = enabled_params or []
     sess["model_params_form"] = {
         "temperature": temperature or "",
@@ -1881,147 +714,91 @@ async def run(
         "seed": seed or "",
         "reasoning_effort": reasoning_effort or "",
     }
-
-    is_json_mode = (json_mode == "1")
-    model_params = _parse_model_params(
-        send_model_params,
-        enabled_params,
-        temperature,
-        top_p,
-        max_output_tokens,
-        presence_penalty,
-        frequency_penalty,
-        seed,
-        reasoning_effort,
-    )
-
-    # Provider key rules
-    if _provider_requires_key(provider) and not api_key.strip():
+    if provider_requires_key(provider) and not api_key.strip():
         return PlainTextResponse("API key is required for OpenAI/LangCC/Gemini.", status_code=400)
 
-    # Initialize progress tracking before the background job starts so polling sees it immediately.
-    sessions[sid]["progress"] = {"status": "running", "done": 0, "sent": 0, "total": len(rows), "error": ""}
+    is_json_mode = json_mode == "1"
+    model_params = parse_model_params(
+        send_model_params, enabled_params, temperature, top_p, max_output_tokens,
+        presence_penalty, frequency_penalty, seed, reasoning_effort,
+    )
+    sess["progress"] = {"status": "running", "done": 0, "sent": 0, "total": len(rows), "error": ""}
+    key_once = api_key.strip()
 
-    def process_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], set[str]]:
-        row_json = json.dumps(row, ensure_ascii=False)
-        row_for_template = dict(row)
-        row_for_template["row_json"] = row_json
-
-        # allow both {row_json} and {{row_json}} habit
-        tmp = prompt_template.replace("{{row_json}}", "{row_json}")
-        prompt = safe_format(tmp, row_for_template)
-
-        t0 = time.time()
-        try:
-            text = call_provider(provider, api_key.strip(), model.strip(), prompt, json_mode=is_json_mode, model_params=model_params)
-            err = ""
-            api_failed = False
-        except Exception as e:
-            text = ""
-            err = str(e)
-            api_failed = True
-        latency = round(time.time() - t0, 3)
-        _log_usage(provider, model, prompt, text)
-
-        out: Dict[str, Any] = {c: row.get(c) for c in csv_cols}
-        out["llm_output"] = text
-        out["llm_api_failed"] = api_failed
-        out["llm_api_error"] = err
-        out["llm_error"] = ""
-        out["llm_latency_s"] = latency
-
-        row_keys: set[str] = set()
-        if is_json_mode and text:
-            parsed, perr = try_parse_json(text)
-            out["llm_json_valid"] = parsed is not None
-            out["llm_json_error"] = perr or ""
-            out["llm_error"] = perr or ""
-            out["llm_json_raw"] = text
-
-            if parsed is not None:
-                flat = flatten_json(parsed, sep=".")
-                out["_llm_json_flat"] = flat  # internal
-                row_keys = set(flat.keys())
-
+    def work_one(idx: int, row: Dict[str, Any]):
+        out, row_keys, prompt, text = process_row(
+            row, csv_cols, prompt_template, provider, key_once, model, is_json_mode, model_params
+        )
+        storage.log_usage(user, provider, model, estimate_tokens(prompt), estimate_tokens(text))
         return idx, out, row_keys
 
     def run_job():
         worker_count = min(requested_workers, len(rows)) if rows else 1
         results: List[Optional[Dict[str, Any]]] = [None] * len(rows)
-        detected_keys: set[str] = set()
+        detected_keys: set = set()
         done_count = 0
         sent_count = 0
 
-        def submit_next(exec_obj, q: deque, fset: set, mapping: dict):
+        def submit_next(exec_obj, q, fset, mapping):
             nonlocal sent_count
             if not q:
                 return
             idx, r = q.popleft()
-            fut = exec_obj.submit(process_row, idx, r)
+            fut = exec_obj.submit(work_one, idx, r)
             fset.add(fut)
             mapping[fut] = idx
             sent_count += 1
-            sessions[sid]["progress"]["sent"] = sent_count
+            sess["progress"]["sent"] = sent_count
 
-        task_queue: deque[tuple[int, Dict[str, Any]]] = deque(list(enumerate(rows)))
-        futures_set: set = set()
-        future_to_idx: dict = {}
-
+        task_queue = deque(list(enumerate(rows)))
+        futures_set = set()
+        future_to_idx = {}
         try:
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 for _ in range(min(worker_count, len(rows))):
                     submit_next(executor, task_queue, futures_set, future_to_idx)
-
                 while futures_set:
-                    for future in as_completed(list(futures_set), timeout=None):
-                        futures_set.remove(future)
+                    for future in as_completed(list(futures_set)):
+                        futures_set.discard(future)
                         idx = future_to_idx.pop(future, None)
                         base_row = rows[idx] if idx is not None else {}
                         try:
                             _, out, row_keys = future.result()
                         except Exception as e:
-                            # Preserve row slot even on failure to keep output aligned.
                             out = {c: base_row.get(c) for c in csv_cols}
-                            out["llm_output"] = ""
-                            out["llm_api_failed"] = True
-                            out["llm_api_error"] = f"Failed: {e}"
-                            out["llm_error"] = ""
-                            out["llm_latency_s"] = 0
+                            out.update({
+                                "llm_output": "",
+                                "llm_api_failed": True,
+                                "llm_api_error": f"Failed: {e}",
+                                "llm_error": "",
+                                "llm_latency_s": 0,
+                            })
                             row_keys = set()
-                        results[idx] = out
-                        detected_keys.update(row_keys)
+                        if idx is not None:
+                            results[idx] = out
+                            detected_keys.update(row_keys)
                         done_count += 1
-                        sessions[sid]["progress"]["done"] = done_count
-
+                        sess["progress"]["done"] = done_count
                         submit_next(executor, task_queue, futures_set, future_to_idx)
-
-            # Fill any missing slots to keep row order intact.
             for idx, res in enumerate(results):
                 if res is None:
                     base_row = rows[idx]
-                    fallback = {c: base_row.get(c) for c in csv_cols}
-                    fallback["llm_output"] = ""
-                    fallback["llm_api_failed"] = True
-                    fallback["llm_api_error"] = "Processing failed"
-                    fallback["llm_error"] = ""
-                    fallback["llm_latency_s"] = 0
-                    results[idx] = fallback
-
+                    results[idx] = {
+                        **{c: base_row.get(c) for c in csv_cols},
+                        "llm_output": "",
+                        "llm_api_failed": True,
+                        "llm_api_error": "Processing failed",
+                        "llm_error": "",
+                        "llm_latency_s": 0,
+                    }
             sess["results"] = results
             sess["detected_json_keys"] = sorted(detected_keys)
-            run_id = _save_run_archive(
-                sess,
-                rows,
-                results,
-                sorted(detected_keys),
-                provider,
-                model,
-                run_name,
-                worker_count,
-                model_params,
+            run_id = storage.save_run_archive(
+                user, sess, rows, results, sorted(detected_keys),
+                provider, model, run_name, worker_count, model_params, prompt_template,
             )
             sess["current_run_id"] = run_id
-            sessions[sid]["progress"] = {
+            sess["progress"] = {
                 "status": "done",
                 "done": len(results),
                 "sent": len(results),
@@ -2030,7 +807,7 @@ async def run(
                 "run_id": run_id,
             }
         except Exception as e:
-            sessions[sid]["progress"] = {
+            sess["progress"] = {
                 "status": "error",
                 "done": done_count,
                 "sent": sent_count,
@@ -2039,17 +816,16 @@ async def run(
             }
 
     threading.Thread(target=run_job, daemon=True).start()
-
     resp = JSONResponse({"ok": True, "started": True})
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
+
 
 @app.post("/test", response_class=HTMLResponse)
 async def test_one(
     request: Request,
     sid_token: Optional[str] = Form(None),
     provider: str = Form(...),
-    model: str = Form(...),
+    model: Optional[str] = Form(None),
     api_key: str = Form(""),
     prompt_template: str = Form(...),
     json_mode: Optional[str] = Form(None),
@@ -2065,155 +841,93 @@ async def test_one(
     seed: Optional[str] = Form(None),
     reasoning_effort: Optional[str] = Form(None),
 ):
-    sid = resolve_sid(request, sid_token)
-    sess = sessions.get(sid, {})
+    sid, sess = resolve_work(request, sid_token)
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Model is required.", status_code=400)
     if "rows" not in sess:
         return PlainTextResponse("Upload a CSV first.", status_code=400)
-
     rows = [r for r in sess["rows"] if not _row_is_empty_dict(r)]
     rows = [{k: _normalize_value(v) for k, v in row.items()} for row in rows]
     if not rows:
-        return PlainTextResponse("No usable rows in CSV after dropping empty rows.", status_code=400)
+        return PlainTextResponse("No usable rows.", status_code=400)
     csv_cols = sess["csv_cols"]
     selected_cols = [c for c in (test_cols or []) if c in csv_cols]
-    # Persist selections in session
-    sess["provider"] = provider
-    sess["model"] = model
-    sess["api_key"] = api_key
-    sess["prompt_template"] = prompt_template
-    sess["json_mode"] = (json_mode == "1")
-    sess["test_cols"] = selected_cols
-    sess["send_model_params"] = (send_model_params == "1")
-    sess["enabled_params"] = enabled_params or []
-    sess["model_params_form"] = {
-        "temperature": temperature or "",
-        "top_p": top_p or "",
-        "max_output_tokens": max_output_tokens or "",
-        "presence_penalty": presence_penalty or "",
-        "frequency_penalty": frequency_penalty or "",
-        "seed": seed or "",
-        "reasoning_effort": reasoning_effort or "",
-    }
-    sid_token = serializer.dumps(sid)
-
+    sess.update({
+        "provider": provider,
+        "model": model,
+        "prompt_template": prompt_template,
+        "json_mode": json_mode == "1",
+        "test_cols": selected_cols,
+        "send_model_params": send_model_params == "1",
+        "enabled_params": enabled_params or [],
+        "model_params_form": {
+            "temperature": temperature or "",
+            "top_p": top_p or "",
+            "max_output_tokens": max_output_tokens or "",
+            "presence_penalty": presence_penalty or "",
+            "frequency_penalty": frequency_penalty or "",
+            "seed": seed or "",
+            "reasoning_effort": reasoning_effort or "",
+        },
+    })
     if not _prompt_has_placeholder(prompt_template, ["row_json"] + csv_cols):
-        return PlainTextResponse("Prompt must include at least one column placeholder or {{row_json}}.", status_code=400)
-
-    if _provider_requires_key(provider) and not api_key.strip():
+        return PlainTextResponse("Prompt must include at least one column placeholder or {row_json}.", status_code=400)
+    if provider_requires_key(provider) and not api_key.strip():
         return PlainTextResponse("API key is required for OpenAI/LangCC/Gemini.", status_code=400)
-
-    if test_row_idx is not None and 0 <= test_row_idx < len(rows):
-        row_idx = test_row_idx
-    else:
-        row_idx = random.randrange(len(rows))
+    row_idx = test_row_idx if test_row_idx is not None and 0 <= test_row_idx < len(rows) else random.randrange(len(rows))
     sess["last_test_row_idx"] = row_idx
     row = rows[row_idx]
-
-    row_json = json.dumps(row, ensure_ascii=False)
-    row_for_template = dict(row)
-    row_for_template["row_json"] = row_json
-    tmp = prompt_template.replace("{{row_json}}", "{row_json}")
-    prompt = safe_format(tmp, row_for_template)
-
+    model_params = parse_model_params(
+        send_model_params, enabled_params, temperature, top_p, max_output_tokens,
+        presence_penalty, frequency_penalty, seed, reasoning_effort,
+    )
     err = ""
-    text = ""
+    raw_output = ""
     latency = 0
-    pretty_text = ""
     try:
         t0 = time.time()
-        model_params = _parse_model_params(
-            send_model_params,
-            enabled_params,
-            temperature,
-            top_p,
-            max_output_tokens,
-            presence_penalty,
-            frequency_penalty,
-            seed,
-            reasoning_effort,
-        )
-        text = call_provider(provider, api_key.strip(), model.strip(), prompt, json_mode=(json_mode == "1"), model_params=model_params)
+        text = call_provider(provider, api_key.strip(), model.strip(), render_prompt(prompt_template, row), json_mode == "1", model_params)
         latency = round(time.time() - t0, 3)
-        _log_usage(provider, model, prompt, text)
-        parsed, _ = try_parse_json(text)
-        if parsed is not None:
-            pretty_text = json.dumps(parsed, ensure_ascii=False, indent=2)
+        storage.log_usage(request.state.user, provider, model, estimate_tokens(render_prompt(prompt_template, row)), estimate_tokens(text))
+        raw_output = text or ""
     except Exception as e:
         err = str(e)
-    if not pretty_text:
-        pretty_text = text or ""
+        raw_output = ""
+    sess["last_test"] = {
+        "row_idx": row_idx,
+        "row": row,
+        "output": raw_output,
+        "prompt_template": prompt_template,
+    }
+    sess["test_fixer"] = _empty_test_fixer()
+    test_saved_key = saved_key_for(request.state.user, provider)
+    resp = render(
+        request,
+        "test.html",
+        {
+            "nav": "run",
+            "user": request.state.user,
+            "row_idx": row_idx,
+            "total_rows": len(rows),
+            "provider": provider,
+            "model": model,
+            "latency": latency,
+            "err": err,
+            "selected_cols": selected_cols,
+            "row": row,
+            "row_json": json.dumps(row, ensure_ascii=False, indent=2),
+            "raw_output": raw_output,
+            "prompt_template": prompt_template,
+            "json_mode": json_mode == "1",
+            "sid_token": work_serializer.dumps(sid),
+            "saved_api_key": test_saved_key,
+            "saved_key_exists": bool(test_saved_key),
+            "accepted_name": sess.get("prompt_name") or "prompt",
+        },
+    )
+    return attach_session(resp, request, sid)
 
-    def format_value(v: Any) -> str:
-        s = "" if v is None else str(v)
-        escaped = html_escape(s)
-        return escaped.replace("\n", "<br><span class='mini-sep'></span><br>")
-
-    cols_display = "".join(
-        [
-            f"<div class='col-block'><div class='col-name'>{html_escape(c)}</div><div class='col-val'>{format_value(row.get(c, ''))}</div></div>"
-            for c in (selected_cols or [])
-        ]
-    ) or "<div class='small'>No columns selected for Test.</div>"
-
-    page = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Test Result</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 20px; background:#f5f7fb; color:#0f172a; }}
-    .wrap {{ display:flex; gap:20px; flex-wrap:wrap; }}
-    .pane {{ flex:1; min-width:280px; background:white; border:1px solid #e5e7eb; border-radius:12px; padding:16px; box-shadow:0 10px 30px rgba(15,23,42,0.08); max-height:70vh; overflow:auto; }}
-    h3 {{ margin-top:0; }}
-    pre {{ white-space:pre-wrap; word-break:break-word; background:#0f172a; color:#e5e7eb; padding:12px; border-radius:10px; font-size:13px; max-height:60vh; overflow:auto; }}
-    .small {{ font-size:12px; color:#6b7280; }}
-    .meta {{ margin:8px 0; font-size:13px; color:#334155; }}
-    .err {{ color:#b91c1c; }}
-    .col-block {{ border-bottom:1px dashed #e5e7eb; padding:6px 0; }}
-    .col-block:last-child {{ border-bottom:none; }}
-    .col-name {{ font-weight:600; margin-bottom:4px; color:#0f172a; }}
-    .col-val {{ white-space:pre-wrap; word-break:break-word; color:#1f2937; }}
-    .mini-sep {{ display:block; height:1px; background:#e5e7eb; margin:4px 0; }}
-  </style>
-</head>
-<body>
-  <h2>Test (random row #{row_idx + 1} of {len(rows)})</h2>
-  <div class="meta">Provider: {html_escape(provider)} — Model: {html_escape(model)} — Latency: {latency}s</div>
-  {"<div class='meta err'>Error: " + html_escape(err) + "</div>" if err else ""}
-  <div class="wrap">
-    <div class="pane">
-      <h3>Selected columns</h3>
-      {cols_display}
-      <div style="margin-top:12px;">
-        <details>
-          <summary>Full row JSON</summary>
-          <pre>{html_escape(row_json)}</pre>
-        </details>
-      </div>
-    </div>
-    <div class="pane">
-      <h3>Model response</h3>
-      <pre>{html_escape(pretty_text)}</pre>
-    </div>
-  </div>
-  <div style="margin-top:14px;">
-    <form action="/test" method="post" style="display:inline;">
-      <input type="hidden" name="sid_token" value="{html_escape(sid_token)}" />
-      <input type="hidden" name="provider" value="{html_escape(provider)}" />
-      <input type="hidden" name="model" value="{html_escape(model)}" />
-      <input type="hidden" name="api_key" value="{html_escape(api_key)}" />
-      <input type="hidden" name="prompt_template" value="{html_escape(prompt_template)}" />
-      {"<input type='hidden' name='json_mode' value='1' />" if (json_mode == "1") else ""}
-      {"".join([f'<input type="hidden" name="test_cols" value="{html_escape(c)}" />' for c in selected_cols])}
-      <button type="submit" style="background:#10b981;">Again</button>
-    </form>
-    <a href="/" style="margin-left:8px;"><button type="button">Back</button></a>
-  </div>
-</body>
-</html>
-"""
-    return HTMLResponse(page)
 
 @app.get("/export", response_class=HTMLResponse)
 def export_page(
@@ -2221,285 +935,52 @@ def export_page(
     filter_key: Optional[List[str]] = Query(None),
     filter_val: Optional[List[str]] = Query(None),
 ):
-    sid = get_or_create_session_id(request)
-    sess = sessions.get(sid, {})
-    has_csv = "csv_cols" in sess
-    has_results = "results" in sess and len(sess["results"]) > 0
-
-    if not has_csv:
+    sid, sess = get_work_session(request)
+    if "csv_cols" not in sess:
         resp = RedirectResponse(url="/", status_code=303)
-        set_session_cookie(resp, sid)
-        return resp
-
-    csv_cols = sess["csv_cols"]
-    detected_keys = sess.get("detected_json_keys", [])
-    filter_keys = filter_key or []
-    filter_vals = filter_val or []
-    filtered_indices = _filter_results_by_json(sess.get("results") or [], filter_keys, filter_vals)
-    filter_hidden = _hidden_json_filters(filter_keys, filter_vals)
-
-    csv_cols_html = render_checkbox_list("out_csv_cols", csv_cols, selected=[])
-    keys_html = (
-        render_checkbox_list("out_json_keys", detected_keys, selected=[])
-        if detected_keys
-        else "<div class='small'>No JSON keys detected yet. Run the prompt with JSON mode enabled.</div>"
-    )
-    stats_keys_selected = sess.get("stats_keys", [])
-    stats_keys_html = (
-        render_checkbox_list("stats_keys", detected_keys, selected=stats_keys_selected)
-        if detected_keys
-        else "<div class='small'>No JSON keys detected yet. Run the prompt with JSON mode enabled.</div>"
-    )
-    filter_rows_html = ""
-    for i in range(3):
-        current_key = filter_keys[i] if i < len(filter_keys) else ""
-        current_val = filter_vals[i] if i < len(filter_vals) else ""
-        key_options = ['<option value="">No filter</option>'] + [
-            f'<option value="{html_escape(k)}" {"selected" if k == current_key else ""}>{html_escape(k)}</option>'
-            for k in detected_keys
-        ]
-        val_options = [
-            f'<option value="">Any</option>',
-            f'<option value="true" {"selected" if current_val == "true" else ""}>True</option>',
-            f'<option value="false" {"selected" if current_val == "false" else ""}>False</option>',
-        ]
-        filter_rows_html += (
-            "<div class='filter-row'>"
-            f"<div><label>JSON attribute</label><select name='filter_key'>{''.join(key_options)}</select></div>"
-            f"<div><label>Value</label><select name='filter_val'>{''.join(val_options)}</select></div>"
-            "</div>"
-        )
-    result_choice_html = ""
+        return attach_session(resp, request, sid)
     results = sess.get("results") or []
-    for pos, result_idx in enumerate(filtered_indices[:200]):
+    detected_keys = sess.get("detected_json_keys") or []
+    pairs = filter_pairs(filter_key, filter_val)
+    filtered_indices = filter_results_by_json(results, [p["key"] for p in pairs], [p["val"] for p in pairs])
+    choices = []
+    csv_cols = sess["csv_cols"]
+    for result_idx in filtered_indices[:200]:
         r = results[result_idx]
         label_parts = []
         for c in csv_cols[:3]:
             val = str(r.get(c, ""))[:60]
             if val:
                 label_parts.append(f"{c}: {val}")
-        label = " | ".join(label_parts) or f"Row {result_idx + 1}"
-        failed = " API failed" if r.get("llm_api_failed") else ""
-        result_choice_html += (
-            f'<label style="display:block;margin:4px 0;">'
-            f'<input type="checkbox" name="result_idx" value="{result_idx}" checked /> '
-            f'#{result_idx + 1} {html_escape(label)}{html_escape(failed)}'
-            f'</label>'
-        )
-    if not result_choice_html:
-        result_choice_html = "<div class='small'>No rows match these filters.</div>"
+        choices.append({
+            "idx": result_idx,
+            "label": " | ".join(label_parts) or f"Row {result_idx + 1}",
+            "failed": bool(r.get("llm_api_failed")),
+            "output": r.get("llm_output", "") or "",
+        })
     current_run_id = sess.get("current_run_id", "")
     current_run_name = (sess.get("run_name") or "").strip()
-    current_run_text = (
-        f"Saved run: {current_run_name or current_run_id}"
-        if current_run_id
-        else "Unsaved current dataset"
+    current_run_text = f"Saved run: {current_run_name or current_run_id}" if current_run_id else "Unsaved current dataset"
+    resp = render(
+        request,
+        "results.html",
+        {
+            "nav": "results",
+            "user": request.state.user,
+            "has_results": bool(results),
+            "results": results,
+            "csv_cols": csv_cols,
+            "detected_keys": detected_keys,
+            "filter_pairs": pairs,
+            "filtered_count": len(filtered_indices),
+            "result_choices": choices,
+            "current_run_id": current_run_id,
+            "current_run_text": current_run_text,
+            "stats_keys": sess.get("stats_keys") or [],
+        },
     )
+    return attach_session(resp, request, sid)
 
-    page = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Results Workspace</title>
-  <style>
-    body {{ font-family:"Inter","Segoe UI",Arial,sans-serif; margin:0; background:#f6f8fb; color:#111827; }}
-    .shell {{ max-width:1240px; margin:0 auto; padding:24px; }}
-    .topbar {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px; }}
-    .brand h1 {{ margin:0; font-size:28px; letter-spacing:0; }}
-    .nav {{ display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
-    a {{ color:inherit; text-decoration:none; }}
-    .row {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; align-items:flex-start; }}
-    @media (max-width: 900px) {{ .row {{ grid-template-columns:1fr; }} .topbar {{ flex-direction:column; }} .nav {{ justify-content:flex-start; }} }}
-    .card,.filter {{ background:white; border:1px solid #e5e7eb; border-radius:8px; padding:16px; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
-    .filter {{ margin:0 0 18px; }}
-    label {{ display:block; margin-top:10px; font-weight:600; }}
-    select, input[type="text"] {{ width:100%; padding:9px 10px; margin-top:6px; border:1px solid #dbe1ea; border-radius:8px; }}
-    .small {{ font-size:12px; color:#64748b; margin-top:6px; }}
-    .box {{ max-height: 340px; overflow:auto; border:1px solid #e5e7eb; padding:10px; border-radius:8px; background:#fbfcfe; }}
-    button {{ padding:9px 12px; border:none; border-radius:8px; background:#2563eb; color:white; font-weight:700; cursor:pointer; }}
-    button.secondary {{ background:#e5e7eb; color:#111827; }}
-    .ok {{ color:#0a7; }}
-    .warn {{ color:#b60; }}
-    .overlay {{
-      position: fixed;
-      inset: 0;
-      background: rgba(15, 23, 42, 0.5);
-      display: none;
-      align-items: center;
-      justify-content: center;
-      z-index: 999;
-    }}
-    .overlay .panel {{
-      background: white;
-      padding: 20px;
-      border-radius: 12px;
-      width: 420px;
-      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.3);
-      max-height: 80vh;
-      overflow: auto;
-    }}
-    .modal-actions {{ display:flex; justify-content:flex-end; gap:10px; margin-top:14px; }}
-    .filter-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-top:8px; }}
-    .filter-row > div {{ flex:1; min-width:160px; }}
-    .actions {{ display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 0; }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-  <div class="topbar">
-    <div class="brand">
-      <h1>Results Workspace</h1>
-      <div class="small">{html_escape(current_run_text)} · {len(results)} result rows · {len(detected_keys)} JSON keys</div>
-    </div>
-    <div class="nav">
-      <a href="/"><button type="button" class="secondary">New Run</button></a>
-      <a href="/runs"><button type="button" class="secondary">Run History</button></a>
-      {f'<a href="/runs/{html_escape(current_run_id)}/download/input"><button type="button" class="secondary">Saved Input</button></a>' if current_run_id else ""}
-      {f'<a href="/runs/{html_escape(current_run_id)}/download/output"><button type="button" class="secondary">Saved Output</button></a>' if current_run_id else ""}
-    </div>
-  </div>
-
-  <div class="filter">
-    {"<span class='ok'>Run results loaded.</span>" if has_results else "<span class='warn'>No run results yet. Go back and run first.</span>"}
-    <div class="small">Filter rows, review responses, calculate stats, create a rerun set, or download a custom CSV.</div>
-  </div>
-
-  <div class="filter">
-    <form action="/export" method="get">
-      <h3>1. Filter Rows</h3>
-      {filter_rows_html}
-      <div style="margin-top:10px;">
-        <button type="submit">Apply filters</button>
-        <a href="/export" style="margin-left:8px;"><button type="button" style="background:#94a3b8;">Clear</button></a>
-      </div>
-      <div class="small">Showing {len(filtered_indices)} of {len(results)} rows. Multiple filters use AND.</div>
-    </form>
-  </div>
-
-  <div class="filter">
-    <form action="/select-results" method="post">
-      {filter_hidden}
-      <h3>2. Create A New Batch From Selected Rows</h3>
-      <div style="margin:6px 0; display:flex; gap:8px; flex-wrap:wrap;">
-        <button type="button" class="toggle-btn" data-target="result_idx" data-action="all">Select all shown</button>
-        <button type="button" class="toggle-btn" data-target="result_idx" data-action="none">Select none</button>
-      </div>
-      <div class="box">{result_choice_html}</div>
-      <div class="small">The first 200 matching rows are shown here. Applying replaces the active dataset with those original input rows, ready to run again.</div>
-      <div style="margin-top:10px;">
-        <button type="submit" {"disabled" if not has_results or not filtered_indices else ""} style="background:#0f766e;">Use selected as new set</button>
-      </div>
-    </form>
-  </div>
-
-  <form action="/download" method="post">
-    {filter_hidden}
-    <h3>3. Download A Custom CSV</h3>
-    <div class="row">
-      <div class="card">
-        <h3>Input Columns</h3>
-        <div style="margin:6px 0; display:flex; gap:8px; flex-wrap:wrap;">
-          <button type="button" class="toggle-btn" data-target="out_csv_cols" data-action="all">Select all</button>
-          <button type="button" class="toggle-btn" data-target="out_csv_cols" data-action="none">Select none</button>
-        </div>
-        <div class="box">{csv_cols_html}</div>
-      </div>
-
-      <div class="card">
-        <h3>Model Output</h3>
-
-        <label>JSON export mode</label>
-        <select name="json_export_mode">
-          <option value="raw_json">Raw JSON column (llm_json_raw)</option>
-          <option value="flatten" selected>Flatten selected JSON keys into columns</option>
-        </select>
-
-        <label>Output prefix</label>
-        <input type="text" name="out_prefix" value="out_" />
-
-        <h4 style="margin-top:14px;">Discovered JSON keys</h4>
-        <div style="margin:6px 0; display:flex; gap:8px; flex-wrap:wrap;">
-          <button type="button" class="toggle-btn" data-target="out_json_keys" data-action="all">Select all</button>
-          <button type="button" class="toggle-btn" data-target="out_json_keys" data-action="none">Select none</button>
-        </div>
-        <div class="box">{keys_html}</div>
-        <div class="small">Keys appear after you run at least once with JSON mode enabled.</div>
-      </div>
-    </div>
-
-    <div class="actions">
-      <button type="submit" {"disabled" if not has_results else ""}>Download output.csv</button>
-      <button type="button" id="stats-button" {"disabled" if not has_results else ""} style="background:#0f766e;">Stats</button>
-      <a href="/review?idx=0"><button type="button" {"disabled" if not has_results else ""}>Review rows</button></a>
-    </div>
-  </form>
-  <div class="overlay" id="stats-overlay">
-    <div class="panel">
-      <h3>Stats on JSON keys</h3>
-      <div style="margin:6px 0; display:flex; gap:8px; flex-wrap:wrap;">
-        <button type="button" class="toggle-btn" data-target="stats_keys" data-action="all">Select all</button>
-        <button type="button" class="toggle-btn" data-target="stats_keys" data-action="none">Select none</button>
-      </div>
-      <form action="/stats" method="post" id="stats-form">
-        <div class="box" style="margin-top:8px; max-height:320px; overflow:auto;">
-          {stats_keys_html}
-        </div>
-        <div class="small">Choose JSON output keys to compute true/false stats.</div>
-        <div class="modal-actions">
-          <button type="button" id="stats-cancel" style="background:#94a3b8;">Cancel</button>
-          <button type="submit" id="stats-confirm" style="background:#0f766e;">Run stats</button>
-        </div>
-      </form>
-    </div>
-  </div>
-  <script>
-    (() => {{
-      function toggleGroup(name, action) {{
-        const boxes = Array.from(document.querySelectorAll(`input[type="checkbox"][name="${{name}}"]`));
-        const shouldCheck = action === "all";
-        boxes.forEach((b) => {{
-          b.checked = shouldCheck;
-        }});
-      }}
-      document.querySelectorAll(".toggle-btn").forEach((btn) => {{
-        btn.addEventListener("click", () => {{
-          const target = btn.getAttribute("data-target");
-          const action = btn.getAttribute("data-action");
-          if (target && action) {{
-            toggleGroup(target, action);
-          }}
-        }});
-      }});
-
-      const statsBtn = document.getElementById("stats-button");
-      const statsOverlay = document.getElementById("stats-overlay");
-      const statsCancel = document.getElementById("stats-cancel");
-      function setModalVisible(el, visible) {{
-        if (!el) return;
-        el.style.display = visible ? "flex" : "none";
-      }}
-      if (statsBtn) {{
-        statsBtn.addEventListener("click", (e) => {{
-          e.preventDefault();
-          setModalVisible(statsOverlay, true);
-        }});
-      }}
-      if (statsCancel) {{
-        statsCancel.addEventListener("click", (e) => {{
-          e.preventDefault();
-          setModalVisible(statsOverlay, false);
-        }});
-      }}
-    }})();
-  </script>
-  </div>
-</body>
-</html>
-"""
-    resp = HTMLResponse(page)
-    set_session_cookie(resp, sid)
-    return resp
 
 @app.post("/download")
 async def download(
@@ -2512,191 +993,112 @@ async def download(
     flatten_sep: str = ".",
     out_prefix: str = Form("out_"),
 ):
-    sid = resolve_sid(request)
-    sess = sessions.get(sid, {})
-    all_results = sess.get("results")
-    results = all_results
+    sid, sess = get_work_session(request)
+    results = sess.get("results")
     if not results:
         return PlainTextResponse("No results to export. Run first.", status_code=400)
     if filter_key or filter_val:
-        indices = _filter_results_by_json(results, filter_key, filter_val)
+        indices = filter_results_by_json(results, filter_key, filter_val)
         results = [results[i] for i in indices]
-
     csv_cols = sess.get("csv_cols", [])
-    out_csv_cols = out_csv_cols or []
-    out_csv_cols = [c for c in out_csv_cols if c in csv_cols]
-
-    out_json_keys = out_json_keys or []
+    out_csv_cols = [c for c in (out_csv_cols or []) if c in csv_cols]
     out_df = _build_output_dataframe(
-        results,
-        csv_cols,
-        out_csv_cols=out_csv_cols,
-        out_json_keys=out_json_keys,
-        json_export_mode=json_export_mode,
-        flatten_sep=flatten_sep,
-        out_prefix=out_prefix,
+        results, csv_cols, out_csv_cols=out_csv_cols, out_json_keys=out_json_keys or [],
+        json_export_mode=json_export_mode, flatten_sep=flatten_sep, out_prefix=out_prefix,
     )
     buf = io.StringIO()
-    # Quote all fields so commas/newlines inside values don't break row boundaries when re-opened.
     out_df.to_csv(buf, index=False, quoting=csv.QUOTE_ALL, lineterminator="\n")
-    out_bytes = buf.getvalue().encode("utf-8")
-
     return StreamingResponse(
-        io.BytesIO(out_bytes),
+        io.BytesIO(buf.getvalue().encode("utf-8")),
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="output.csv"'},
     )
 
+
 @app.post("/select-results")
-async def select_results_for_new_set(
-    request: Request,
-    result_idx: Optional[List[int]] = Form(None),
-):
-    sid = resolve_sid(request)
-    sess = sessions.get(sid, {})
+async def select_results_for_new_set(request: Request, result_idx: Optional[List[int]] = Form(None)):
+    sid, sess = get_work_session(request)
     results = sess.get("results") or []
     csv_cols = sess.get("csv_cols") or []
     if not results or not csv_cols:
         return PlainTextResponse("No results to select from.", status_code=400)
-
     selected = []
     for idx in result_idx or []:
         if 0 <= idx < len(results):
-            selected.append(_result_to_base_row(results[idx], csv_cols))
+            selected.append(result_to_base_row(results[idx], csv_cols))
     if not selected:
         return PlainTextResponse("Choose at least one row.", status_code=400)
-
     df = pd.DataFrame(selected).reindex(columns=csv_cols)
     sess["csv_df"] = df
     sess["rows"] = df.to_dict(orient="records")
-    sess.pop("results", None)
-    sess.pop("detected_json_keys", None)
-    sess.pop("progress", None)
-    sess.pop("current_run_id", None)
-    sess.pop("last_test_row_idx", None)
+    for key in ("results", "detected_json_keys", "progress", "current_run_id", "last_test_row_idx"):
+        sess.pop(key, None)
     resp = RedirectResponse(url="/", status_code=303)
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
+
 
 @app.get("/runs", response_class=HTMLResponse)
-def runs_page(request: Request):
-    sid = get_or_create_session_id(request)
-    runs = _list_saved_runs()
-    rows_html = ""
-    for meta in runs:
-        run_id = meta.get("run_id", "")
-        display_name = (meta.get("run_name") or "").strip()
-        created = meta.get("created_at", "")
-        try:
-            created = datetime.fromisoformat(created).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            pass
-        title = display_name or created
-        rows_html += f"""
-        <tr>
-          <td><strong>{html_escape(title)}</strong><div class="small">{html_escape(created)} · {html_escape(run_id)}</div></td>
-          <td>{html_escape(meta.get("provider", ""))}<div class="small">{html_escape(meta.get("model", ""))}</div></td>
-          <td>{meta.get("row_count", 0)}</td>
-          <td>{meta.get("failed_count", 0)}</td>
-          <td>{meta.get("json_key_count", 0)}</td>
-          <td class="actions">
-            <form action="/runs/{html_escape(run_id)}/open" method="post" style="display:inline;">
-              <button type="submit">Open results</button>
-            </form>
-            <a href="/runs/{html_escape(run_id)}/download/input"><button type="button" class="secondary">Input CSV</button></a>
-            <a href="/runs/{html_escape(run_id)}/download/output"><button type="button" class="secondary">Output CSV</button></a>
-          </td>
-        </tr>
-        """
-    if not rows_html:
-        rows_html = "<tr><td colspan='6'>No saved runs yet. Run a CSV batch and it will appear here.</td></tr>"
+def runs_page(request: Request, q: str = ""):
+    sid, _ = get_work_session(request)
+    query = (q or "").strip().lower()
+    rows = []
+    for meta in storage.list_saved_runs(request.state.user):
+        hay = " ".join([
+            str(meta.get("run_name", "")),
+            str(meta.get("run_id", "")),
+            str(meta.get("prompt_name", "")),
+            str(meta.get("provider", "")),
+            str(meta.get("model", "")),
+            str(meta.get("created_at", "")),
+        ]).lower()
+        if query and query not in hay:
+            continue
+        rows.append({
+            **meta,
+            "title": run_title(meta),
+            "created": pretty_created(meta),
+        })
+    resp = render(
+        request,
+        "runs.html",
+        {"nav": "history", "user": request.state.user, "runs": rows, "q": q},
+    )
+    return attach_session(resp, request, sid)
 
-    page = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Run History</title>
-  <style>
-    body {{ margin:0; font-family:"Inter","Segoe UI",Arial,sans-serif; background:#f6f8fb; color:#101827; }}
-    .shell {{ max-width:1180px; margin:0 auto; padding:24px; }}
-    .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:18px; }}
-    h1 {{ margin:0; font-size:26px; }}
-    .nav {{ display:flex; gap:8px; flex-wrap:wrap; }}
-    a {{ color:inherit; text-decoration:none; }}
-    button {{ border:none; border-radius:8px; padding:8px 12px; background:#2563eb; color:white; font-weight:700; cursor:pointer; }}
-    button.secondary {{ background:#e5e7eb; color:#111827; }}
-    .panel {{ background:white; border:1px solid #e5e7eb; border-radius:8px; overflow:hidden; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th,td {{ padding:12px; border-bottom:1px solid #edf0f4; text-align:left; vertical-align:top; font-size:14px; }}
-    th {{ background:#f9fafb; color:#475569; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
-    .small {{ color:#64748b; font-size:12px; margin-top:4px; }}
-    .actions {{ white-space:nowrap; }}
-  </style>
-</head>
-<body>
-  <div class="shell">
-    <div class="topbar">
-      <div>
-        <h1>Run History</h1>
-        <div class="small">Every completed batch is saved with its input CSV, output CSV, results, and metadata.</div>
-      </div>
-      <div class="nav">
-        <a href="/"><button type="button" class="secondary">New Run</button></a>
-        <a href="/export"><button type="button" class="secondary">Current Results</button></a>
-      </div>
-    </div>
-    <div class="panel">
-      <table>
-        <thead>
-          <tr>
-            <th>Run</th>
-            <th>Provider / Model</th>
-            <th>Rows</th>
-            <th>API Failures</th>
-            <th>JSON Keys</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>{rows_html}</tbody>
-      </table>
-    </div>
-  </div>
-</body>
-</html>
-"""
-    resp = HTMLResponse(page)
-    set_session_cookie(resp, sid)
-    return resp
 
 @app.post("/runs/{run_id}/open")
 async def open_saved_run(request: Request, run_id: str):
-    sid = get_or_create_session_id(request)
-    sess = sessions.get(sid, {})
+    sid, sess = get_work_session(request)
     try:
-        _load_run_into_session(run_id, sess)
+        storage.load_run_into_session(request.state.user, run_id, sess)
+    except PermissionError:
+        return PlainTextResponse("Not your run.", status_code=403)
     except Exception as e:
         return PlainTextResponse(f"Failed to open run: {e}", status_code=404)
     resp = RedirectResponse(url="/export", status_code=303)
-    set_session_cookie(resp, sid)
-    return resp
+    return attach_session(resp, request, sid)
+
 
 @app.get("/runs/{run_id}/download/{kind}")
-def download_saved_run(run_id: str, kind: str):
-    run_path = _run_dir(run_id)
-    file_map = {
-        "input": ("input.csv", "text/csv"),
-        "output": ("output.csv", "text/csv"),
-        "results": ("results.json", "application/json"),
-        "metadata": ("metadata.json", "application/json"),
-    }
-    if kind not in file_map:
-        return PlainTextResponse("Unknown run file.", status_code=404)
-    fname, media_type = file_map[kind]
-    path = os.path.join(run_path, fname)
-    if not os.path.isfile(path):
-        return PlainTextResponse("Run file not found.", status_code=404)
-    return FileResponse(path, media_type=media_type, filename=f"{_safe_run_id(run_id)}-{fname}")
+def download_saved_run(request: Request, run_id: str, kind: str):
+    try:
+        path = storage.run_file(request.state.user, run_id, kind)
+    except PermissionError:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    except ValueError:
+        return JSONResponse({"error": "unknown file"}, status_code=404)
+    except FileNotFoundError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    media = {
+        "input": "text/csv",
+        "output": "text/csv",
+        "results": "application/json",
+        "metadata": "application/json",
+        "prompt": "text/plain",
+        "review": "application/json",
+    }.get(kind, "application/octet-stream")
+    return FileResponse(path, media_type=media, filename=f"{run_id}-{path.name}")
+
 
 @app.post("/stats", response_class=HTMLResponse)
 async def stats(
@@ -2708,32 +1110,27 @@ async def stats(
     stats_filter_key: str = Form(""),
     stats_filter_val: str = Form(""),
 ):
-    sid = resolve_sid(request)
-    sess = sessions.get(sid, {})
+    sid, sess = get_work_session(request)
     results = sess.get("results") or []
     if not results:
         return PlainTextResponse("No results to compute stats. Run first.", status_code=400)
-
     selected_keys = stats_keys if stats_keys is not None else sess.get("stats_keys", [])
     sess["stats_keys"] = selected_keys
-    if stats_date_col and stats_date_col in (sess.get("csv_cols") or []):
-        sess["stats_date_col"] = stats_date_col
-    else:
+    csv_cols = sess.get("csv_cols") or []
+    if stats_date_col not in csv_cols:
         stats_date_col = ""
-        sess["stats_date_col"] = ""
+    sess["stats_date_col"] = stats_date_col
     sess["stats_date_from"] = stats_date_from or ""
     sess["stats_date_to"] = stats_date_to or ""
-
     date_from = _parse_date(stats_date_from)
     date_to = _parse_date(stats_date_to)
-
     filtered_results = results
     filter_notes = []
     if stats_date_col and (date_from or date_to):
         tmp = []
         for r in results:
             raw_val = r.get(stats_date_col)
-            if _is_empty_value(raw_val):
+            if raw_val in (None, ""):
                 continue
             dt = pd.to_datetime(raw_val, errors="coerce")
             if pd.isna(dt):
@@ -2745,18 +1142,10 @@ async def stats(
                 continue
             tmp.append(r)
         filtered_results = tmp
-        range_parts = []
-        if date_from:
-            range_parts.append(f"from {date_from.isoformat()}")
-        if date_to:
-            range_parts.append(f"to {date_to.isoformat()}")
-        range_text = " ".join(range_parts) if range_parts else "selected range"
-        filter_notes.append(f"Filtered by {stats_date_col} ({range_text}).")
-    elif stats_date_col:
-        filter_notes.append(f"Date column selected ({stats_date_col}) but no date range provided.")
-
-    stats_filter_key = stats_filter_key if stats_filter_key in (sess.get("detected_json_keys") or []) else ""
-    stats_filter_val = stats_filter_val.lower().strip() if stats_filter_val else ""
+        filter_notes.append(f"Filtered by {stats_date_col}.")
+    detected = sess.get("detected_json_keys") or []
+    stats_filter_key = stats_filter_key if stats_filter_key in detected else ""
+    stats_filter_val = (stats_filter_val or "").lower().strip()
     if stats_filter_key and stats_filter_val in ("true", "false"):
         target = stats_filter_val == "true"
         filtered_results = [
@@ -2764,142 +1153,44 @@ async def stats(
             if _coerce_bool((r.get("_llm_json_flat", {}) or {}).get(stats_filter_key)) is target
         ]
         filter_notes.append(f"Filtered where {stats_filter_key} is {stats_filter_val}.")
-
     total_rows = len(filtered_results)
-    rows_html = ""
-    stats_keys_hidden_base = "".join(
-        [f'<input type="hidden" name="stats_keys" value="{html_escape(k)}" />' for k in selected_keys]
-    )
-    date_hidden = (
-        f'<input type="hidden" name="stats_date_col" value="{html_escape(stats_date_col)}" />'
-        f'<input type="hidden" name="stats_date_from" value="{html_escape(stats_date_from)}" />'
-        f'<input type="hidden" name="stats_date_to" value="{html_escape(stats_date_to)}" />'
-    )
-    def stat_filter_button(key: str, val: str, count: int) -> str:
-        return (
-            '<form action="/stats" method="post" style="display:inline;">'
-            f'{stats_keys_hidden_base}{date_hidden}'
-            f'<input type="hidden" name="stats_filter_key" value="{html_escape(key)}" />'
-            f'<input type="hidden" name="stats_filter_val" value="{html_escape(val)}" />'
-            f'<button type="submit" style="padding:4px 8px;background:#0f766e;">{count}</button>'
-            '</form>'
-        )
+    stat_rows = []
     for key in selected_keys:
-        true_count = 0
-        for r in filtered_results:
-            flat = r.get("_llm_json_flat", {}) or {}
-            val = flat.get(key)
-            if _coerce_bool(val) is True:
-                true_count += 1
+        true_count = sum(1 for r in filtered_results if _coerce_bool((r.get("_llm_json_flat", {}) or {}).get(key)) is True)
         false_count = total_rows - true_count
-        true_pct = (true_count / total_rows * 100) if total_rows else 0
-        false_pct = (false_count / total_rows * 100) if total_rows else 0
-        rows_html += (
-            "<tr>"
-            f"<td>{html_escape(key)}</td>"
-            f"<td>{total_rows}</td>"
-            f"<td>{stat_filter_button(key, 'true', true_count)}</td>"
-            f"<td>{stat_filter_button(key, 'false', false_count)}</td>"
-            f"<td>{true_pct:.2f}%</td>"
-            f"<td>{false_pct:.2f}%</td>"
-            "</tr>"
-        )
+        stat_rows.append({
+            "key": key,
+            "true_count": true_count,
+            "false_count": false_count,
+            "true_pct": (true_count / total_rows * 100) if total_rows else 0,
+            "false_pct": (false_count / total_rows * 100) if total_rows else 0,
+        })
+    resp = render(
+        request,
+        "stats.html",
+        {
+            "nav": "results",
+            "user": request.state.user,
+            "selected_keys": selected_keys,
+            "csv_cols": csv_cols,
+            "stats_date_col": stats_date_col,
+            "stats_date_from": stats_date_from,
+            "stats_date_to": stats_date_to,
+            "stats_filter_key": stats_filter_key,
+            "stat_rows": stat_rows,
+            "total_rows": total_rows,
+            "filter_note": " ".join(filter_notes) if filter_notes else "No filters applied.",
+        },
+    )
+    return attach_session(resp, request, sid)
 
-    if not rows_html:
-        rows_html = "<tr><td colspan='6'>No JSON keys selected.</td></tr>"
 
-    csv_cols = sess.get("csv_cols") or []
-    date_options = ['<option value="">No date filter</option>'] + [
-        f'<option value="{html_escape(c)}" {"selected" if c == stats_date_col else ""}>{html_escape(c)}</option>'
-        for c in csv_cols
-    ]
-    stats_date_select = "\n".join(date_options)
-    stats_keys_hidden = stats_keys_hidden_base
-    clear_filter_html = ""
-    if stats_filter_key and stats_filter_val in ("true", "false"):
-        clear_filter_html = (
-            '<form action="/stats" method="post" style="display:inline;margin-left:8px;">'
-            f'{stats_keys_hidden_base}{date_hidden}'
-            '<button type="submit" style="background:#94a3b8;">Clear stat filter</button>'
-            '</form>'
-        )
-    filter_note = " ".join(filter_notes) if filter_notes else "No filters applied."
+def _review_state(request: Request):
+    sid, sess = get_work_session(request)
+    run_id = sess.get("current_run_id")
+    review = storage.load_review(request.state.user, run_id) if run_id else storage._empty_review()
+    return sid, sess, run_id, review
 
-    page = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Stats</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 20px; background:#f5f7fb; color:#0f172a; }}
-    table {{ width:100%; border-collapse:collapse; background:white; border-radius:10px; overflow:hidden; }}
-    th, td {{ padding:10px 12px; border-bottom:1px solid #e5e7eb; text-align:left; font-size:14px; }}
-    th {{ background:#f1f5f9; }}
-    .small {{ font-size:12px; color:#6b7280; margin-top:8px; }}
-    .nav {{ display:flex; gap:10px; align-items:center; margin-bottom:12px; }}
-    button {{ padding:8px 12px; border:none; border-radius:8px; background:#0b74ff; color:white; cursor:pointer; }}
-    .filter {{ background:white; border:1px solid #e5e7eb; border-radius:10px; padding:12px; margin:12px 0; }}
-    .filter-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }}
-    .filter-row > div {{ flex:1; min-width:160px; }}
-    label {{ display:block; font-size:12px; color:#475569; margin-bottom:4px; }}
-    input[type="date"], select {{ width:100%; padding:8px; border:1px solid #e5e7eb; border-radius:8px; }}
-  </style>
-</head>
-<body>
-  <div class="nav">
-    <a href="/export"><button type="button">Back to export</button></a>
-    {clear_filter_html}
-  </div>
-  <h2>Stats</h2>
-  <div class="filter">
-    <form action="/stats" method="post">
-      {stats_keys_hidden}
-      <div class="filter-row">
-        <div>
-          <label>Date column (optional)</label>
-          <select name="stats_date_col">
-            {stats_date_select}
-          </select>
-        </div>
-        <div>
-          <label>From</label>
-          <input type="date" name="stats_date_from" value="{html_escape(stats_date_from)}" />
-        </div>
-        <div>
-          <label>To</label>
-          <input type="date" name="stats_date_to" value="{html_escape(stats_date_to)}" />
-        </div>
-        <div style="flex:0 0 auto;">
-          <button type="submit">Apply filter</button>
-        </div>
-      </div>
-      <div class="small">If no date column is selected, no date filtering is applied.</div>
-    </form>
-  </div>
-  <table>
-    <thead>
-      <tr>
-        <th>JSON key</th>
-        <th>Rows</th>
-        <th>True</th>
-        <th>False</th>
-        <th>% True</th>
-        <th>% False</th>
-      </tr>
-    </thead>
-    <tbody>
-      {rows_html}
-    </tbody>
-  </table>
-  <div class="small">Note: missing or non-boolean values are treated as false.</div>
-  <div class="small">{html_escape(filter_note)} Total rows: {total_rows}.</div>
-</body>
-</html>
-"""
-    resp = HTMLResponse(page)
-    set_session_cookie(resp, sid)
-    return resp
 
 @app.get("/review", response_class=HTMLResponse)
 def review(
@@ -2907,158 +1198,475 @@ def review(
     idx: int = 0,
     filter_key: Optional[List[str]] = Query(None),
     filter_val: Optional[List[str]] = Query(None),
-    key: str = "",
-    val: str = "",
 ):
-    sid = get_or_create_session_id(request)
-    sess = sessions.get(sid, {})
+    sid, sess, run_id, review_data = _review_state(request)
     results = sess.get("results") or []
-    csv_cols = sess.get("csv_cols") or []
-    detected_keys = sess.get("detected_json_keys") or []
     if not results:
         resp = RedirectResponse(url="/", status_code=303)
-        set_session_cookie(resp, sid)
-        return resp
-
-    filter_keys = filter_key or ([key] if key else [])
-    filter_vals = filter_val or ([val] if val else [])
-    filter_keys = [k if k in detected_keys else "" for k in filter_keys]
-    filter_vals = [v.lower().strip() for v in filter_vals]
-    filtered_indices = _filter_results_by_json(results, filter_keys, filter_vals)
-
+        return attach_session(resp, request, sid)
+    csv_cols = sess.get("csv_cols") or []
+    detected_keys = sess.get("detected_json_keys") or []
+    pairs = filter_pairs(filter_key, filter_val)
+    filtered_indices = filter_results_by_json(results, [p["key"] for p in pairs], [p["val"] for p in pairs])
     total = len(filtered_indices)
     row = None
+    result_idx = None
     if total > 0:
         idx = max(0, min(idx, total - 1))
-        row = results[filtered_indices[idx]]
-
-    def format_value(v: Any) -> str:
-        s = "" if v is None else str(v)
-        escaped = html_escape(s)
-        return escaped.replace("\n", "<br><span class='mini-sep'></span><br>")
-
+        result_idx = filtered_indices[idx]
+        row = results[result_idx]
+    pretty_text = ""
+    err = ""
     if row is not None:
-        cols_display = "".join(
-            [
-                f"<div class='col-block'><div class='col-name'>{html_escape(c)}</div><div class='col-val'>{format_value(row.get(c, ''))}</div></div>"
-                for c in csv_cols
-            ]
-        ) or "<div class='small'>No columns to display.</div>"
         text = row.get("llm_output", "") or ""
-        pretty_text = text
         parsed, _ = try_parse_json(text)
-        if parsed is not None:
-            try:
-                pretty_text = json.dumps(parsed, ensure_ascii=False, indent=2)
-            except Exception:
-                pretty_text = text
+        pretty_text = json.dumps(parsed, ensure_ascii=False, indent=2) if parsed is not None else text
         err = row.get("llm_api_error", "") or row.get("llm_error", "") or ""
-    else:
-        cols_display = "<div class='small'>No rows match this filter.</div>"
-        pretty_text = ""
-        err = ""
+    note_rec = review_data.get("notes", {}).get(str(result_idx), {}) if result_idx is not None else {}
+    noted_count = sum(
+        1 for rec in (review_data.get("notes") or {}).values()
+        if isinstance(rec, dict) and ((rec.get("verdict") or "").strip() or (rec.get("note") or "").strip())
+    )
+    fixer = review_data.get("fixer") or {}
+    analysis = fixer.get("analysis")
+    if isinstance(analysis, dict):
+        analysis = json.dumps(analysis, ensure_ascii=False)
+    critic = fixer.get("critic")
+    if isinstance(critic, dict):
+        critic = json.dumps(critic, ensure_ascii=False)
+    qs = filter_qs(pairs)
+    review_provider = sess.get("provider", "openai")
+    review_saved_key = saved_key_for(request.state.user, review_provider)
+    resp = render(
+        request,
+        "review.html",
+        {
+            "nav": "review",
+            "user": request.state.user,
+            "idx": idx,
+            "prev_idx": max(0, idx - 1) if total else 0,
+            "next_idx": min(total - 1, idx + 1) if total else 0,
+            "display_index": idx + 1 if row is not None else 0,
+            "total": total,
+            "total_all": len(results),
+            "filter_pairs": pairs,
+            "filter_qs": qs,
+            "detected_keys": detected_keys,
+            "csv_cols": csv_cols,
+            "row": row,
+            "pretty_text": pretty_text,
+            "err": err,
+            "verdict": note_rec.get("verdict", ""),
+            "note": note_rec.get("note", ""),
+            "prompt_draft": review_data.get("prompt_draft") or sess.get("prompt_template") or "",
+            "provider": review_provider,
+            "model": sess.get("model", "gpt-5-mini"),
+            "saved_api_key": review_saved_key,
+            "saved_key_exists": bool(review_saved_key),
+            "proposed_prompt": fixer.get("proposed_prompt") or "",
+            "diff_lines": fixer.get("diff") or [],
+            "analysis": analysis or "",
+            "critic": critic or "",
+            "fixer_status": fixer.get("error") or fixer.get("status") or "",
+            "current_run_id": run_id or "",
+            "result_idx": result_idx,
+            "accepted_name": sess.get("prompt_name") or "prompt",
+            "noted_count": noted_count,
+            "fixer_fix_id": fixer.get("fix_id") or "",
+            "prompt_name": sess.get("prompt_name") or "",
+        },
+    )
+    return attach_session(resp, request, sid)
 
-    prev_idx = max(0, idx - 1) if total > 0 else 0
-    next_idx = min(total - 1, idx + 1) if total > 0 else 0
-    display_index = idx + 1 if row is not None else 0
-    total_all = len(results)
-    filter_rows_html = ""
-    filter_qs_parts = []
-    for i in range(3):
-        current_key = filter_keys[i] if i < len(filter_keys) else ""
-        current_val = filter_vals[i] if i < len(filter_vals) else ""
-        key_options = ['<option value="">All attributes</option>'] + [
-            f'<option value="{html_escape(k)}" {"selected" if k == current_key else ""}>{html_escape(k)}</option>'
-            for k in detected_keys
-        ]
-        val_options = [
-            ('', 'Any value'),
-            ('true', 'True'),
-            ('false', 'False'),
-        ]
-        val_options_html = "\n".join(
-            [
-                f'<option value="{v}" {"selected" if v == current_val else ""}>{label}</option>'
-                for v, label in val_options
-            ]
-        )
-        filter_rows_html += (
-            '<div class="filter-row">'
-            f'<div><label>JSON attribute</label><select name="filter_key">{"".join(key_options)}</select></div>'
-            f'<div><label>Value</label><select name="filter_val">{val_options_html}</select></div>'
-            '</div>'
-        )
-        if current_key and current_val in ("true", "false"):
-            filter_qs_parts.append(f"filter_key={quote(current_key)}")
-            filter_qs_parts.append(f"filter_val={quote(current_val)}")
-    filter_qs = ("&" + "&".join(filter_qs_parts)) if filter_qs_parts else ""
 
-    page = f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Review Rows</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 20px; background:#f5f7fb; color:#0f172a; }}
-    .wrap {{ display:flex; gap:20px; flex-wrap:wrap; }}
-    .pane {{ flex:1; min-width:280px; background:white; border:1px solid #e5e7eb; border-radius:12px; padding:16px; box-shadow:0 10px 30px rgba(15,23,42,0.08); max-height:70vh; overflow:auto; }}
-    h3 {{ margin-top:0; }}
-    pre {{ white-space:pre-wrap; word-break:break-word; background:#0f172a; color:#e5e7eb; padding:12px; border-radius:10px; font-size:13px; max-height:60vh; overflow:auto; }}
-    .small {{ font-size:12px; color:#6b7280; }}
-    .meta {{ margin:8px 0; font-size:13px; color:#334155; }}
-    .err {{ color:#b91c1c; }}
-    .col-block {{ border-bottom:1px dashed #e5e7eb; padding:6px 0; }}
-    .col-block:last-child {{ border-bottom:none; }}
-    .col-name {{ font-weight:600; margin-bottom:4px; color:#0f172a; }}
-    .col-val {{ white-space:pre-wrap; word-break:break-word; color:#1f2937; }}
-    .mini-sep {{ display:block; height:1px; background:#e5e7eb; margin:4px 0; }}
-    .nav {{ display:flex; gap:10px; align-items:center; margin-bottom:12px; }}
-    button {{ padding:8px 12px; border:none; border-radius:8px; background:#0b74ff; color:white; cursor:pointer; }}
-    button[disabled] {{ opacity:0.6; cursor:not-allowed; }}
-    .filter {{ background:white; border:1px solid #e5e7eb; border-radius:10px; padding:12px; margin:12px 0; }}
-    .filter-row {{ display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; }}
-    .filter-row > div {{ flex:1; min-width:160px; }}
-    label {{ display:block; font-size:12px; color:#475569; margin-bottom:4px; }}
-    select {{ width:100%; padding:8px; border:1px solid #e5e7eb; border-radius:8px; }}
-  </style>
-</head>
-<body>
-  <div class="nav">
-    <a href="/export"><button type="button">Back to export</button></a>
-    <span class="small">Row {display_index} of {total} (filtered from {total_all})</span>
-    <a href="/review?idx={prev_idx}{filter_qs}"><button type="button" {"disabled" if total == 0 or idx == 0 else ""}>Previous</button></a>
-    <a href="/review?idx={next_idx}{filter_qs}"><button type="button" {"disabled" if total == 0 or idx >= total - 1 else ""}>Next</button></a>
-  </div>
-  <div class="filter">
-    <form action="/review" method="get">
-      <input type="hidden" name="idx" value="0" />
-      <div class="filter-row">
-        <div style="flex:1 1 100%;">
-          {filter_rows_html}
-        </div>
-        <div style="flex:0 0 auto;">
-          <button type="submit">Apply filter</button>
-          <a href="/review?idx=0"><button type="button" style="background:#94a3b8;margin-left:6px;">Clear</button></a>
-        </div>
-      </div>
-      <div class="small">Filter uses JSON output keys (true/false). Leave empty for all rows.</div>
-    </form>
-  </div>
-  <div class="wrap">
-    <div class="pane">
-      <h3>Input columns</h3>
-      {cols_display}
-    </div>
-    <div class="pane">
-      <h3>Model response</h3>
-      {"<div class='meta err'>Error: " + html_escape(err) + "</div>" if err else ""}
-      <pre>{html_escape(pretty_text)}</pre>
-    </div>
-  </div>
-</body>
-</html>
-"""
-    resp = HTMLResponse(page)
-    set_session_cookie(resp, sid)
-    return resp
+@app.post("/review/notes")
+async def save_review_note(
+    request: Request,
+    row_idx: int = Form(...),
+    verdict: str = Form(""),
+    note: str = Form(""),
+    prompt_draft: str = Form(""),
+):
+    sid, sess, run_id, review_data = _review_state(request)
+    if not run_id:
+        return PlainTextResponse("Open or finish a saved run first.", status_code=400)
+    notes = review_data.setdefault("notes", {})
+    notes[str(row_idx)] = {"verdict": verdict, "note": note}
+    if prompt_draft:
+        review_data["prompt_draft"] = prompt_draft
+    storage.save_review(request.state.user, run_id, review_data)
+    sess["prompt_template"] = review_data.get("prompt_draft") or sess.get("prompt_template", "")
+    resp = JSONResponse({"ok": True})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/review/improve")
+async def start_prompt_improve(
+    request: Request,
+    provider: str = Form(...),
+    model: str = Form(...),
+    api_key: str = Form(""),
+    prompt_draft: str = Form(""),
+):
+    sid, sess, run_id, review_data = _review_state(request)
+    if not run_id:
+        return PlainTextResponse("Open or finish a saved run first.", status_code=400)
+    if provider_requires_key(provider) and not api_key.strip():
+        return PlainTextResponse("API key is required to run the prompt fixer.", status_code=400)
+    results = sess.get("results") or []
+    examples = build_examples(results, sess.get("csv_cols") or [], review_data.get("notes") or {})
+    if not examples:
+        return PlainTextResponse("Add at least one note or verdict before improving the prompt.", status_code=400)
+    prompt = prompt_draft or review_data.get("prompt_draft") or sess.get("prompt_template") or ""
+    source_name = sess.get("prompt_name") or "prompt"
+    prev_fixer = review_data.get("fixer") or {}
+    if prev_fixer.get("status") == "done" and prev_fixer.get("fix_id"):
+        storage.update_prompt_fix(prev_fixer.get("source_name") or source_name, prev_fixer.get("fix_id"), status="superseded")
+    review_data["prompt_draft"] = prompt
+    review_data["fixer"] = {
+        "status": "running", "proposed_prompt": "", "diff": [], "analysis": "",
+        "critic": "", "error": "", "fix_id": "", "source_name": source_name,
+    }
+    storage.save_review(request.state.user, run_id, review_data)
+    user = request.state.user
+    key_once = api_key.strip()
+
+    def job():
+        try:
+            result = improve_prompt(provider, key_once, model, prompt, examples)
+            fix_id = ""
+            try:
+                fix_id = storage.record_prompt_fix(
+                    source_name=source_name,
+                    user=user,
+                    run_id=run_id,
+                    flow="review",
+                    examples=examples,
+                    analysis=result["analysis"],
+                    critic=result["critic"],
+                    change_summary=(result.get("editor") or {}).get("change_summary") or [],
+                    diff=result["diff"],
+                    old_prompt=prompt,
+                    new_prompt=result["proposed_prompt"],
+                )
+            except Exception:
+                fix_id = ""
+            current = storage.load_review(user, run_id)
+            current["fixer"] = {
+                "status": "done",
+                "proposed_prompt": result["proposed_prompt"],
+                "diff": result["diff"],
+                "analysis": result["analysis"],
+                "critic": result["critic"],
+                "error": "",
+                "fix_id": fix_id,
+                "source_name": source_name,
+            }
+            storage.save_review(user, run_id, current)
+        except Exception as e:
+            current = storage.load_review(user, run_id)
+            current["fixer"] = {
+                "status": "error",
+                "proposed_prompt": "",
+                "diff": [],
+                "analysis": "",
+                "critic": "",
+                "error": str(e),
+                "fix_id": "",
+                "source_name": source_name,
+            }
+            storage.save_review(user, run_id, current)
+
+    threading.Thread(target=job, daemon=True).start()
+    resp = JSONResponse({"ok": True, "status": "running"})
+    return attach_session(resp, request, sid)
+
+
+@app.get("/review/improve/status")
+def prompt_improve_status(request: Request):
+    sid, sess, run_id, review_data = _review_state(request)
+    fixer = review_data.get("fixer") or {}
+    status = fixer.get("status") or "idle"
+    message = fixer.get("error") if status == "error" else {
+        "idle": "Add notes, then run the fixer.",
+        "running": "Analyst, editor, and critic are working…",
+        "done": "Proposed update is ready.",
+    }.get(status, status)
+    resp = JSONResponse({"status": status, "message": message})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/review/accept")
+async def accept_prompt_version(request: Request, prompt_name: str = Form(...)):
+    sid, sess, run_id, review_data = _review_state(request)
+    fixer = review_data.get("fixer") or {}
+    proposed = fixer.get("proposed_prompt") or ""
+    if not proposed.strip():
+        return PlainTextResponse("No proposed prompt to save. Run the fixer first.", status_code=400)
+    try:
+        version_name = storage.next_prompt_version(prompt_name)
+        saved = storage.save_prompt(version_name, proposed)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    review_data["prompt_draft"] = proposed
+    review_data["fixer"]["accepted_name"] = saved
+    storage.save_review(request.state.user, run_id, review_data)
+    if fixer.get("fix_id"):
+        storage.update_prompt_fix(
+            fixer.get("source_name") or prompt_name,
+            fixer.get("fix_id"),
+            status="accepted",
+            new_version=saved,
+        )
+    sess["prompt_name"] = saved
+    sess["prompt_template"] = proposed
+    resp = JSONResponse({"ok": True, "name": saved})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/review/discard")
+async def discard_prompt_version(request: Request):
+    sid, sess, run_id, review_data = _review_state(request)
+    fixer = review_data.get("fixer") or {}
+    if fixer.get("fix_id"):
+        storage.update_prompt_fix(
+            fixer.get("source_name") or sess.get("prompt_name") or "prompt",
+            fixer.get("fix_id"),
+            status="discarded",
+        )
+    review_data["fixer"] = storage._empty_review()["fixer"]
+    if run_id:
+        storage.save_review(request.state.user, run_id, review_data)
+    resp = JSONResponse({"ok": True})
+    return attach_session(resp, request, sid)
+
+
+def _empty_test_fixer() -> Dict[str, Any]:
+    return {
+        "status": "idle", "proposed_prompt": "", "diff": [], "analysis": "",
+        "critic": "", "error": "", "fix_id": "", "source_name": "",
+    }
+
+
+@app.post("/test/improve")
+async def start_test_improve(
+    request: Request,
+    sid_token: Optional[str] = Form(None),
+    provider: str = Form(...),
+    model: str = Form(...),
+    api_key: str = Form(""),
+    verdict: str = Form(""),
+    note: str = Form(""),
+    prompt_draft: str = Form(""),
+):
+    sid, sess = resolve_work(request, sid_token)
+    last_test = sess.get("last_test")
+    if not last_test:
+        return PlainTextResponse("Run a test row first, then improve from it.", status_code=400)
+    if not (note.strip() or verdict.strip()):
+        return PlainTextResponse("Add a note or a verdict on this test row first.", status_code=400)
+    if provider_requires_key(provider) and not api_key.strip():
+        return PlainTextResponse("API key is required to run the prompt fixer.", status_code=400)
+    prompt = prompt_draft or last_test.get("prompt_template") or sess.get("prompt_template") or ""
+    if not prompt.strip():
+        return PlainTextResponse("There is no prompt to improve.", status_code=400)
+    example = build_example(
+        last_test.get("row") or {},
+        sess.get("csv_cols") or [],
+        last_test.get("output") or "",
+        verdict,
+        note,
+        row_index=last_test.get("row_idx") or 0,
+    )
+    source_name = sess.get("prompt_name") or "prompt"
+    prev = sess.get("test_fixer") or {}
+    if prev.get("status") == "done" and prev.get("fix_id"):
+        storage.update_prompt_fix(prev.get("source_name") or source_name, prev.get("fix_id"), status="superseded")
+    sess["test_fixer"] = {**_empty_test_fixer(), "status": "running", "source_name": source_name}
+    user = request.state.user
+    key_once = api_key.strip()
+
+    def job():
+        try:
+            result = improve_prompt(provider, key_once, model, prompt, [example])
+            fix_id = ""
+            try:
+                fix_id = storage.record_prompt_fix(
+                    source_name=source_name,
+                    user=user,
+                    run_id="",
+                    flow="test",
+                    examples=[example],
+                    analysis=result["analysis"],
+                    critic=result["critic"],
+                    change_summary=(result.get("editor") or {}).get("change_summary") or [],
+                    diff=result["diff"],
+                    old_prompt=prompt,
+                    new_prompt=result["proposed_prompt"],
+                )
+            except Exception:
+                fix_id = ""
+            sess["test_fixer"] = {
+                "status": "done",
+                "proposed_prompt": result["proposed_prompt"],
+                "diff": result["diff"],
+                "analysis": result["analysis"],
+                "critic": result["critic"],
+                "error": "",
+                "fix_id": fix_id,
+                "source_name": source_name,
+            }
+        except Exception as e:
+            sess["test_fixer"] = {**_empty_test_fixer(), "status": "error", "error": str(e), "source_name": source_name}
+
+    threading.Thread(target=job, daemon=True).start()
+    resp = JSONResponse({"ok": True, "status": "running"})
+    return attach_session(resp, request, sid)
+
+
+def _fixer_diff_html(diff_lines: List[str]) -> str:
+    parts = []
+    for line in diff_lines or []:
+        safe = (line or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if line.startswith("+") and not line.startswith("+++"):
+            parts.append(f'<span class="add">{safe}</span>')
+        elif line.startswith("-") and not line.startswith("---"):
+            parts.append(f'<span class="del">{safe}</span>')
+        else:
+            parts.append(safe)
+    return "\n".join(parts)
+
+
+@app.get("/test/improve/status")
+def test_improve_status(request: Request, sid_token: Optional[str] = None):
+    sid, sess = resolve_work(request, sid_token)
+    fixer = sess.get("test_fixer") or _empty_test_fixer()
+    status = fixer.get("status") or "idle"
+    analysis = fixer.get("analysis")
+    if isinstance(analysis, dict):
+        analysis = json.dumps(analysis, ensure_ascii=False)
+    critic = fixer.get("critic")
+    if isinstance(critic, dict):
+        critic = json.dumps(critic, ensure_ascii=False)
+    message = fixer.get("error") if status == "error" else {
+        "idle": "Add a note, then run the fixer.",
+        "running": "Analyst, editor, and critic are working…",
+        "done": "Proposed update is ready.",
+    }.get(status, status)
+    payload = {
+        "status": status,
+        "message": message,
+        "proposed": bool((fixer.get("proposed_prompt") or "").strip()),
+        "diff_html": _fixer_diff_html(fixer.get("diff") or []) if status == "done" else "",
+        "analysis": analysis or "",
+        "critic": critic or "",
+    }
+    resp = JSONResponse(payload)
+    return attach_session(resp, request, sid)
+
+
+@app.post("/test/accept")
+async def accept_test_version(request: Request, sid_token: Optional[str] = Form(None), prompt_name: str = Form(...)):
+    sid, sess = resolve_work(request, sid_token)
+    fixer = sess.get("test_fixer") or {}
+    proposed = fixer.get("proposed_prompt") or ""
+    if not proposed.strip():
+        return PlainTextResponse("No proposed prompt to save. Run the fixer first.", status_code=400)
+    try:
+        version_name = storage.next_prompt_version(prompt_name)
+        saved = storage.save_prompt(version_name, proposed)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    if fixer.get("fix_id"):
+        storage.update_prompt_fix(
+            fixer.get("source_name") or prompt_name,
+            fixer.get("fix_id"),
+            status="accepted",
+            new_version=saved,
+        )
+    fixer["accepted_name"] = saved
+    sess["prompt_name"] = saved
+    sess["prompt_template"] = proposed
+    resp = JSONResponse({"ok": True, "name": saved})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/test/discard")
+async def discard_test_version(request: Request, sid_token: Optional[str] = Form(None)):
+    sid, sess = resolve_work(request, sid_token)
+    fixer = sess.get("test_fixer") or {}
+    if fixer.get("fix_id"):
+        storage.update_prompt_fix(
+            fixer.get("source_name") or sess.get("prompt_name") or "prompt",
+            fixer.get("fix_id"),
+            status="discarded",
+        )
+    sess["test_fixer"] = _empty_test_fixer()
+    resp = JSONResponse({"ok": True})
+    return attach_session(resp, request, sid)
+
+
+@app.get("/prompts/raw")
+def prompt_raw(request: Request, name: str):
+    """Read-only view of a saved prompt version. Does not mutate the session."""
+    try:
+        content = storage.load_prompt(name)
+        safe_name = storage._safe_prompt_name(name)
+    except Exception as e:
+        return PlainTextResponse(f"Failed to load prompt: {e}", status_code=400)
+    return JSONResponse({"name": safe_name, "content": content})
+
+
+@app.get("/prompts/history", response_class=HTMLResponse)
+def prompts_history(request: Request, name: str = ""):
+    sid, _ = get_work_session(request)
+    name = (name or "").strip()
+    if name:
+        try:
+            safe = storage._safe_prompt_name(name)
+        except Exception:
+            safe = ""
+        fixes = storage.load_prompt_history(safe) if safe else []
+        versions = storage.list_prompt_versions(safe) if safe else []
+        for fix in fixes:
+            fix["created"] = _iso_to_pretty(fix.get("ts", ""))
+        resp = render(
+            request,
+            "prompt_history.html",
+            {
+                "nav": "prompts",
+                "user": request.state.user,
+                "detail": True,
+                "prompt": storage.prompt_family(safe) if safe else name,
+                "fixes": fixes,
+                "versions": versions,
+            },
+        )
+        return attach_session(resp, request, sid)
+    summaries = storage.list_prompt_history()
+    for item in summaries:
+        item["last_pretty"] = _iso_to_pretty(item.get("last_ts", ""))
+    resp = render(
+        request,
+        "prompt_history.html",
+        {
+            "nav": "prompts",
+            "user": request.state.user,
+            "detail": False,
+            "summaries": summaries,
+        },
+    )
+    return attach_session(resp, request, sid)
+
+
+def _iso_to_pretty(value: str) -> str:
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return value or ""
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)

@@ -1,0 +1,11 @@
+{# Reusable, user-friendly viewer for raw LLM output.
+   The raw text is placed in a hidden node so Jinja auto-escaping keeps it exact;
+   static/ai-output.js reads .textContent and renders a JSON tree / raw toggle,
+   a valid/invalid badge, a copy button, and (inline) an expand control.
+   mode: "inline" (always shown) or "disclosure" (collapsed <details>, built on open). #}
+{% macro ai_output(text, mode='inline', label='') %}
+<div class="ai-output" data-mode="{{ mode }}">
+  {%- if label %}<div class="ai-output__label" hidden>{{ label }}</div>{% endif -%}
+  <div class="ai-output__raw" hidden>{{ text }}</div>
+</div>
+{% endmacro %}

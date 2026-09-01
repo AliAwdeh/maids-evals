@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Prompt history · Maids Evals{% endblock %}
+{% block body %}
+{% if detail %}
+  <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+    <div>
+      <h1>Fix history · {{ prompt }}</h1>
+      <p class="lede">Shared across the team. Every Analyst → Editor → Critic run on this prompt family — who ran it, why, and the diff. Old versions are never deleted.</p>
+    </div>
+    <div class="actions"><a class="btn secondary" href="/prompts/history">All prompts</a></div>
+  </div>
+
+  <section class="card">
+    <div class="kicker">Saved versions</div>
+    {% for v in versions %}
+    <div class="recent-row">
+      <div>
+        <strong>{{ v.name }}</strong>
+        <div class="small">{{ v.size }} bytes{% if v.modified %} · {{ v.modified[:16].replace('T', ' ') }}{% endif %}</div>
+      </div>
+      <button type="button" class="secondary view-version" data-name="{{ v.name }}">View text</button>
+    </div>
+    {% else %}
+    <p class="small">No saved versions in the library for this family yet.</p>
+    {% endfor %}
+  </section>
+
+  {% for fix in fixes %}
+  <section class="card" style="margin-top:14px;">
+    <div class="step-head">
+      <div class="step-title">
+        <h2 style="margin:0;">{{ fix.new_version or 'Proposed update' }}</h2>
+        <span class="tag {% if fix.status == 'accepted' %}ok{% elif fix.status in ['discarded', 'superseded'] %}warn{% endif %}">{{ fix.status }}</span>
+      </div>
+      <span class="small">{{ fix.created }} · {{ fix.user }} · from {{ fix.flow }}</span>
+    </div>
+    <p class="small">
+      Based on {{ fix.example_count }} note{{ '' if fix.example_count == 1 else 's' }}{% if fix.run_id %} · run {{ fix.run_id }}{% endif %} · source {{ fix.source_name }}
+    </p>
+    {% if fix.patterns %}
+    <div class="kicker" style="margin-top:8px;">Failure patterns the Analyst found</div>
+    <ul class="tight-list">
+      {% for p in fix.patterns %}
+      <li><strong>{{ p.title or 'Pattern' }}</strong>{% if p.problem %} — {{ p.problem }}{% endif %}{% if p.needed_change %} <span class="muted">→ {{ p.needed_change }}</span>{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+    {% if fix.change_summary %}
+    <p class="small"><strong>Edits:</strong> {{ fix.change_summary|join('; ') }}</p>
+    {% endif %}
+    {% if fix.critic_summary %}
+    <p class="small"><strong>Critic:</strong> {{ fix.critic_summary }}</p>
+    {% endif %}
+    {% if fix.notes_summary %}
+    <details style="margin-top:8px;">
+      <summary>Notes it was based on ({{ fix.notes_summary|length }})</summary>
+      <ul class="tight-list">
+        {% for n in fix.notes_summary %}
+        <li><span class="tag {% if n.verdict == 'ok' %}ok{% elif n.verdict == 'wrong' %}warn{% endif %}">{{ n.verdict or '—' }}</span> row {{ n.row }}{% if n.note %}: {{ n.note }}{% endif %}</li>
+        {% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+    {% if fix.diff %}
+    <details style="margin-top:8px;" open>
+      <summary>Diff (old → new)</summary>
+      <pre class="diff">{% for line in fix.diff %}{% if line.startswith('+') and not line.startswith('+++') %}<span class="add">{{ line }}</span>
+{% elif line.startswith('-') and not line.startswith('---') %}<span class="del">{{ line }}</span>
+{% else %}{{ line }}
+{% endif %}{% endfor %}</pre>
+    </details>
+    {% endif %}
+    {% if fix.new_prompt %}
+    <details style="margin-top:8px;">
+      <summary>Full proposed text (retrievable even if discarded)</summary>
+      <pre class="out">{{ fix.new_prompt }}</pre>
+    </details>
+    {% endif %}
+  </section>
+  {% else %}
+  <div class="card empty" style="margin-top:14px;">No fixes recorded for this prompt yet.</div>
+  {% endfor %}
+
+  <div class="overlay" id="version-overlay">
+    <div class="modal wide">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <h3 id="version-title" style="margin:0;">Prompt text</h3>
+        <button type="button" id="version-close" class="secondary">Close</button>
+      </div>
+      <pre class="out" id="version-body" style="margin-top:12px;">Loading…</pre>
+    </div>
+  </div>
+{% else %}
+  <h1>Prompt fix history</h1>
+  <p class="lede">Shared across the team. Pick a prompt to see every fix: who ran it, the failure patterns, the diff, and whether it was accepted or discarded.</p>
+  {% if summaries %}
+  <table class="plain">
+    <thead>
+      <tr><th>Prompt</th><th>Fixes</th><th>Accepted</th><th>Last fix</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for s in summaries %}
+      <tr>
+        <td><strong>{{ s.prompt }}</strong></td>
+        <td>{{ s.fix_count }}</td>
+        <td>{{ s.accepted_count }}</td>
+        <td>{{ s.last_pretty }}<div class="small">{{ s.last_user }}</div></td>
+        <td><a class="btn secondary" href="/prompts/history?name={{ s.prompt }}">Open</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="card empty">No prompt fixes recorded yet. Improve a prompt from review notes or a test row and it will appear here.</div>
+  {% endif %}
+{% endif %}
+{% endblock %}
+{% block scripts %}
+{% if detail %}<script src="/static/prompt-history.js"></script>{% endif %}
+{% endblock %}

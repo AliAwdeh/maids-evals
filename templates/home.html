@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block title %}New run · Maids Evals{% endblock %}
+{% block body %}
+  <h1>New run</h1>
+  <p class="lede">Four steps, in order. Upload a CSV, load or write a prompt, pick a provider, then run. Your API key is saved only to your account.</p>
+
+  <div class="wizard">
+    <section class="step{% if has_csv %} done{% endif %}" id="step-dataset">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">1</span>
+          <h2>Dataset</h2>
+        </div>
+        <span class="tag {% if has_csv %}ok{% else %}warn{% endif %} step-tag">{% if has_csv %}{{ total_rows }} rows · {{ csv_cols|length }} columns{% else %}Waiting for a CSV{% endif %}</span>
+      </div>
+      <p class="empty-hint" id="dataset-hint">{% if has_csv %}Replace the file if you need a different sheet. Empty rows are dropped on upload.{% else %}Choose a CSV, then Upload. That unlocks the rest of the page.{% endif %}</p>
+      <form action="/upload" method="post" enctype="multipart/form-data">
+        <label for="csv_file">CSV file</label>
+        <input id="csv_file" type="file" name="csv_file" accept=".csv" required />
+        <div class="actions">
+          <button type="submit"{% if has_csv %} class="secondary"{% endif %}>{% if has_csv %}Replace CSV{% else %}Upload{% endif %}</button>
+        </div>
+      </form>
+      <details class="adv">
+        <summary>Advanced — keep a random subset</summary>
+        <p class="small">Useful before an expensive full pass. The rest are discarded from this session only.</p>
+        <div class="actions">
+          <button type="button" id="divide-button" class="secondary" {% if not has_csv %}disabled{% endif %}>Choose how many rows to keep</button>
+        </div>
+      </details>
+    </section>
+
+    <section class="step{% if prompt_template %} done{% endif %}" id="step-prompt">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">2</span>
+          <h2>Prompt</h2>
+        </div>
+        <span class="tag {% if prompt_name %}ok{% else %}warn{% endif %} step-tag">{% if prompt_name %}{{ prompt_name }}{% else %}Write or load one{% endif %}</span>
+      </div>
+      <p class="empty-hint">Load a shared prompt or write one. Click a column chip to insert it. At least one <code>{column}</code> or <code>{row_json}</code> is required.</p>
+      <label for="prompt-select">Shared library</label>
+      <div class="actions tight">
+        <select id="prompt-select">
+          <option value="">Select a shared prompt</option>
+          {% for name in prompts %}
+          <option value="{{ name }}" {% if name == prompt_name %}selected{% endif %}>{{ name }}</option>
+          {% endfor %}
+        </select>
+        <button type="button" id="prompt-load">Load</button>
+      </div>
+      <label for="prompt-name">Save as</label>
+      <div class="actions tight">
+        <input id="prompt-name" type="text" value="{{ prompt_name }}" placeholder="e.g. agent_eval" />
+        <button type="button" id="prompt-save" class="secondary">Save to library</button>
+      </div>
+      <p class="slot-msg" id="prompt-status">Everyone who is logged in can load and save these prompts.</p>
+      <label for="prompt-template">Prompt template</label>
+      <div class="chips" id="prompt-toolbar">
+        {% if csv_cols %}
+          {% for col in csv_cols %}
+          <button type="button" class="chip" data-insert="{{ '{' ~ col ~ '}' }}">{{ col }}</button>
+          {% endfor %}
+        {% else %}
+          <span class="chip-empty">Upload a CSV in step 1 to insert column names.</span>
+        {% endif %}
+        <button type="button" class="chip" data-insert="{row_json}">row_json</button>
+      </div>
+      <textarea form="run-form" name="prompt_template" id="prompt-template">{{ prompt_template }}</textarea>
+    </section>
+
+    <section class="step" id="step-provider">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">3</span>
+          <h2>Provider and key</h2>
+        </div>
+        <span class="tag step-tag" id="provider-tag">{{ provider }}</span>
+      </div>
+      <p class="empty-hint">Pick a provider, then a model. Save the key to your account if you want it filled in next time.</p>
+
+      <form id="run-form" action="/run" method="post" data-total-rows="{{ total_rows }}" data-sid-token="{{ sid_token }}">
+        <label for="provider-select">Provider</label>
+        <select name="provider" id="provider-select">
+          <option value="openai" {% if provider == 'openai' %}selected{% endif %}>OpenAI</option>
+          <option value="langcc" {% if provider == 'langcc' %}selected{% endif %}>LangCC</option>
+          <option value="gemini" {% if provider == 'gemini' %}selected{% endif %}>Gemini</option>
+          <option value="ollama" {% if provider == 'ollama' %}selected{% endif %}>Ollama</option>
+        </select>
+
+        <label for="model-input">Model</label>
+        <div id="model-slot" class="model-slot {% if provider in ['ollama', 'langcc'] %}is-list{% else %}is-text{% endif %}">
+          <div class="model-text">
+            <input type="text" name="{% if provider in ['ollama', 'langcc'] %}{% else %}model{% endif %}" id="model-input" value="{{ model }}" autocomplete="off" {% if provider in ['ollama', 'langcc'] %}disabled{% endif %} />
+          </div>
+          <div class="model-list">
+            <input type="text" id="model-search" placeholder="Search models…" autocomplete="off" aria-label="Search models" />
+            <select name="{% if provider in ['ollama', 'langcc'] %}model{% endif %}" id="model-select" {% if provider not in ['ollama', 'langcc'] %}disabled{% endif %}><option value="">Loading…</option></select>
+          </div>
+        </div>
+        <p class="slot-msg error" id="model-error"></p>
+      </form>
+
+      <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on">
+        <label for="llm-username">Key name</label>
+        <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
+        <label for="llm-password">API key</label>
+        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="Required for OpenAI, LangCC, Gemini" value="{{ saved_api_key }}" />
+        <div class="actions tight">
+          <button type="button" id="key-save" class="secondary">Save key</button>
+          <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>
+        </div>
+        <p class="slot-msg" id="key-status">{% if saved_key_exists %}Saved for your account only.{% else %}Optional: save to this account, or let your password manager remember it.{% endif %}</p>
+      </form>
+    </section>
+
+    <section class="step" id="step-run">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">4</span>
+          <h2>Run</h2>
+        </div>
+        <span class="tag {% if has_csv %}ok{% else %}warn{% endif %} step-tag">{% if has_csv %}Ready{% else %}Needs a CSV{% endif %}</span>
+      </div>
+      <p class="empty-hint">{% if has_csv %}Name the batch if you want, then Run. Test one row first if you are unsure.{% else %}Upload a CSV in step 1 before you can run.{% endif %}</p>
+      <label for="run-name">Run name</label>
+      <input id="run-name" type="text" name="run_name" form="run-form" value="{{ run_name }}" placeholder="Optional, e.g. August agent audit" />
+      <div class="actions run-actions">
+        <button type="submit" form="run-form" id="run-button" {% if not has_csv %}disabled{% endif %}>Run</button>
+        <button type="button" id="test-button" class="secondary" {% if not has_csv %}disabled{% endif %}>Test one row</button>
+        <button type="button" id="retest-button" class="warning" {% if last_test_row_idx is none %}disabled{% endif %}>Test same row</button>
+      </div>
+      <details class="adv">
+        <summary>Advanced — workers and model parameters</summary>
+        <label for="max-workers">Max concurrent requests</label>
+        <input id="max-workers" type="number" name="max_workers" form="run-form" value="{{ max_workers }}" min="1" max="{{ workers_cap }}" />
+        <label><input type="checkbox" name="json_mode" form="run-form" value="1" {% if json_mode %}checked{% endif %} /> Output is JSON</label>
+        <label><input type="checkbox" name="send_model_params" id="send-model-params" form="run-form" value="1" {% if send_model_params %}checked{% endif %} /> Send model parameters</label>
+        <div class="box param-box" id="model-params-box">
+          <label><input type="checkbox" name="enabled_params" form="run-form" value="temperature" {% if 'temperature' in enabled_params %}checked{% endif %} /> Temperature</label>
+          <input type="text" name="temperature" form="run-form" value="{{ model_params.temperature }}" />
+          <label><input type="checkbox" name="enabled_params" form="run-form" value="top_p" {% if 'top_p' in enabled_params %}checked{% endif %} /> Top P</label>
+          <input type="text" name="top_p" form="run-form" value="{{ model_params.top_p }}" />
+          <label><input type="checkbox" name="enabled_params" form="run-form" value="max_output_tokens" {% if 'max_output_tokens' in enabled_params %}checked{% endif %} /> Max output tokens</label>
+          <input type="text" name="max_output_tokens" form="run-form" value="{{ model_params.max_output_tokens }}" />
+          <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="presence_penalty" {% if 'presence_penalty' in enabled_params %}checked{% endif %} /> Presence penalty</label>
+          <input class="param-openai" type="text" name="presence_penalty" form="run-form" value="{{ model_params.presence_penalty }}" />
+          <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="frequency_penalty" {% if 'frequency_penalty' in enabled_params %}checked{% endif %} /> Frequency penalty</label>
+          <input class="param-openai" type="text" name="frequency_penalty" form="run-form" value="{{ model_params.frequency_penalty }}" />
+          <label class="param-advanced"><input type="checkbox" name="enabled_params" form="run-form" value="seed" {% if 'seed' in enabled_params %}checked{% endif %} /> Seed</label>
+          <input class="param-advanced" type="text" name="seed" form="run-form" value="{{ model_params.seed }}" />
+          <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="reasoning_effort" {% if 'reasoning_effort' in enabled_params %}checked{% endif %} /> Reasoning effort</label>
+          <select class="param-openai" name="reasoning_effort" form="run-form">
+            <option value="">Default</option>
+            {% for opt in ['minimal', 'low', 'medium', 'high'] %}
+            <option value="{{ opt }}" {% if model_params.reasoning_effort == opt %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </details>
+    </section>
+  </div>
+
+  <section class="recent">
+    <div class="kicker">Your recent runs</div>
+    {% if recent_runs %}
+      {% for run in recent_runs %}
+      <div class="recent-row">
+        <div>
+          <strong>{{ run.title }}</strong>
+          <div class="small">{{ run.created }} · {{ run.provider }} / {{ run.model }} · {{ run.row_count }} rows</div>
+        </div>
+        <form action="/runs/{{ run.run_id }}/open" method="post">
+          <button type="submit" class="secondary">Open</button>
+        </form>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="empty-hint">No runs yet. After a batch finishes it appears here and in History.</p>
+    {% endif %}
+    <div class="actions"><a class="btn secondary" href="/runs">View all of your runs</a></div>
+  </section>
+
+  <div class="overlay" id="progress-overlay">
+    <div class="modal">
+      <h3>Processing rows</h3>
+      <p class="small">Processed <span id="progress-done">0</span> / <span id="progress-total">0</span></p>
+      <p class="small">In progress <span id="progress-running">0</span> · Pending <span id="progress-pending">0</span></p>
+      <p class="slot-msg error" id="progress-error"></p>
+    </div>
+  </div>
+
+  <div class="overlay" id="test-overlay">
+    <div class="modal">
+      <h3>Columns to show on the test page</h3>
+      <div class="box">
+        {% for col in csv_cols %}
+        <label><input type="checkbox" name="test_cols" value="{{ col }}" {% if col in test_cols %}checked{% endif %} /> {{ col }}</label>
+        {% else %}
+        <div class="small">Upload a CSV first.</div>
+        {% endfor %}
+      </div>
+      <div class="actions">
+        <button type="button" id="test-cancel" class="secondary">Cancel</button>
+        <button type="button" id="test-confirm">Run test</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="divide-overlay">
+    <div class="modal">
+      <h3>Keep a random subset</h3>
+      <form action="/divide" method="post">
+        <input type="hidden" name="sid_token" value="{{ sid_token }}" />
+        <label>Rows to keep (of {{ total_rows }})</label>
+        <input type="number" name="divide_rows" min="1" max="{{ total_rows or 1 }}" value="{{ divide_default }}" />
+        <p class="small">The rest are discarded from this session. Original files are unchanged.</p>
+        <div class="actions">
+          <button type="button" id="divide-cancel" class="secondary">Cancel</button>
+          <button type="submit">Apply</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{% endblock %}
+{% block scripts %}
+<script>window.MAIDS = { lastTestRow: {{ last_test_row_idx if last_test_row_idx is not none else 'null' }}, workersCap: {{ workers_cap }} };</script>
+<script src="/static/run.js"></script>
+{% endblock %}

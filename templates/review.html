@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% from "_components.html" import ai_output %}
+{% block title %}Review · Maids Evals{% endblock %}
+{% block body %}
+  <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+    <div>
+      <h1>Review</h1>
+      <p class="lede">Row {{ display_index }} of {{ total }}{% if total_all != total %} (filtered from {{ total_all }}){% endif %}. Notes stay on this run. The prompt is shared when you save a new version.</p>
+    </div>
+    <div class="actions">
+      <a class="btn secondary" href="/review?idx={{ prev_idx }}{{ filter_qs }}" {% if total == 0 or idx == 0 %}aria-disabled="true"{% endif %}>Previous</a>
+      <a class="btn secondary" href="/review?idx={{ next_idx }}{{ filter_qs }}" {% if total == 0 or idx >= total - 1 %}aria-disabled="true"{% endif %}>Next</a>
+    </div>
+  </div>
+
+  <section class="card" style="margin-bottom:14px;">
+    <form action="/review" method="get">
+      <input type="hidden" name="idx" value="0" />
+      {% for pair in filter_pairs %}
+      <div class="grid-2" style="grid-template-columns:1fr 1fr;margin-top:8px;">
+        <div>
+          <label>JSON attribute</label>
+          <select name="filter_key">
+            <option value="">All attributes</option>
+            {% for key in detected_keys %}
+            <option value="{{ key }}" {% if key == pair.key %}selected{% endif %}>{{ key }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Value</label>
+          <select name="filter_val">
+            <option value="">Any value</option>
+            <option value="true" {% if pair.val == 'true' %}selected{% endif %}>True</option>
+            <option value="false" {% if pair.val == 'false' %}selected{% endif %}>False</option>
+          </select>
+        </div>
+      </div>
+      {% endfor %}
+      <div class="actions">
+        <button type="submit">Apply filter</button>
+        <a class="btn secondary" href="/review?idx=0">Clear</a>
+      </div>
+    </form>
+    <p class="small">Keyboard: ←/→ or K/J for rows. 1 ok · 2 wrong · 3 unclear. Notes save as you type.</p>
+  </section>
+
+  {% if row %}
+  <div class="review-grid">
+    <section class="card">
+      <div class="kicker">Input</div>
+      {% for col in csv_cols %}
+      <div class="col-block">
+        <div class="col-name">{{ col }}</div>
+        <div class="col-val">{{ row.get(col, '') }}</div>
+      </div>
+      {% endfor %}
+    </section>
+    <section class="card">
+      <div class="kicker">Model response</div>
+      {% if err %}<p class="error">{{ err }}</p>{% endif %}
+      {{ ai_output(row.get('llm_output', '') or pretty_text, mode='inline', label='Model response') }}
+    </section>
+  </div>
+
+  <div class="review-tools">
+    <section class="card">
+      <div class="kicker">Your note</div>
+      <div class="verdicts">
+        <button type="button" data-verdict="ok" aria-pressed="{{ 'true' if verdict == 'ok' else 'false' }}">Ok</button>
+        <button type="button" data-verdict="wrong" class="warning" aria-pressed="{{ 'true' if verdict == 'wrong' else 'false' }}">Wrong</button>
+        <button type="button" data-verdict="unclear" class="secondary" aria-pressed="{{ 'true' if verdict == 'unclear' else 'false' }}">Unclear</button>
+      </div>
+      <label for="review-note">What should change?</label>
+      <textarea id="review-note" style="min-height:140px;">{{ note }}</textarea>
+      <p class="small" id="note-status">Saved on this run only.</p>
+    </section>
+    <section class="card">
+      <div class="kicker" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <span>Prompt used for this run</span>
+        <a class="small" href="/prompts/history{% if prompt_name %}?name={{ prompt_name }}{% endif %}">Fix history →</a>
+      </div>
+      <label for="review-prompt">Edit if you already know the fix</label>
+      <textarea id="review-prompt" style="min-height:180px;">{{ prompt_draft }}</textarea>
+      <p class="small">This draft is stored on your run. Accepting an automated fix writes a new version into the shared library.</p>
+      <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on" style="margin-top:12px;">
+        <label for="llm-username">Key name</label>
+        <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
+        <label for="llm-password">API key</label>
+        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="Needed only to improve the prompt" value="{{ saved_api_key }}" />
+        <div class="actions tight">
+          <button type="button" id="key-save" class="secondary">Save key</button>
+          <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>
+        </div>
+        <p class="slot-msg" id="key-status">{% if saved_key_exists %}Saved for your account only.{% else %}Optional: save to this account.{% endif %}</p>
+        <label for="fixer-model">Model for the fixer</label>
+        <input id="fixer-model" type="text" value="{{ model }}" />
+        <input type="hidden" id="fixer-provider" value="{{ provider }}" />
+      </form>
+      <div class="actions">
+        <button type="button" id="improve-button">{% if noted_count %}Improve prompt from all {{ noted_count }} notes{% else %}Improve prompt from notes{% endif %}</button>
+        <button type="button" id="accept-button" class="secondary" {% if not proposed_prompt %}disabled{% endif %}>Save proposed as shared version</button>
+        <button type="button" id="discard-button" class="ghost" {% if not proposed_prompt %}disabled{% endif %}>Discard</button>
+      </div>
+      <p class="small">One pass batches every reviewed row's note + verdict on this run into a single Analyst → Editor → Critic run.</p>
+      <p class="small" id="fixer-status">{{ fixer_status }}</p>
+    </section>
+  </div>
+
+  {% if diff_lines %}
+  <section class="card" style="margin-top:16px;">
+    <div class="kicker">Proposed update</div>
+    <pre class="diff">{% for line in diff_lines %}{% if line.startswith('+') and not line.startswith('+++') %}<span class="add">{{ line }}</span>
+{% elif line.startswith('-') and not line.startswith('---') %}<span class="del">{{ line }}</span>
+{% else %}{{ line }}
+{% endif %}{% endfor %}</pre>
+    {% if analysis %}<p class="small"><strong>Analyst:</strong> {{ analysis }}</p>{% endif %}
+    {% if critic %}<p class="small"><strong>Critic:</strong> {{ critic }}</p>{% endif %}
+  </section>
+  {% endif %}
+  {% else %}
+  <div class="card empty">No rows match this filter, or you have not run a batch yet.</div>
+  {% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+window.MAIDS_REVIEW = {
+  runId: {{ current_run_id|tojson }},
+  rowIdx: {{ result_idx if result_idx is not none else 'null' }},
+  prevUrl: {{ ("/review?idx=" ~ prev_idx ~ filter_qs)|tojson }},
+  nextUrl: {{ ("/review?idx=" ~ next_idx ~ filter_qs)|tojson }},
+  atStart: {{ (total == 0 or idx == 0)|tojson }},
+  atEnd: {{ (total == 0 or idx >= total - 1)|tojson }},
+  acceptedName: {{ accepted_name|tojson }}
+};
+</script>
+<script src="/static/ai-output.js"></script>
+<script src="/static/review.js"></script>
+{% endblock %}

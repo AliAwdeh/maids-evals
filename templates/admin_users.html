@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Admin · Maids Evals{% endblock %}
+{% block body %}
+  <h1>User management</h1>
+  <p class="lede">Create and remove access tokens for this instance. Only the site admin sees this page. A token is generated on the server and shown once, right after you create it — copy it and hand it off immediately.</p>
+
+  {% if error %}<p class="flash-err">{{ error }}</p>{% endif %}
+  {% if revoked %}<p class="ok-text">Removed “{{ revoked }}”. Their token stops working on the next request.</p>{% endif %}
+
+  <div class="grid-2">
+    <div class="card">
+      <div class="kicker">Create user</div>
+      <form method="post" action="/admin/users" autocomplete="off">
+        <label for="new-username">Username</label>
+        <input id="new-username" name="username" type="text" required
+               autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+               pattern="[A-Za-z0-9_\-]+" maxlength="64"
+               placeholder="letters, numbers, hyphens, underscores" />
+        <p class="small">The token is generated for you and cannot be chosen. It is shown only once.</p>
+        <div class="actions">
+          <button type="submit">Create user</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card creds token-slot" aria-live="polite">
+      {% if new_user and new_token %}
+        <div class="kicker">Token for {{ new_user }} — copy now</div>
+        <p class="small">This is the only time this token is shown. If it is lost, reset it below or recreate the user.</p>
+        <div class="token-reveal">
+          <code id="new-token" class="token-value">{{ new_token }}</code>
+          <button type="button" class="secondary" id="copy-token" data-copy-target="new-token">Copy</button>
+        </div>
+        <p class="small">Give <strong>{{ new_user }}</strong> this username and token. They log in at <code>/login</code> — the token goes in the “Access token” field.</p>
+      {% else %}
+        <div class="kicker">New token</div>
+        <p class="small token-slot__empty">When you create or reset a user, their one-time token appears here with a copy button. It is never shown again.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <h2 class="admin-users__heading">Existing users</h2>
+  <table class="plain">
+    <thead>
+      <tr>
+        <th>Username</th>
+        <th>Type</th>
+        <th>Access</th>
+        <th class="admin-users__actions-col"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in users %}
+      <tr>
+        <td><strong>{{ u.username }}</strong></td>
+        <td>
+          {% if u.is_env_admin %}<span class="tag ok">env admin</span>
+          {% else %}<span class="tag">user</span>{% endif %}
+        </td>
+        <td>
+          {% if u.is_admin %}<span class="tag ok">admin</span>
+          {% else %}<span class="muted">standard</span>{% endif %}
+        </td>
+        <td>
+          {% if u.removable %}
+          <div class="actions tight admin-users__actions">
+            <form method="post" action="/admin/users/reset-token" class="js-reset">
+              <input type="hidden" name="username" value="{{ u.username }}" />
+              <button type="submit" class="secondary">Reset token</button>
+            </form>
+            <form method="post" action="/admin/users/revoke" class="js-revoke" data-username="{{ u.username }}">
+              <input type="hidden" name="username" value="{{ u.username }}" />
+              <button type="submit" class="danger">Remove</button>
+            </form>
+          </div>
+          {% else %}
+          <span class="small">Managed in <code>.env</code> — cannot be edited or removed here.</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+{% block scripts %}
+<script src="/static/admin.js"></script>
+{% endblock %}

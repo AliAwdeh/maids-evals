@@ -1,0 +1,14 @@
+users.json
+.env
+data/*
+!data/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+.venv313/
+.venv-run/
+venv/
+token_usage.txt
+runs/
+backup/
+.DS_Store

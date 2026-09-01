@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Admins only · Maids Evals{% endblock %}
+{% block body %}
+  <div class="card empty">
+    <h1>Admins only</h1>
+    <p class="lede">This area is limited to the site administrator. You are signed in as <strong>{{ user }}</strong>, which does not have admin access. If you think you should, ask whoever runs this instance.</p>
+    <p><a class="btn secondary" href="/">Back to New run</a></p>
+  </div>
+{% endblock %}
