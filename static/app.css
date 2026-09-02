@@ -553,6 +553,19 @@ pre.out, .diff {
 
 .model-slot .model-list select { margin-top: 8px; }
 
+.model-slot .model-list-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.model-slot .model-list-controls #model-search { flex: 1 1 auto; }
+.model-slot .model-list-controls #model-refresh {
+  flex: 0 0 auto;
+  margin-top: 0;
+  white-space: nowrap;
+  padding: 9px 12px;
+}
+
 .model-slot.is-text .model-list,
 .model-slot.is-list .model-text {
   visibility: hidden;

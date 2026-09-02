@@ -397,7 +397,7 @@ def home(request: Request):
         "seed": "",
         "reasoning_effort": "",
     }
-    current_provider = sess.get("provider", "openai")
+    current_provider = sess.get("provider", "langcc")
     saved_key = saved_key_for(request.state.user, current_provider)
     resp = render(
         request,

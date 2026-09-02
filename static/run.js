@@ -4,6 +4,7 @@
   const modelInput = document.getElementById("model-input");
   const modelSelect = document.getElementById("model-select");
   const modelSearch = document.getElementById("model-search");
+  const modelRefresh = document.getElementById("model-refresh");
   const promptBox = document.getElementById("prompt-template");
   const promptSelect = document.getElementById("prompt-select");
   const promptName = document.getElementById("prompt-name");
@@ -32,18 +33,29 @@
   const fallbackOllama = ["llama3", "llama3:70b", "gemma3", "mistral-small"];
   const fallbackLangcc = ["gpt-5-mini", "gpt-5", "gpt-4.1-mini", "o4-mini"];
   const KEY_PROVIDERS = ["openai", "langcc", "gemini"];
+  const PROVIDER_LABELS = { openai: "OpenAI", langcc: "LangCC", gemini: "Gemini", ollama: "Ollama" };
   let providerModels = {};
   let modelsLoading = {};
   let lastModelKey = "";
   let loadingKeyFor = "";
+  let keyModelTimer = null;
 
   function currentProvider() {
-    return (providerSel?.value || "openai").toLowerCase();
+    return (providerSel?.value || "langcc").toLowerCase();
+  }
+
+  function providerLabel(provider) {
+    return PROVIDER_LABELS[provider] || provider;
   }
 
   function usesModelList() {
     const provider = currentProvider();
     return provider === "ollama" || provider === "langcc";
+  }
+
+  // Which list-based providers require an API key to enumerate models.
+  function modelFetchNeedsKey(provider) {
+    return provider === "langcc";
   }
 
   function currentModel() {
@@ -118,10 +130,16 @@
     else setKeyStatus("Optional: save to this account, or let your password manager remember it.");
   }
 
+  function maybeLoadModelsFor(provider) {
+    // Only fetch if the user is still on this provider and it uses the list picker.
+    if (currentProvider() === provider && usesModelList()) loadProviderModels(provider);
+  }
+
   async function loadSavedKey(provider) {
     loadingKeyFor = provider;
     if (!KEY_PROVIDERS.includes(provider)) {
       applyKeyField(provider, "", false);
+      maybeLoadModelsFor(provider);
       return;
     }
     try {
@@ -129,14 +147,15 @@
       if (loadingKeyFor !== provider) return;
       if (resp.status === 401) {
         setKeyStatus("Log in to load a saved key.", true);
-        return;
+      } else if (resp.ok) {
+        const data = await resp.json();
+        applyKeyField(provider, data.api_key || "", !!data.saved);
       }
-      if (!resp.ok) return;
-      const data = await resp.json();
-      applyKeyField(provider, data.api_key || "", !!data.saved);
     } catch (_) {
       /* keep whatever is already in the field */
     }
+    // Once the saved key is in place, populate the model list for key-based providers.
+    maybeLoadModelsFor(provider);
   }
 
   async function saveCurrentKey() {
@@ -158,6 +177,7 @@
     if (!resp.ok) return setKeyStatus("Could not save key.", true);
     setKeyActions(true);
     setKeyStatus("Saved for your account only.");
+    if (usesModelList()) loadProviderModels(provider, { force: true });
   }
 
   async function forgetCurrentKey() {
@@ -171,6 +191,7 @@
     if (llmPass) llmPass.value = "";
     setKeyActions(false);
     setKeyStatus("Saved key removed from your account.");
+    if (usesModelList()) loadProviderModels(provider);
   }
 
   function setModelOptions(models, note) {
@@ -196,38 +217,78 @@
     }
   }
 
-  async function loadProviderModels(provider) {
-    const cacheKey = modelCacheKey(provider);
-    lastModelKey = cacheKey;
-    if (modelsLoading[cacheKey] || providerModels[cacheKey]) {
-      if (providerModels[cacheKey]) setModelOptions(providerModels[cacheKey]);
+  function setModelPlaceholder(text) {
+    if (!modelSelect) return;
+    modelSelect.innerHTML = "";
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = text;
+    modelSelect.appendChild(opt);
+  }
+
+  function setRefreshBusy(busy) {
+    if (!modelRefresh) return;
+    modelRefresh.disabled = busy;
+    modelRefresh.textContent = busy ? "Refreshing…" : "Refresh";
+  }
+
+  async function loadProviderModels(provider, opts = {}) {
+    const force = !!opts.force;
+    if (!usesModelList()) return;
+    // Providers that need a key can't list models until one is available.
+    if (modelFetchNeedsKey(provider) && !apiKey().trim()) {
+      setModelPlaceholder("Add an API key, then Refresh");
+      showModelError(`Enter or save your ${providerLabel(provider)} API key to load models, then use Refresh.`);
       return;
     }
-    modelsLoading[cacheKey] = true;
-    if (modelSelect && !modelSelect.options.length) {
-      modelSelect.innerHTML = "";
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "Loading…";
-      modelSelect.appendChild(opt);
+    const cacheKey = modelCacheKey(provider);
+    lastModelKey = cacheKey;
+    if (!force && providerModels[cacheKey]) {
+      setModelOptions(providerModels[cacheKey]);
+      showModelError("");
+      return;
     }
+    if (!force && modelsLoading[cacheKey]) return;
+    if (force) delete providerModels[cacheKey];
+    modelsLoading[cacheKey] = true;
+    setRefreshBusy(true);
+    setModelPlaceholder("Loading…");
+    showModelError("");
     try {
       const form = new FormData();
       form.append("provider", provider);
       form.append("api_key", apiKey());
       const resp = await fetch("/provider/models", { method: "POST", body: form, credentials: "same-origin" });
-      if (!resp.ok) throw new Error("Failed to load models");
+      if (!resp.ok) throw new Error("request failed");
       const data = await resp.json();
       const models = Array.isArray(data?.models) ? data.models : [];
-      if (!models.length) throw new Error("No models");
+      if (!models.length) throw new Error("no models");
       providerModels[cacheKey] = models;
-      if (lastModelKey === cacheKey) setModelOptions(models);
+      if (lastModelKey === cacheKey) {
+        setModelOptions(models);
+        showModelError("");
+      }
     } catch (err) {
-      providerModels[cacheKey] = provider === "ollama" ? fallbackOllama : fallbackLangcc;
-      if (lastModelKey === cacheKey) setModelOptions(providerModels[cacheKey]);
+      if (lastModelKey === cacheKey) {
+        const fallback = provider === "ollama" ? fallbackOllama : (provider === "langcc" ? fallbackLangcc : null);
+        if (fallback) {
+          setModelOptions(fallback);
+          showModelError("Could not reach the model list — showing defaults. Check the API key or connection, then Refresh.");
+        } else {
+          setModelPlaceholder("No models — Refresh to retry");
+          showModelError("Could not load models. Check the API key or connection, then Refresh.");
+        }
+      }
     } finally {
       modelsLoading[cacheKey] = false;
+      setRefreshBusy(false);
     }
+  }
+
+  function refreshModels() {
+    const provider = currentProvider();
+    if (!usesModelList()) return;
+    loadProviderModels(provider, { force: true });
   }
 
   function syncParamVisibility() {
@@ -252,10 +313,10 @@
       modelSelect.disabled = !usesList;
       modelSelect.name = usesList ? "model" : "";
     }
-    if (usesList) loadProviderModels(provider);
-    else if (modelInput && !modelInput.value) modelInput.value = "gpt-5-mini";
     showModelError("");
     syncParamVisibility();
+    if (usesList) loadProviderModels(provider);
+    else if (modelInput && !modelInput.value) modelInput.value = "gpt-5-mini";
   }
 
   if (llmUser) {
@@ -267,6 +328,8 @@
   keySave?.addEventListener("click", (e) => { e.preventDefault(); saveCurrentKey(); });
   keyForget?.addEventListener("click", (e) => { e.preventDefault(); forgetCurrentKey(); });
   providerSel?.addEventListener("change", () => {
+    // Drop the previous provider's key so we never list models with a stale key.
+    if (llmPass) llmPass.value = "";
     syncModelForProvider();
     loadSavedKey(currentProvider());
     queueSaveState();
@@ -278,20 +341,19 @@
   modelSearch?.addEventListener("input", () => {
     setModelOptions(providerModels[modelCacheKey(currentProvider())] || []);
   });
+  modelRefresh?.addEventListener("click", (e) => { e.preventDefault(); refreshModels(); });
   llmPass?.addEventListener("input", () => {
     const provider = currentProvider();
-    if (provider === "langcc" || provider === "openai") loadProviderModels(provider);
+    if (!(usesModelList() && modelFetchNeedsKey(provider))) return;
+    if (keyModelTimer) clearTimeout(keyModelTimer);
+    keyModelTimer = setTimeout(() => loadProviderModels(provider, { force: true }), 500);
   });
   sendModelParamsInput?.addEventListener("change", () => {
     syncParamVisibility();
     queueSaveState();
   });
   syncModelForProvider();
-  if (!apiKey() && KEY_PROVIDERS.includes(currentProvider())) {
-    loadSavedKey(currentProvider());
-  } else if (!KEY_PROVIDERS.includes(currentProvider())) {
-    applyKeyField(currentProvider(), "", false);
-  }
+  loadSavedKey(currentProvider());
 
   document.querySelectorAll(".chip").forEach((btn) => {
     btn.addEventListener("click", () => {

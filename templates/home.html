@@ -83,8 +83,8 @@
       <form id="run-form" action="/run" method="post" data-total-rows="{{ total_rows }}" data-sid-token="{{ sid_token }}">
         <label for="provider-select">Provider</label>
         <select name="provider" id="provider-select">
-          <option value="openai" {% if provider == 'openai' %}selected{% endif %}>OpenAI</option>
           <option value="langcc" {% if provider == 'langcc' %}selected{% endif %}>LangCC</option>
+          <option value="openai" {% if provider == 'openai' %}selected{% endif %}>OpenAI</option>
           <option value="gemini" {% if provider == 'gemini' %}selected{% endif %}>Gemini</option>
           <option value="ollama" {% if provider == 'ollama' %}selected{% endif %}>Ollama</option>
         </select>
@@ -95,7 +95,10 @@
             <input type="text" name="{% if provider in ['ollama', 'langcc'] %}{% else %}model{% endif %}" id="model-input" value="{{ model }}" autocomplete="off" {% if provider in ['ollama', 'langcc'] %}disabled{% endif %} />
           </div>
           <div class="model-list">
-            <input type="text" id="model-search" placeholder="Search models…" autocomplete="off" aria-label="Search models" />
+            <div class="model-list-controls">
+              <input type="text" id="model-search" placeholder="Search models…" autocomplete="off" aria-label="Search models" />
+              <button type="button" id="model-refresh" class="secondary" title="Re-fetch models for this provider">Refresh</button>
+            </div>
             <select name="{% if provider in ['ollama', 'langcc'] %}model{% endif %}" id="model-select" {% if provider not in ['ollama', 'langcc'] %}disabled{% endif %}><option value="">Loading…</option></select>
           </div>
         </div>
