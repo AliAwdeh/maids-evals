@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}New run · Maids Evals{% endblock %}
 {% block body %}
+  <div class="wizard-page">
   <h1>New run</h1>
   <p class="lede">Four steps, in order. Upload a CSV, load or write a prompt, pick a provider, then run. Your API key is saved only to your account.</p>
 
@@ -180,6 +181,7 @@
     {% endif %}
     <div class="actions"><a class="btn secondary" href="/runs">View all of your runs</a></div>
   </section>
+  </div>
 
   <div class="overlay" id="progress-overlay">
     <div class="modal">

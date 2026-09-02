@@ -457,8 +457,15 @@ pre.out, .diff {
   margin: 0 0 14px;
 }
 
+.wizard-page {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+}
+
 .wizard {
   max-width: 760px;
+  margin-inline: auto;
   display: flex;
   flex-direction: column;
 }
@@ -571,6 +578,7 @@ pre.out, .diff {
 
 .recent {
   max-width: 760px;
+  margin-inline: auto;
   margin-top: 22px;
   padding-top: 8px;
 }
