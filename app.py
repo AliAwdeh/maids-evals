@@ -570,7 +570,13 @@ async def provider_models(request: Request, provider: str = Form(...), api_key: 
 @app.get("/progress")
 def progress_status(request: Request, sid_token: Optional[str] = None):
     sid, sess = resolve_work(request, sid_token)
-    prog = sess.get("progress") or {"status": "idle", "done": 0, "sent": 0, "total": 0, "error": ""}
+    prog = dict(sess.get("progress") or {"status": "idle", "done": 0, "sent": 0, "total": 0, "error": ""})
+    stamped = prog.pop("updated_at", None)
+    # Seconds since a row last finished. A frozen number on the page means
+    # nothing on its own -- this is what says whether the server is still
+    # working or the run has actually wedged.
+    prog["idle_seconds"] = round(time.time() - stamped) if stamped else None
+    prog["run_id"] = prog.get("run_id") or sess.get("current_run_id") or ""
     resp = JSONResponse(prog)
     return attach_session(resp, request, sid)
 
@@ -970,7 +976,10 @@ async def run(
         send_model_params, enabled_params, temperature, top_p, max_output_tokens,
         presence_penalty, frequency_penalty, seed, reasoning_effort,
     )
-    sess["progress"] = {"status": "running", "done": 0, "sent": 0, "total": len(rows), "error": ""}
+    sess["progress"] = {
+        "status": "running", "done": 0, "sent": 0, "total": len(rows), "error": "",
+        "updated_at": time.time(),
+    }
     # A batch is the expensive thing this tool does. Without a stop, a prompt
     # aimed at the wrong column had to be ridden out or the server restarted.
     sess["cancel"] = False
@@ -1004,6 +1013,7 @@ async def run(
             mapping[fut] = idx
             sent_count += 1
             sess["progress"]["sent"] = sent_count
+            sess["progress"]["updated_at"] = time.time()
 
         task_queue = deque(list(enumerate(rows)))
         futures_set = set()
@@ -1034,6 +1044,7 @@ async def run(
                             detected_keys.update(row_keys)
                         done_count += 1
                         sess["progress"]["done"] = done_count
+                        sess["progress"]["updated_at"] = time.time()
                         submit_next(executor, task_queue, futures_set, future_to_idx)
             for idx, res in enumerate(results):
                 if res is None:
@@ -1058,6 +1069,7 @@ async def run(
                     "total": len(rows),
                     "error": "",
                     "message": f"Stopped after {len(finished)} of {len(rows)} rows. Nothing was archived.",
+                    "updated_at": time.time(),
                 }
                 return
             sess["results"] = results
@@ -1075,6 +1087,7 @@ async def run(
                 "total": len(results),
                 "error": "",
                 "run_id": run_id,
+                "updated_at": time.time(),
             }
         except Exception as e:
             sess["progress"] = {
@@ -1083,6 +1096,7 @@ async def run(
                 "sent": sent_count,
                 "total": len(rows),
                 "error": str(e),
+                "updated_at": time.time(),
             }
 
     threading.Thread(target=run_job, daemon=True).start()

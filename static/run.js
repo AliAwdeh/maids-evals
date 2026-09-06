@@ -988,10 +988,41 @@
   divideBtn?.addEventListener("click", (e) => { e.preventDefault(); show(divideOverlay, true); });
   document.getElementById("divide-cancel")?.addEventListener("click", () => show(divideOverlay, false));
 
+  // A poll that throws must never end the run's progress display. The batch
+  // keeps going on the server, so a laptop waking from sleep or one dropped
+  // request should cost a retry, not leave a frozen counter that looks like a
+  // hung job.
+  let pollFailures = 0;
+  const POLL_FAILURE_LIMIT = 12;
+  const STALL_SECONDS = 180;
+
+  function setProgressNote(msg, tone) {
+    const err = document.getElementById("progress-error");
+    if (!err) return;
+    err.textContent = msg || "";
+    err.style.color = tone === "warn" ? "var(--warn)" : "var(--bad)";
+  }
+
   async function pollProgress() {
     const qs = sidToken ? `?sid_token=${encodeURIComponent(sidToken)}` : "";
-    const resp = await fetch(`/progress${qs}`, { credentials: "same-origin" });
-    const data = await resp.json();
+    let data;
+    try {
+      const resp = await fetch(`/progress${qs}`, { credentials: "same-origin" });
+      if (!resp.ok) throw new Error(String(resp.status));
+      data = await resp.json();
+      pollFailures = 0;
+    } catch (err) {
+      pollFailures += 1;
+      if (pollFailures >= POLL_FAILURE_LIMIT) {
+        setProgressNote(
+          "Lost contact with the server. Your run is probably still going — it is saved when it finishes, so check Past runs.",
+        );
+        return "unreachable";
+      }
+      setProgressNote(`Lost contact with the server, retrying… (${pollFailures})`, "warn");
+      return "running";
+    }
+
     const done = data?.done ?? 0;
     const total = data?.total ?? 0;
     const sent = data?.sent ?? done;
@@ -1002,11 +1033,19 @@
     if (fill) fill.style.width = total ? `${Math.round((done / total) * 100)}%` : "0%";
     set("progress-running", Math.max(sent - done, 0));
     set("progress-pending", Math.max(total - sent, 0));
-    const err = document.getElementById("progress-error");
-    if (err) {
-      if (data?.status === "error") err.textContent = data.error || "";
-      else if (data?.status === "cancelled") err.textContent = data.message || "Run stopped.";
-      else err.textContent = "";
+
+    if (data?.status === "error") {
+      setProgressNote(data.error || "The run failed.");
+    } else if (data?.status === "cancelled") {
+      setProgressNote(data.message || "Run stopped.", "warn");
+    } else if ((data?.idle_seconds ?? 0) > STALL_SECONDS) {
+      const mins = Math.round(data.idle_seconds / 60);
+      setProgressNote(
+        `No row has finished for ${mins} minutes. The provider may be rate limiting — lower "Requests at once" under Advanced and try again, or press Stop.`,
+        "warn",
+      );
+    } else {
+      setProgressNote("");
     }
     return data?.status ?? "idle";
   }
@@ -1037,6 +1076,13 @@
     window.setBusy("run-button", false);
   });
 
+  // Closing the modal stops watching, not the run.
+  document.getElementById("progress-hide")?.addEventListener("click", () => {
+    show(overlay, false);
+    window.setBusy("run-button", false);
+    setPromptStatus("Your run is still going. It appears in Past runs when it finishes.");
+  });
+
   runForm?.addEventListener("submit", async (e) => {
     if (runForm.dataset.mode === "test") {
       runForm.dataset.mode = "";
@@ -1060,13 +1106,16 @@
       return;
     }
     showStopControls(true);
+    pollFailures = 0;
     let status = await pollProgress();
     while (status === "running") {
-      await new Promise((r) => setTimeout(r, 500));
+      // Back off while the server is unreachable so a dropped connection does
+      // not turn into a request storm.
+      await new Promise((r) => setTimeout(r, pollFailures ? Math.min(500 * 2 ** pollFailures, 15000) : 500));
       status = await pollProgress();
     }
     window.setBusy("run-button", false);
-    if (status === "error" || status === "cancelled") {
+    if (status !== "done") {
       showStopControls(false);
       return;
     }

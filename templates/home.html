@@ -251,10 +251,11 @@
       <p class="small"><strong><span id="progress-done">0</span> of <span id="progress-total">0</span></strong> done · <span id="progress-running">0</span> in flight · <span id="progress-pending">0</span> waiting</p>
       <p class="slot-msg error" id="progress-error"></p>
       <div class="actions">
-        <button type="button" id="progress-stop" class="warning">Stop</button>
+        <button type="button" id="progress-hide" class="secondary">Leave it running</button>
+        <button type="button" id="progress-stop" class="ghost">Stop the run</button>
         <button type="button" id="progress-close" class="secondary" hidden>Close</button>
       </div>
-      <p class="small">Stopping lets the rows already sent finish. Nothing is saved, but the finished rows stay on this page.</p>
+      <p class="small">The run carries on if you close this or the page — it is saved to <a href="/runs">Past runs</a> when it finishes. Stopping lets the rows already sent finish and saves nothing.</p>
     </div>
   </div>
 
