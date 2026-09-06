@@ -5,7 +5,7 @@
   <div class="page-head">
     <div>
       <h1>Check &amp; improve</h1>
-      <p class="lede">Read the answers, say which ones are wrong and why, then let the assistant rewrite the question. Your notes stay on this run — only a saved version is shared.</p>
+      <p class="lede">Read the answers, mark the wrong ones and say why, then let the fixer rewrite the prompt. Your notes stay on this run — only a saved version is shared.</p>
     </div>
     <div class="actions" style="margin:0;">
       <a class="btn secondary" href="/review?idx={{ prev_idx }}{{ filter_qs }}" {% if total == 0 or idx == 0 %}aria-disabled="true"{% endif %}>← Previous</a>
@@ -91,7 +91,7 @@
         <!-- ============ the fixer ============ -->
         <section class="card fixer">
           <div class="step-head" style="margin-bottom:2px;">
-            <div class="step-title"><h2>Improve the question</h2></div>
+            <div class="step-title"><h2>Improve the prompt</h2></div>
             <span class="tag {% if noted_count %}ai{% else %}warn{% endif %}">{{ noted_count }} note{{ '' if noted_count == 1 else 's' }}</span>
           </div>
           <p class="empty-hint">
@@ -125,12 +125,12 @@
           </details>
 
           <details class="adv">
-            <summary>See the question this run used</summary>
-            <label for="review-prompt">What to do</label>
+            <summary>The prompt this run used</summary>
+            <label for="review-prompt">Instructions</label>
             <textarea id="review-prompt" class="instructions-box">{{ prompt_draft }}</textarea>
-            <label for="review-input-template">What to read <span class="small" style="font-weight:400;">(read-only)</span></label>
+            <label for="review-input-template">Input data <span class="small" style="font-weight:400;">(read-only)</span></label>
             <textarea id="review-input-template" class="input-data-box" readonly>{{ input_template }}</textarea>
-            <p class="small"><a href="/prompts/history{% if prompt_name %}?name={{ prompt_name }}{% endif %}">See every past change to this question →</a></p>
+            <p class="small"><a href="/prompts/history{% if prompt_name %}?name={{ prompt_name }}{% endif %}">Every past change to this prompt →</a></p>
           </details>
         </section>
       </div>
@@ -189,7 +189,7 @@
         <!-- ============ re-check ============ -->
         <div class="kicker" style="margin-top:18px;">Does it actually work better?</div>
         <p class="empty-hint">
-          Run the new question on the rows you marked — including the ones you said were right.
+          Run the new prompt on the rows you marked — including the ones you said were right.
           A good fix moves the wrong answers and leaves the right ones alone.
         </p>
         <div class="actions tight">
@@ -232,7 +232,7 @@
           <button type="button" id="accept-button" {% if not proposed_prompt or fixer_unchanged %}disabled{% endif %}>Save as the new version</button>
           <button type="button" id="discard-button" class="ghost" {% if not proposed_prompt %}disabled{% endif %}>Throw it away</button>
         </div>
-        <p class="small">Saving shares this with everyone who can use the question. The old text is kept, so it can be put back.</p>
+        <p class="small">Saving shares this with everyone who can use the prompt. The old text is kept, so it can be put back.</p>
       </section>
       {% endif %}
     </div>
@@ -240,7 +240,7 @@
   {% else %}
   <div class="card empty">
     <h2>Nothing to check yet</h2>
-    <p class="empty-hint">Run a question over some rows first, or open a past run.</p>
+    <p class="empty-hint">Run a prompt over some rows first, or open a past run.</p>
     <div class="actions" style="justify-content:center;"><a class="btn" href="/">Start a run</a><a class="btn secondary" href="/runs">Past runs</a></div>
   </div>
   {% endif %}
@@ -257,6 +257,6 @@ window.MAIDS_REVIEW = {
   acceptedName: {{ accepted_name|tojson }}
 };
 </script>
-<script src="/static/ai-output.js"></script>
-<script src="/static/review.js"></script>
+<script src="{{ asset('ai-output.js') if asset else '/static/ai-output.js' }}"></script>
+<script src="{{ asset('review.js') if asset else '/static/review.js' }}"></script>
 {% endblock %}

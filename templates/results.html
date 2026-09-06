@@ -169,6 +169,6 @@
   </div>
 {% endblock %}
 {% block scripts %}
-<script src="/static/ai-output.js"></script>
-<script src="/static/app.js"></script>
+<script src="{{ asset('ai-output.js') if asset else '/static/ai-output.js' }}"></script>
+<script src="{{ asset('app.js') if asset else '/static/app.js' }}"></script>
 {% endblock %}

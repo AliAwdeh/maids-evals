@@ -52,6 +52,7 @@ import company_context
 from prompt_fixer import build_example, build_examples, improve_prompt, unified_diff
 from prompt_builder import (
     answers_from_form,
+    sample_report,
     catalogue_chat_turn,
     check_availability,
     discover_plan,
@@ -72,6 +73,7 @@ DATA_EXACT = {
     "/prompts/get",
     "/prompts/save",
     "/session/save",
+    "/upload",
     "/provider/models",
     "/ollama/models",
     "/credentials",
@@ -134,8 +136,26 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 
+_STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+
+def asset_url(path: str) -> str:
+    """Stamp a static file with its mtime.
+
+    Without this, a browser keeps serving the stylesheet it cached before the
+    last change, so a fix lands on the server and the page still looks broken
+    until someone thinks to hard-refresh.
+    """
+    try:
+        stamp = int(os.path.getmtime(os.path.join(_STATIC_DIR, path)))
+    except OSError:
+        stamp = 0
+    return f"/static/{path}?v={stamp}"
+
+
 def render(request: Request, name: str, context: Dict[str, Any], status_code: int = 200):
     ctx = dict(context)
+    ctx.setdefault("asset", asset_url)
     if "is_admin" not in ctx:
         user = getattr(request.state, "user", None) or ctx.get("user")
         ctx["is_admin"] = bool(user and auth.is_admin(user))
@@ -680,6 +700,40 @@ async def forget_credentials(request: Request, provider: str = Form(...)):
     return JSONResponse({"ok": True, "provider": (provider or "").strip().lower(), "saved": False, "deleted": deleted})
 
 
+
+def _scope_column_map(sess: Dict[str, Any], prompt_key: str, prompt: str, input_template: str) -> Dict[str, str]:
+    """Keep only the field matches the prompt now on screen actually uses.
+
+    The map used to live on the session and never be cleared, so every prompt
+    you had loaded that day left its fields behind: opening a prompt that needs
+    only {FULL_CONVERSATION} still showed {CHAT_TRANSCRIPT} from an earlier one.
+    A stale alias is worse than untidy -- apply_column_map writes it over the
+    row, so a leftover entry naming a column the new sheet really has would
+    silently replace that column's value.
+
+    Each prompt's matches are remembered separately, so switching back to one
+    you mapped earlier restores it instead of asking again.
+    """
+    store = sess.setdefault("column_maps", {})
+    active = sess.get("column_map") or {}
+    previous_key = sess.get("column_map_key") or ""
+    if previous_key and active:
+        store[previous_key] = dict(active)
+
+    wanted = set(required_placeholders(prompt or "", input_template or ""))
+    remembered = store.get(prompt_key) or {}
+    # Anything the previous prompt shared with this one carries over, so a
+    # re-load of the same prompt does not lose the matches you just made.
+    merged = {**{k: v for k, v in active.items() if k in wanted}, **remembered}
+    scoped = {k: v for k, v in merged.items() if k in wanted}
+
+    sess["column_map"] = scoped
+    sess["column_map_key"] = prompt_key
+    if prompt_key:
+        store[prompt_key] = dict(scoped)
+    return scoped
+
+
 @app.get("/prompts/get")
 def get_prompt(request: Request, name: str = "", id: str = ""):
     sid, sess = get_work_session(request)
@@ -707,18 +761,25 @@ def get_prompt(request: Request, name: str = "", id: str = ""):
     sess["input_template"] = item.get("input_template") or ""
     if item.get("id"):
         storage.remember_last_prompt(user, item.get("id") or "", item.get("name") or "")
+    column_map = _scope_column_map(
+        sess,
+        item.get("id") or item.get("name") or "",
+        item.get("prompt") or "",
+        item.get("input_template") or "",
+    )
     gaps = mapping_gaps(
-        item.get("required_inputs") or required_placeholders(item.get("prompt") or "", item.get("input_template") or ""),
+        required_placeholders(item.get("prompt") or "", item.get("input_template") or ""),
         sess.get("csv_cols") or [],
-        sess.get("column_map") or {},
+        column_map,
     )
     resp = JSONResponse({
         "id": item.get("id") or "",
         "name": item.get("name") or "",
         "content": item.get("prompt") or "",
         "input_template": item.get("input_template") or "",
-        "required_inputs": item.get("required_inputs") or [],
+        "required_inputs": required_placeholders(item.get("prompt") or "", item.get("input_template") or ""),
         "mapping_needed": gaps,
+        "column_map": column_map,
         "columns": sess.get("csv_cols") or [],
     })
     return attach_session(resp, request, sid)
@@ -754,22 +815,63 @@ def _safe_next_path(next_path: Optional[str]) -> str:
     return path if path in allowed else "/"
 
 
+def _dataset_payload(sess: Dict[str, Any]) -> Dict[str, Any]:
+    """What the page needs to show a newly loaded sheet without reloading."""
+    rows = sess.get("rows") or []
+    cols = sess.get("csv_cols") or []
+    first = rows[0] if rows else {}
+    return {
+        "ok": True,
+        "rows": len(rows),
+        "columns": cols,
+        "note": sess.get("upload_note") or "",
+        "sheet": sess.get("upload_sheet") or "",
+        "sample_row": {str(k): (str(v)[:600] if v is not None else "") for k, v in first.items()},
+        "column_map": sess.get("column_map") or {},
+        "mapping_needed": mapping_gaps(
+            required_placeholders(sess.get("prompt_template") or "", sess.get("input_template") or ""),
+            cols,
+            sess.get("column_map") or {},
+        ),
+    }
+
+
 @app.post("/upload")
 async def upload(
     request: Request,
     csv_file: UploadFile = File(...),
     next: Optional[str] = Form(None),
+    json_response: Optional[str] = Form(None),
 ):
     sid, sess = get_work_session(request)
     raw = await csv_file.read()
     filename = csv_file.filename or ""
+    wants_json = json_response == "1"
     try:
         df, meta = load_tabular_file(raw, filename)
     except ValueError as e:
+        if wants_json:
+            return JSONResponse({"error": str(e)}, status_code=400)
         return PlainTextResponse(str(e), status_code=400)
     except Exception as e:
-        return PlainTextResponse(f"Could not read this file: {e}", status_code=400)
+        message = f"Could not read this file: {e}"
+        if wants_json:
+            return JSONResponse({"error": message}, status_code=400)
+        return PlainTextResponse(message, status_code=400)
     _store_uploaded_frame(sess, df, meta)
+
+    # A new sheet can invalidate matches made against the old one.
+    columns = set(sess.get("csv_cols") or [])
+    kept = {k: v for k, v in (sess.get("column_map") or {}).items() if v in columns}
+    sess["column_map"] = kept
+    for key, saved in (sess.get("column_maps") or {}).items():
+        sess["column_maps"][key] = {k: v for k, v in saved.items() if v in columns}
+
+    if wants_json:
+        # Returning data instead of a redirect is what lets the page keep the
+        # prompt someone is halfway through typing.
+        resp = JSONResponse(_dataset_payload(sess))
+        return attach_session(resp, request, sid)
     resp = RedirectResponse(url=_safe_next_path(next), status_code=303)
     return attach_session(resp, request, sid)
 
@@ -2358,15 +2460,39 @@ async def builder_discover(
     key = _builder_key(request, provider, api_key)
     if provider_requires_key(provider) and not key:
         return PlainTextResponse("An API key is required for this provider.", status_code=400)
-    sample = sample_rows(rows, cols)
+    # One random draw, used by both passes, so the availability score describes
+    # the same rows the plan was built on.
+    seed = random.randrange(1 << 30)
+    sample = sample_rows(rows, cols, content_column=content_col, seed=seed)
+    stats = sample_report(rows, cols, content_col)
     mode = "deep" if (mode or "").strip().lower() == "deep" else "quick"
-    try:
-        plan = discover_plan(provider, key, model, cols, sample, goal, content_col, meanings, mode=mode)
-    except ValueError as e:
-        return PlainTextResponse(str(e), status_code=400)
-    except Exception as e:
-        return PlainTextResponse(f"Could not study the sample: {e}", status_code=502)
-    storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 400, 400)
+
+    # Studying the rows and scoring the sheet are independent, so run them at
+    # the same time -- the wall clock is one call, not two.
+    def _plan():
+        return discover_plan(provider, key, model, cols, sample, goal, content_col, meanings, mode=mode)
+
+    def _availability():
+        return check_availability(
+            provider, key, model, cols, sample, goal, content_col, meanings, stats=stats
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        plan_future = pool.submit(_plan)
+        avail_future = pool.submit(_availability)
+        try:
+            plan = plan_future.result()
+        except ValueError as e:
+            return PlainTextResponse(str(e), status_code=400)
+        except Exception as e:
+            return PlainTextResponse(f"Could not study the sample: {e}", status_code=502)
+        try:
+            availability = avail_future.result()
+        except Exception:
+            # A missing score should never block the plan the user asked for.
+            availability = None
+
+    storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 800, 700)
     state = _builder_state(sess)
     state.update({
         "goal": goal,
@@ -2377,10 +2503,20 @@ async def builder_discover(
         "question_log": [],
         "discover_mode": mode,
         "answers": {},
+        "availability": availability or {},
+        "sample_seed": seed,
+        "sample_stats": stats,
     })
     sess["provider"] = provider
     sess["model"] = model
-    resp = JSONResponse({"ok": True, "plan": plan, "sample_size": len(sample), "mode": mode})
+    resp = JSONResponse({
+        "ok": True,
+        "plan": plan,
+        "sample_size": len(sample),
+        "mode": mode,
+        "report": availability,
+        "stats": stats,
+    })
     return attach_session(resp, request, sid)
 
 
@@ -2420,7 +2556,7 @@ async def builder_deep_next(
         state["questions"] = []
         resp = JSONResponse({"ok": True, "plan": plan, "mode": "deep", "stopped": "limit"})
         return attach_session(resp, request, sid)
-    sample = sample_rows(rows, cols)
+    sample = sample_rows(rows, cols, content_column=content_col)
     prior = [
         {"id": q.get("id"), "question": q.get("text"), "answer": q.get("answer")}
         for q in state["question_log"]
@@ -2502,6 +2638,7 @@ async def builder_generate(
     sess["prompt_id"] = ""
     sess["prompt_template"] = made["prompt"]
     sess["input_template"] = made.get("input_template") or ""
+    _scope_column_map(sess, "", made["prompt"], made.get("input_template") or "")
     sess["json_mode"] = bool(made.get("json_mode", True))
     sess["provider"] = provider
     sess["model"] = model
@@ -2610,11 +2747,13 @@ async def builder_availability(
     key = _builder_key(request, provider, api_key)
     if provider_requires_key(provider) and not key:
         return PlainTextResponse("An API key is required for this provider.", status_code=400)
-    sample = sample_rows(rows, cols)
     state = _builder_state(sess)
+    sample = sample_rows(rows, cols, content_column=content_col, seed=state.get("sample_seed"))
+    stats = sample_report(rows, cols, content_col)
     try:
         report = check_availability(
-            provider, key, model, cols, sample, goal, content_col, meanings, state.get("plan") or {}
+            provider, key, model, cols, sample, goal, content_col, meanings,
+            state.get("plan") or {}, stats=stats,
         )
     except ValueError as e:
         return PlainTextResponse(str(e), status_code=400)
@@ -3043,18 +3182,22 @@ async def catalogue_use(request: Request, prompt_id: str):
     sess["prompt_template"] = item.get("prompt") or ""
     sess["input_template"] = item.get("input_template") or ""
     storage.remember_last_prompt(request.state.user, item["id"], item["name"])
+    column_map = _scope_column_map(
+        sess, item["id"], item.get("prompt") or "", item.get("input_template") or ""
+    )
     gaps = mapping_gaps(
-        item.get("required_inputs") or [],
+        required_placeholders(item.get("prompt") or "", item.get("input_template") or ""),
         sess.get("csv_cols") or [],
-        sess.get("column_map") or {},
+        column_map,
     )
     resp = JSONResponse({
         "ok": True,
         "id": item["id"],
         "name": item["name"],
         "mapping_needed": gaps,
+        "column_map": column_map,
         "columns": sess.get("csv_cols") or [],
-        "required_inputs": item.get("required_inputs") or [],
+        "required_inputs": required_placeholders(item.get("prompt") or "", item.get("input_template") or ""),
     })
     return attach_session(resp, request, sid)
 

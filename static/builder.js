@@ -403,9 +403,16 @@
       }
       const data = await resp.json();
       fillPlan(data.plan || {});
+      // Scoring the sheet ran alongside the study, so show it here instead of
+      // hiding it behind a button that has to be discovered.
+      if (data.report) {
+        fillAvailability(data.report);
+        showAvailabilityInline(data.report, data.stats || {});
+      }
+      const drawn = `${data.sample_size || 0} rows picked at random out of ${(data.stats || {}).total_rows || 0}`;
       statusNearQuestions(mode === "deep"
-        ? `Deep pass on ${data.sample_size || 0} sample rows. Answer the questions below, then click Answer and keep going.`
-        : `Looked at ${data.sample_size || 0} sample rows.`);
+        ? `Deep pass on ${drawn}. Answer the questions below, then click Answer and keep going.`
+        : `Studied ${drawn}.`);
     } catch (err) {
       statusNearQuestions(err?.message || "Could not reach the helper.", true);
     } finally {
@@ -491,6 +498,55 @@
     setMsg("generate-status", `Draft ready as ${data.name}. Not saved yet, and no row was tested.`);
   });
 
+
+  // Sheet score, shown in the flow. The numbers in the second line are counted
+  // over the whole sheet in code -- they are facts, not the model's impression
+  // of five rows.
+  function showAvailabilityInline(report, stats) {
+    const box = document.getElementById("avail-inline");
+    if (!box) return;
+    const score = report.score != null ? report.score : null;
+    const good = score != null && score >= 80;
+    const poor = score != null && score < 60;
+    box.className = "fixer-callout " + (poor ? "bad" : good ? "good" : "warn");
+    const ico = document.getElementById("avail-inline-ico");
+    if (ico) ico.textContent = poor ? "!" : good ? "✓" : "!";
+    const head = document.getElementById("avail-inline-head");
+    if (head) {
+      head.textContent = score == null
+        ? "Sheet checked. "
+        : `This sheet scores ${score}/100 for what you asked. `;
+    }
+    const body = document.getElementById("avail-inline-body");
+    if (body) body.textContent = report.summary || "";
+
+    const line = document.getElementById("avail-inline-stats");
+    if (line) {
+      const bits = [];
+      if (stats.total_rows) bits.push(`${stats.total_rows} rows`);
+      if (stats.content_coverage != null) {
+        bits.push(`${stats.content_coverage}% have text in ${stats.content_column}`);
+      }
+      if (stats.median_content_chars) bits.push(`typical length ${stats.median_content_chars} chars`);
+      if ((stats.empty_columns || []).length) {
+        bits.push(`always empty: ${stats.empty_columns.slice(0, 4).join(", ")}`);
+      }
+      line.textContent = bits.join(" · ");
+    }
+
+    const more = document.getElementById("avail-more");
+    if (more) {
+      const hasDetail = (report.helpful_missing || []).length || (report.have || []).length;
+      more.hidden = !hasDetail;
+    }
+    box.hidden = false;
+  }
+
+  document.getElementById("avail-more")?.addEventListener("click", () => {
+    const overlay = document.getElementById("avail-overlay");
+    if (overlay) overlay.style.display = "flex";
+  });
+
   function fillAvailability(report) {
     const score = document.getElementById("avail-score");
     const summary = document.getElementById("avail-summary");
@@ -547,6 +603,7 @@
     }
     const data = await resp.json();
     fillAvailability(data.report || {});
+    showAvailabilityInline(data.report || {}, (data.report || {}).stats || {});
     setMsg("avail-status", (data.report || {}).ready
       ? "Everything important looks available. You can build the prompt."
       : "Read the missing fields. Add them to the file if you can, or build anyway.");

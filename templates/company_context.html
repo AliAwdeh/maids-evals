@@ -26,5 +26,5 @@
   </div>
 {% endblock %}
 {% block scripts %}
-<script src="/static/company-context.js"></script>
+<script src="{{ asset('company-context.js') if asset else '/static/company-context.js' }}"></script>
 {% endblock %}

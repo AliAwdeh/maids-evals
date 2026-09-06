@@ -90,5 +90,5 @@
   </section>
 {% endblock %}
 {% block scripts %}
-<script src="/static/settings.js"></script>
+<script src="{{ asset('settings.js') if asset else '/static/settings.js' }}"></script>
 {% endblock %}

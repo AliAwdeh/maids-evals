@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import re
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -486,7 +487,18 @@ def process_row(
 # (base_url, model) and remember the answer so a gateway that cannot do it costs
 # one extra request in total rather than one per row.
 _json_mode_unsupported: set = set()
-_json_mode_lock = __import__("threading").Lock()
+_json_mode_lock = threading.Lock()
+
+_gemini_clients: Dict[str, Any] = {}
+
+
+def _gemini_client(api_key: str):
+    with _clients_lock:
+        client = _gemini_clients.get(api_key)
+        if client is None:
+            client = genai.Client(api_key=api_key)
+            _gemini_clients[api_key] = client
+        return client
 
 
 def _json_mode_ok(scope: str) -> bool:
@@ -497,6 +509,52 @@ def _json_mode_ok(scope: str) -> bool:
 def _mark_json_mode_unsupported(scope: str) -> None:
     with _json_mode_lock:
         _json_mode_unsupported.add(scope)
+
+
+# One client per (base_url, key), reused for the life of the process.
+#
+# A fresh OpenAI() per call means a fresh connection pool and a fresh TLS
+# handshake for every single row -- on a 5,000-row batch that is 5,000
+# handshakes, and it is the single largest avoidable cost in a run. The SDK's
+# client is thread-safe, so the worker pool can share one.
+REQUEST_TIMEOUT = float(os.getenv("LLM_TIMEOUT_SECONDS", "180"))
+_clients: Dict[str, "OpenAI"] = {}
+_clients_lock = threading.Lock()
+
+
+def _client_for(api_key: str, base_url: Optional[str] = None) -> "OpenAI":
+    cache_key = f"{base_url or 'default'}::{api_key}"
+    with _clients_lock:
+        client = _clients.get(cache_key)
+        if client is None:
+            kwargs: Dict[str, Any] = {
+                "api_key": api_key,
+                "timeout": REQUEST_TIMEOUT,
+                "max_retries": 2,
+            }
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = OpenAI(**kwargs)
+            _clients[cache_key] = client
+        return client
+
+
+def _is_unsupported_param_error(exc: Exception) -> bool:
+    """True only when the endpoint rejected the JSON response format itself.
+
+    A timeout or a 429 must not permanently disable JSON mode for a model that
+    supports it perfectly well.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None and status not in (400, 404, 422):
+        return False
+    text = str(exc).lower()
+    if status in (400, 404, 422):
+        return True
+    return any(
+        hint in text
+        for hint in ("unsupported", "unrecognized", "unknown parameter", "invalid_request", "not supported")
+    )
 
 
 def _responses_call(
@@ -517,10 +575,12 @@ def _responses_call(
                 **params,
             )
             return resp.output_text
-        except Exception:
-            # The gateway or model does not take a JSON response format. Fall
-            # back to plain text for this and every later call on this scope --
-            # the prompt still asks for JSON and try_parse_json still repairs it.
+        except Exception as e:
+            # Only stop asking for JSON when the endpoint actually refused the
+            # parameter. The prompt still asks for JSON and try_parse_json still
+            # repairs it, so falling back costs accuracy, not correctness.
+            if not _is_unsupported_param_error(e):
+                raise
             _mark_json_mode_unsupported(scope)
     resp = client.responses.create(model=model, input=prompt, **params)
     return resp.output_text
@@ -533,8 +593,9 @@ def call_openai(
     json_mode: bool = False,
     model_params: Optional[Dict[str, Any]] = None,
 ) -> str:
-    client = OpenAI(api_key=api_key)
-    return _responses_call(client, model, prompt, json_mode, model_params, f"openai::{model}")
+    return _responses_call(
+        _client_for(api_key), model, prompt, json_mode, model_params, f"openai::{model}"
+    )
 
 
 def call_langcc(
@@ -544,8 +605,10 @@ def call_langcc(
     json_mode: bool = False,
     model_params: Optional[Dict[str, Any]] = None,
 ) -> str:
-    client = OpenAI(api_key=api_key, base_url=LANGCC_API_BASE)
-    return _responses_call(client, model, prompt, json_mode, model_params, f"{LANGCC_API_BASE}::{model}")
+    return _responses_call(
+        _client_for(api_key, LANGCC_API_BASE), model, prompt, json_mode, model_params,
+        f"{LANGCC_API_BASE}::{model}",
+    )
 
 
 def call_gemini(
@@ -555,7 +618,7 @@ def call_gemini(
     json_mode: bool = False,
     model_params: Optional[Dict[str, Any]] = None,
 ) -> str:
-    client = genai.Client(api_key=api_key)
+    client = _gemini_client(api_key)
     config = {}
     for src, dst in (("temperature", "temperature"), ("top_p", "top_p"), ("max_output_tokens", "max_output_tokens")):
         if model_params and src in model_params:
@@ -616,7 +679,7 @@ def fetch_ollama_models() -> List[str]:
 
 
 def fetch_openai_compatible_models(api_key: str, base_url: Optional[str] = None) -> List[str]:
-    client = OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+    client = _client_for(api_key, base_url)
     models_page = client.models.list()
     models = [m.id for m in models_page.data if getattr(m, "id", None)]
     return sorted(models)

@@ -83,5 +83,5 @@
   </table>
 {% endblock %}
 {% block scripts %}
-<script src="/static/admin.js"></script>
+<script src="{{ asset('admin.js') if asset else '/static/admin.js' }}"></script>
 {% endblock %}

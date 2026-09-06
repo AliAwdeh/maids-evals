@@ -4,7 +4,7 @@
 {% block body %}
   <div class="wizard-page">
   <h1>Build a prompt</h1>
-  <p class="lede">Tell the assistant what you want to know about each row. It reads a few example rows, asks you a couple of questions, and writes the question for you. You try it on one row before anything else happens. It already knows the team's <a href="/context">company notes</a>, so it uses the right names.</p>
+  <p class="lede">Say what you want to find out about each row. The assistant reads a few sample rows, asks what it still needs, and drafts the prompt — instructions and input data separately. You test it on one row before it goes anywhere. It already reads the team's <a href="/context">company notes</a>, so it uses the right names.</p>
 
   <div class="wizard">
     <section class="step{% if has_csv %} done{% endif %}" id="step-data">
@@ -151,8 +151,17 @@
       </div>
       <div class="actions">
         <button type="button" id="deep-next-button" class="secondary" hidden>Answer and keep going</button>
-        <button type="button" id="availability-button" class="secondary" {% if not has_csv %}disabled{% endif %}>Check data availability</button>
-        <button type="button" id="generate-button" class="secondary" {% if not builder.plan %}disabled{% endif %}>Write the prompt</button>
+        <button type="button" id="generate-button" {% if not builder.plan %}disabled{% endif %}>Write the prompt</button>
+        <button type="button" id="availability-button" class="ghost" {% if not has_csv %}disabled{% endif %}>Score the sheet again</button>
+      </div>
+      <div class="fixer-callout info" id="avail-inline" hidden>
+        <span class="ico" id="avail-inline-ico">i</span>
+        <span>
+          <strong id="avail-inline-head"></strong>
+          <span id="avail-inline-body"></span>
+          <span class="small" id="avail-inline-stats" style="display:block;margin-top:4px;"></span>
+          <button type="button" id="avail-more" class="ghost" style="margin-top:6px;padding:3px 9px;font-size:12px;">What would help</button>
+        </span>
       </div>
       <p class="slot-msg" id="questions-status"></p>
       <p class="slot-msg" id="generate-status">{% if builder.prompt_name %}Draft ready as {{ builder.prompt_name }}{% endif %}</p>
@@ -247,6 +256,6 @@ window.MAIDS_BUILDER = {
   hasFile: {{ has_csv|tojson }}
 };
 </script>
-<script src="/static/ai-output.js"></script>
-<script src="/static/builder.js"></script>
+<script src="{{ asset('ai-output.js') if asset else '/static/ai-output.js' }}"></script>
+<script src="{{ asset('builder.js') if asset else '/static/builder.js' }}"></script>
 {% endblock %}

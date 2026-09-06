@@ -135,19 +135,79 @@ def _clip(value: Any, limit: int = CELL_LIMIT) -> str:
     return text[: limit - 1] + "…"
 
 
-def sample_rows(rows: List[Dict[str, Any]], columns: List[str], n: int = SAMPLE_ROWS) -> List[Dict[str, str]]:
-    usable = [r for r in rows if any(str(r.get(c, "")).strip() for c in columns)]
+def sample_rows(
+    rows: List[Dict[str, Any]],
+    columns: List[str],
+    n: int = SAMPLE_ROWS,
+    content_column: str = "",
+    seed: Optional[int] = None,
+) -> List[Dict[str, str]]:
+    """A random handful of rows that actually have something to read.
+
+    Two things matter here. It must be *random* across the whole sheet -- the
+    first few rows of an export are usually the oldest or the smallest, and a
+    plan built on those misses everything the tail looks like. And when a
+    content column is named, rows where that column is blank are useless for
+    studying: they were being sampled anyway, because the old filter accepted a
+    row if *any* cell had text, so a sheet with sparse transcripts could hand
+    the helper five empty conversations.
+
+    Pass a seed to get the same sample twice, so the availability score
+    describes the rows the plan was built on rather than a different draw.
+    """
+    content = (content_column or "").strip()
+    if content:
+        usable = [r for r in rows if str(r.get(content, "") or "").strip()]
+        if not usable:
+            # Nothing has content. Fall back rather than returning nothing, so
+            # the helper can still say the sheet is not usable for this goal.
+            usable = [r for r in rows if any(str(r.get(c, "")).strip() for c in columns)]
+    else:
+        usable = [r for r in rows if any(str(r.get(c, "")).strip() for c in columns)]
     if not usable:
         return []
     take = min(max(n, 3), 8, len(usable))
     if len(usable) <= take:
-        chosen = usable
+        chosen = list(usable)
     else:
-        chosen = random.sample(usable, take)
+        rng = random.Random(seed) if seed is not None else random
+        chosen = rng.sample(usable, take)
     sample = []
     for row in chosen:
         sample.append({str(c): _clip(row.get(c, "")) for c in columns})
     return sample
+
+
+def sample_report(rows: List[Dict[str, Any]], columns: List[str], content_column: str = "") -> Dict[str, Any]:
+    """How much of the sheet is actually usable, counted rather than guessed.
+
+    This runs in code, not in the model, so the coverage numbers are facts.
+    """
+    total = len(rows or [])
+    content = (content_column or "").strip()
+    filled = 0
+    lengths: List[int] = []
+    if content:
+        for row in rows or []:
+            text = str(row.get(content, "") or "").strip()
+            if text:
+                filled += 1
+                lengths.append(len(text))
+    blank_columns = []
+    for col in columns or []:
+        if not any(str(r.get(col, "") or "").strip() for r in (rows or [])):
+            blank_columns.append(col)
+    lengths.sort()
+    median = lengths[len(lengths) // 2] if lengths else 0
+    return {
+        "total_rows": total,
+        "content_column": content,
+        "rows_with_content": filled,
+        "content_coverage": round(100 * filled / total) if (total and content) else None,
+        "median_content_chars": median,
+        "shortest_content_chars": lengths[0] if lengths else 0,
+        "empty_columns": blank_columns,
+    }
 
 
 _PLACEHOLDER_RE = re.compile(r"\{([^{}]+)\}")
@@ -402,7 +462,12 @@ def answers_from_form(questions: List[Dict[str, Any]], raw: Optional[Dict[str, s
 
 AVAILABILITY_INSTRUCTIONS = TOOL_LIMITS + """Score how useful the CURRENT spreadsheet is for the user's analysis goal.
 
-You receive the goal, the main content column, optional notes, a small sample, and the plan so far.
+You receive the goal, the main content column, optional notes, a small sample, the plan so far, and measured_stats.
+
+measured_stats was counted over the WHOLE sheet in code, not estimated from the sample. Trust it over your impression of the sample:
+- content_coverage is the percentage of rows whose main content column has any text. Below 70 is a real problem: say so plainly and cap the score at 60, because most rows will produce an answer about nothing.
+- median_content_chars near zero means the content is too short to analyse.
+- empty_columns are entirely blank in every row. Never rely on one, and mention it if the user's goal needs it.
 
 Return JSON only:
 {
@@ -433,9 +498,11 @@ def check_availability(
     content_column: str,
     meanings: str = "",
     plan: Optional[Dict[str, Any]] = None,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not sample:
         raise ValueError("Need a few example rows to score the sheet.")
+    stats = stats or {}
     data = _ask(
         provider,
         api_key,
@@ -448,12 +515,18 @@ def check_availability(
             "columns": columns,
             "sample_rows": sample,
             "plan": plan or {},
+            "measured_stats": stats,
         },
     )
     try:
         score = max(0, min(100, int(data.get("score"))))
     except Exception:
         score = 50
+    # Coverage is a counted fact. Do not let an optimistic model score a sheet
+    # highly when most of its rows have nothing to read.
+    coverage = stats.get("content_coverage")
+    if isinstance(coverage, int) and coverage < 70:
+        score = min(score, 60 if coverage >= 40 else 35)
     missing = []
     for item in data.get("helpful_missing") or []:
         if not isinstance(item, dict):
@@ -471,7 +544,8 @@ def check_availability(
         "have": [str(x).strip() for x in (data.get("have") or []) if str(x).strip()],
         "helpful_missing": missing,
         "questions": _normalize_questions(data.get("questions"), 4),
-        "ready": bool(data.get("ready")) or score >= 80,
+        "ready": (bool(data.get("ready")) or score >= 80) and score >= 70,
+        "stats": stats,
     }
 
 

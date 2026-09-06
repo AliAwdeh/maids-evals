@@ -60,7 +60,7 @@
       <p class="small">One row is a thin basis for a change. For a real fix, run the file and mark several rows on <a href="/review">Check &amp; improve</a>.</p>
     </section>
     <section class="card">
-      <div class="kicker">Fix the question from this one row</div>
+      <div class="kicker">Fix the prompt from this one row</div>
       <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on">
         <input id="llm-username" name="username" type="hidden" autocomplete="username" value="{{ provider }}" />
         <label for="fixer-model">Model</label>
@@ -99,6 +99,6 @@ window.MAIDS_TEST = {
   acceptedName: {{ accepted_name|tojson }}
 };
 </script>
-<script src="/static/ai-output.js"></script>
-<script src="/static/test.js"></script>
+<script src="{{ asset('ai-output.js') if asset else '/static/ai-output.js' }}"></script>
+<script src="{{ asset('test.js') if asset else '/static/test.js' }}"></script>
 {% endblock %}

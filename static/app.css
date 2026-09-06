@@ -103,6 +103,12 @@
 
 * { box-sizing: border-box; }
 
+/* The browser hides [hidden] with display:none from the UA sheet, which any
+   authored `display` rule outranks -- and buttons here are inline-flex. Without
+   this, every hidden control (Save changes, Apply edit, Stop, Upload) stayed on
+   screen while the DOM insisted it was hidden. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;

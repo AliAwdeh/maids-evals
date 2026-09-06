@@ -4,7 +4,7 @@
   <div class="page-head">
     <div>
       <h1>New run</h1>
-      <p class="lede">Pick your data, pick the question, run it over every row. If you don't have a question written yet, <a href="/builder">let the assistant write one with you</a>.</p>
+      <p class="lede">Upload a sheet, load or write a prompt, run it over every row. No prompt yet? <a href="/builder">Build one with the assistant</a>.</p>
     </div>
   </div>
 
@@ -23,34 +23,33 @@
         </div>
         <p class="empty-hint" id="dataset-hint">{% if has_csv %}Each row is analysed on its own. Upload a different file to start over.{% else %}A CSV or Excel file. Anything with text in it works — chats, call transcripts, SMS, tickets, survey answers.{% endif %}</p>
         {% if upload_note %}<p class="slot-msg">{{ upload_note }}</p>{% endif %}
-        <form action="/upload" method="post" enctype="multipart/form-data">
+        <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data">
           <input type="hidden" name="next" value="/" />
           <input id="csv_file" type="file" name="csv_file" accept=".csv,.xlsx,.xls" required aria-label="Spreadsheet" />
           <div class="actions tight">
-            <button type="submit"{% if has_csv %} class="secondary"{% endif %}>{% if has_csv %}Use a different file{% else %}Upload{% endif %}</button>
-            {% if has_csv %}<button type="button" id="divide-button" class="ghost">Try a smaller sample first</button>{% endif %}
+            <button type="submit" id="upload-button" class="secondary" hidden>Upload</button>
+            <button type="button" id="divide-button" class="ghost" {% if not has_csv %}hidden{% endif %}>Try a smaller sample first</button>
           </div>
         </form>
-        {% if csv_cols %}
-        <div class="chips" style="margin-top:12px;">
+        <p class="slot-msg" id="upload-status"></p>
+        <div class="chips" id="dataset-columns" style="margin-top:12px;" {% if not csv_cols %}hidden{% endif %}>
           {% for col in csv_cols[:14] %}<span class="tag">{{ col }}</span>{% endfor %}
           {% if csv_cols|length > 14 %}<span class="chip-empty">+{{ csv_cols|length - 14 }} more</span>{% endif %}
         </div>
-        {% endif %}
       </section>
 
       <section class="step{% if prompt_template %} done{% endif %}" id="step-prompt">
         <div class="step-head">
           <div class="step-title">
             <span class="step-num">2</span>
-            <h2>Your question</h2>
+            <h2>Prompt</h2>
           </div>
           <span class="tag {% if prompt_name %}ok{% else %}warn{% endif %} step-tag">{% if prompt_name %}{{ prompt_name }}{% else %}Nothing loaded{% endif %}</span>
         </div>
 
         <div class="actions tight" style="margin-top:6px;">
           <select id="prompt-select" style="flex:1;min-width:200px;">
-            <option value="">Choose a saved question…</option>
+            <option value="">Load a prompt from the library…</option>
             {% for item in prompts %}
             <option value="{{ item.id }}" data-owner="{{ item.owner }}" data-name="{{ item.name }}" {% if item.id == prompt_id or item.name == prompt_name %}selected{% endif %}>{{ item.name }} — {{ item.owner }}{% if item.mine %} (yours){% endif %}</option>
             {% endfor %}
@@ -58,13 +57,13 @@
           <button type="button" id="prompt-load" class="secondary">Load</button>
           <button type="button" id="prompt-last" class="ghost" {% if not last_prompt_id %}disabled{% endif %}>{% if last_prompt_name %}Last: {{ last_prompt_name }}{% else %}Last used{% endif %}</button>
         </div>
-        <input id="prompt-search" type="search" placeholder="Filter by name or who made it" autocomplete="off" style="margin-top:8px;" aria-label="Filter saved questions" />
-        <p class="slot-msg" id="prompt-status">Or write your own below. <a href="/catalogue">Browse all questions</a>.</p>
+        <input id="prompt-search" type="search" placeholder="Filter by name or who made it" autocomplete="off" style="margin-top:8px;" aria-label="Filter the prompt library" />
+        <p class="slot-msg" id="prompt-status">Or write your own below. <a href="/catalogue">Open the prompt library</a>.</p>
 
         <div class="editor" style="margin-top:14px;">
           <div class="editor-tabs" role="tablist">
-            <button type="button" class="editor-tab" role="tab" data-pane="pane-instructions" aria-selected="true">What to do<span class="count" id="count-instructions"></span></button>
-            <button type="button" class="editor-tab" role="tab" data-pane="pane-input" aria-selected="false">What to read<span class="count" id="count-input"></span></button>
+            <button type="button" class="editor-tab" role="tab" data-pane="pane-instructions" aria-selected="true">Instructions<span class="count" id="count-instructions"></span></button>
+            <button type="button" class="editor-tab" role="tab" data-pane="pane-input" aria-selected="false">Input data<span class="count" id="count-input"></span></button>
             <button type="button" class="editor-tab" role="tab" data-pane="pane-preview" aria-selected="false">Preview</button>
           </div>
 
@@ -80,7 +79,7 @@
 
           <div class="editor-pane" id="pane-preview" role="tabpanel" hidden>
             <p class="empty-hint">Exactly what one row sends to the model. <span class="preview-fill">Green</span> is a value filled in from your sheet. <span class="preview-gap">Red</span> is a field that is missing — fix those before running.</p>
-            <pre class="preview-box" id="prompt-preview">Upload a file and write your question to see the preview.</pre>
+            <pre class="preview-box" id="prompt-preview">Upload a file and write a prompt to see the preview.</pre>
           </div>
 
           <div class="editor-foot">
@@ -103,7 +102,7 @@
             <div class="step-title"><h3>Match fields to your columns</h3></div>
             <span class="tag warn" id="map-tag">Needs matching</span>
           </div>
-          <p class="empty-hint">This question asks for something your sheet does not have under that name. Point each one at the right column.</p>
+          <p class="empty-hint">This prompt uses a field your sheet does not have under that name. Point each one at the right column.</p>
           <div id="map-inline-rows"></div>
           <div class="actions tight">
             <button type="button" id="map-inline-save" class="secondary">Save matches</button>
@@ -296,7 +295,7 @@
   <div class="overlay" id="map-overlay">
     <div class="modal">
       <h3>Match fields to your columns</h3>
-      <p class="small">This question asks for something your sheet does not have under that name. Point each one at the right column — otherwise those fields go to the model empty.</p>
+      <p class="small">This prompt uses a field your sheet does not have under that name. Point each one at the right column — otherwise those fields reach the model empty.</p>
       <div id="map-rows">
         {% for name in mapping_needed %}
         <label>{{ name }}
@@ -328,5 +327,5 @@
   sampleRow: {{ (sample_row or {})|tojson }},
   totalRows: {{ total_rows or 0 }}
 };</script>
-<script src="/static/run.js"></script>
+<script src="{{ asset('run.js') if asset else '/static/run.js' }}"></script>
 {% endblock %}

@@ -116,5 +116,5 @@
 {% endif %}
 {% endblock %}
 {% block scripts %}
-{% if detail %}<script src="/static/prompt-history.js"></script>{% endif %}
+{% if detail %}<script src="{{ asset('prompt-history.js') if asset else '/static/prompt-history.js' }}"></script>{% endif %}
 {% endblock %}

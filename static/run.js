@@ -383,19 +383,22 @@
   promptBox?.addEventListener("focus", () => setInsertTarget(promptBox));
   inputBox?.addEventListener("focus", () => setInsertTarget(inputBox));
 
+  function insertChip(btn) {
+    const box = insertTarget || inputBox || promptBox;
+    if (!box) return;
+    const text = btn.getAttribute("data-insert") || "";
+    const start = box.selectionStart ?? box.value.length;
+    const end = box.selectionEnd ?? box.value.length;
+    box.value = box.value.slice(0, start) + text + box.value.slice(end);
+    box.focus();
+    box.setSelectionRange(start + text.length, start + text.length);
+    setInsertTarget(box);
+    queueSaveState();
+    box.dispatchEvent(new Event("input"));
+  }
+
   document.querySelectorAll(".chip").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const box = insertTarget || inputBox || promptBox;
-      if (!box) return;
-      const text = btn.getAttribute("data-insert") || "";
-      const start = box.selectionStart ?? box.value.length;
-      const end = box.selectionEnd ?? box.value.length;
-      box.value = box.value.slice(0, start) + text + box.value.slice(end);
-      box.focus();
-      box.setSelectionRange(start + text.length, start + text.length);
-      setInsertTarget(box);
-      queueSaveState();
-    });
+    btn.addEventListener("click", () => insertChip(btn));
   });
 
   ["input", "change"].forEach((evt) => {
@@ -519,8 +522,13 @@
   function refreshMappingPanel(needed) {
     const columns = (window.MAIDS || {}).csvCols || [];
     const names = placeholderNames();
-    const extra = Object.keys(columnMap).filter((name) => !names.includes(name));
-    renderMapRows(document.getElementById("map-inline-rows"), names.concat(extra), columns);
+    // Only the fields this prompt uses. The panel used to append every
+    // placeholder still sitting in the saved map, so a prompt needing one
+    // field showed leftovers from whatever was loaded before it.
+    Object.keys(columnMap).forEach((name) => {
+      if (!names.includes(name)) delete columnMap[name];
+    });
+    renderMapRows(document.getElementById("map-inline-rows"), names, columns);
     renderMapRows(document.getElementById("map-rows"), needed && needed.length ? needed : names, columns);
     setMapTag(needed);
   }
@@ -573,6 +581,7 @@
       if (promptBox) promptBox.value = data.content || "";
       if (inputBox) inputBox.value = data.input_template || "";
       setPromptStatus(`Loaded "${data.name || id}"`);
+      columnMap = data.column_map || {};
       showMapping(data.mapping_needed || [], data.columns || (window.MAIDS || {}).csvCols || []);
       if ((data.mapping_needed || []).length) {
         setPromptStatus("This prompt needs columns mapped to your sheet. You can change the mapping below.");
@@ -771,6 +780,150 @@
     if (ci) ci.textContent = (promptBox?.value || "").trim() ? "•" : "";
     if (cin) cin.textContent = (inputBox?.value || "").trim() ? "•" : "";
   }
+
+
+  /* ======================================================================
+     Uploading
+
+     Picking a file starts the upload -- there is no reason to make someone
+     press a second button for something they have already decided to do.
+     The response is data, not a redirect, so whatever is half-typed in the
+     prompt boxes survives.
+     ====================================================================== */
+
+  const uploadForm = document.getElementById("upload-form");
+  const fileInput = document.getElementById("csv_file");
+  const uploadStatus = document.getElementById("upload-status");
+
+  function setUploadMsg(msg, isError) {
+    if (!uploadStatus) return;
+    uploadStatus.textContent = msg || "";
+    uploadStatus.style.color = isError ? "var(--bad)" : "var(--muted)";
+  }
+
+  function applyDataset(data) {
+    const M = window.MAIDS || (window.MAIDS = {});
+    M.csvCols = data.columns || [];
+    M.sampleRow = data.sample_row || {};
+    M.totalRows = data.rows || 0;
+    columnMap = data.column_map || {};
+
+    const section = document.getElementById("step-dataset");
+    if (section) section.classList.add("done");
+
+    const tag = section?.querySelector(".step-tag");
+    if (tag) {
+      tag.textContent = `${data.rows} rows · ${M.csvCols.length} columns`;
+      tag.className = "tag ok step-tag";
+    }
+
+    const hint = document.getElementById("dataset-hint");
+    if (hint) hint.textContent = "Each row is analysed on its own. Upload a different file to start over.";
+
+    const cols = document.getElementById("dataset-columns");
+    if (cols) {
+      cols.innerHTML = "";
+      M.csvCols.slice(0, 14).forEach((name) => {
+        const chip = document.createElement("span");
+        chip.className = "tag";
+        chip.textContent = name;
+        cols.appendChild(chip);
+      });
+      if (M.csvCols.length > 14) {
+        const more = document.createElement("span");
+        more.className = "chip-empty";
+        more.textContent = `+${M.csvCols.length - 14} more`;
+        cols.appendChild(more);
+      }
+      cols.hidden = !M.csvCols.length;
+    }
+
+    // The insert-a-column buttons under the editor.
+    const toolbar = document.getElementById("prompt-toolbar");
+    if (toolbar) {
+      toolbar.innerHTML = "";
+      M.csvCols.forEach((name) => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "chip";
+        chip.dataset.insert = `{${name}}`;
+        chip.textContent = name;
+        chip.addEventListener("click", () => insertChip(chip));
+        toolbar.appendChild(chip);
+      });
+    }
+
+    // Which columns the test page shows.
+    const testBox = document.querySelector("#test-overlay .box");
+    if (testBox) {
+      testBox.innerHTML = "";
+      M.csvCols.forEach((name) => {
+        const label = document.createElement("label");
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.name = "test_cols";
+        box.value = name;
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(" " + name));
+        testBox.appendChild(label);
+      });
+    }
+
+    ["run-button", "test-button"].forEach((id) => {
+      const btn = document.getElementById(id);
+      if (btn) btn.disabled = false;
+    });
+    const divide = document.getElementById("divide-button");
+    if (divide) divide.hidden = false;
+    const divideInput = document.querySelector('#divide-overlay input[name="divide_rows"]');
+    if (divideInput) {
+      divideInput.max = String(data.rows || 1);
+      divideInput.value = String(Math.min(data.rows || 1, 100));
+    }
+
+    refreshMappingPanel(data.mapping_needed || []);
+    updateReadiness();
+    const active = TABS.find((t) => t.getAttribute("aria-selected") === "true");
+    if (active && active.dataset.pane === "pane-preview") renderPreview();
+  }
+
+  async function uploadFile(file) {
+    if (!file) return;
+    setUploadMsg(`Reading ${file.name}…`);
+    window.setBusy("upload-button", true, "Reading…");
+    const body = new FormData();
+    body.append("csv_file", file);
+    body.append("next", "/");
+    body.append("json_response", "1");
+    try {
+      const resp = await fetch("/upload", {
+        method: "POST",
+        body,
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        setUploadMsg(data.error || "Could not read this file.", true);
+        return;
+      }
+      applyDataset(data);
+      const parts = [`${data.rows} rows, ${(data.columns || []).length} columns`];
+      if (data.sheet) parts.push(`sheet “${data.sheet}”`);
+      setUploadMsg(`${file.name} loaded — ${parts.join(" · ")}.${data.note ? " " + data.note : ""}`);
+      queueSaveState();
+    } catch (err) {
+      setUploadMsg("Upload failed. Check your connection and try again.", true);
+    } finally {
+      window.setBusy("upload-button", false);
+    }
+  }
+
+  fileInput?.addEventListener("change", () => uploadFile(fileInput.files?.[0]));
+  uploadForm?.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    uploadFile(fileInput?.files?.[0]);
+  });
 
   let readyTimer = null;
   function queueReadiness() {

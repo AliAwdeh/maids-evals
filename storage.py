@@ -48,9 +48,16 @@ def _safe_prompt_name(name: str) -> str:
     return cleaned
 
 
+_ensured_dirs: set = set()
+
+
 def user_dir(username: str) -> Path:
     path = USERS_DATA_DIR / _safe_username(username)
-    path.mkdir(parents=True, exist_ok=True)
+    # log_usage runs once per row, and this used to mkdir on every one of them.
+    key = str(path)
+    if key not in _ensured_dirs:
+        path.mkdir(parents=True, exist_ok=True)
+        _ensured_dirs.add(key)
     return path
 
 

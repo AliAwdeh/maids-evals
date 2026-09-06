@@ -4,7 +4,7 @@
   <div class="page-head">
     <div>
       <h1>Prompts</h1>
-      <p class="lede">Every question you're allowed to run. Open one to read it, ask the assistant what it does, copy it, or change it.</p>
+      <p class="lede">Every prompt you can run. Open one to read it, ask the assistant what it does, clone it, or edit it.</p>
     </div>
     <div class="actions" style="margin:0;"><a class="btn" href="/builder">Build a new one</a></div>
   </div>
@@ -28,7 +28,7 @@
 
       <details class="adv">
         <summary>Can't find it? Describe what you need</summary>
-        <p class="empty-hint">The assistant only looks at questions you're allowed to run.</p>
+        <p class="empty-hint">The assistant only sees prompts you have access to.</p>
         <textarea id="find-input" style="min-height:64px;" placeholder="e.g. something that spots angry customers in WhatsApp chats"></textarea>
         <div class="actions tight">
           <button type="button" id="find-send" class="ai">Find it for me</button>
@@ -70,8 +70,8 @@
 
       <div class="editor" style="margin-top:14px;">
         <div class="editor-tabs" role="tablist">
-          <button type="button" class="editor-tab" role="tab" data-pane="d-pane-prompt" aria-selected="true">What it does</button>
-          <button type="button" class="editor-tab" role="tab" data-pane="d-pane-input" aria-selected="false">What it reads</button>
+          <button type="button" class="editor-tab" role="tab" data-pane="d-pane-prompt" aria-selected="true">Instructions</button>
+          <button type="button" class="editor-tab" role="tab" data-pane="d-pane-input" aria-selected="false">Input data</button>
         </div>
         <div class="editor-pane" id="d-pane-prompt" role="tabpanel">
           <textarea id="d-prompt" class="instructions-box" readonly></textarea>
@@ -141,5 +141,5 @@ window.MAIDS_CATALOGUE = {
   hasKey: {{ saved_key_exists|tojson }}
 };
 </script>
-<script src="/static/catalogue.js"></script>
+<script src="{{ asset('catalogue.js') if asset else '/static/catalogue.js' }}"></script>
 {% endblock %}
