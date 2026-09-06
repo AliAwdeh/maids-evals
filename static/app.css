@@ -1492,3 +1492,9 @@ details.view-version > summary { cursor: pointer; font-size: 13px; color: var(--
 
 .ai-output__disclosure > summary { cursor: pointer; padding: 8px 11px; font-size: 13px; }
 .ai-output__summary-label { font-weight: 600; }
+
+/* Drop a spreadsheet anywhere on the picker */
+.is-dropping input[type="file"], input[type="file"].is-dropping {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}

@@ -17,14 +17,18 @@
       </div>
       <p class="empty-hint">{% if has_csv %}This file is already loaded. Replace it if you meant a different one.{% else %}Upload a CSV or Excel file. We only look at a few rows while building the prompt.{% endif %}</p>
       {% if upload_note %}<p class="slot-msg">{{ upload_note }}</p>{% endif %}
-      <form action="/upload" method="post" enctype="multipart/form-data">
+      <form id="builder-upload-form" action="/upload" method="post" enctype="multipart/form-data">
         <input type="hidden" name="next" value="/builder" />
-        <label for="builder-file">Spreadsheet</label>
-        <input id="builder-file" type="file" name="csv_file" accept=".csv,.xlsx,.xls" {% if not has_csv %}required{% endif %} />
-        <div class="actions">
-          <button type="submit"{% if has_csv %} class="secondary"{% endif %}>{% if has_csv %}Replace file{% else %}Upload{% endif %}</button>
+        <input id="builder-file" type="file" name="csv_file" accept=".csv,.xlsx,.xls" aria-label="Spreadsheet" {% if not has_csv %}required{% endif %} />
+        <div class="actions tight">
+          <button type="submit" id="builder-upload-button" class="secondary" hidden>Upload</button>
         </div>
       </form>
+      <p class="slot-msg" id="builder-upload-status"></p>
+      <div class="chips" id="builder-columns-preview" style="margin-top:10px;" {% if not csv_cols %}hidden{% endif %}>
+        {% for col in csv_cols[:14] %}<span class="tag">{{ col }}</span>{% endfor %}
+        {% if csv_cols|length > 14 %}<span class="chip-empty">+{{ csv_cols|length - 14 }} more</span>{% endif %}
+      </div>
     </section>
 
     <section class="step{% if builder.goal %} done{% endif %}" id="step-goal">
@@ -257,5 +261,6 @@ window.MAIDS_BUILDER = {
 };
 </script>
 <script src="{{ asset('ai-output.js') if asset else '/static/ai-output.js' }}"></script>
+<script src="{{ asset('upload.js') if asset else '/static/upload.js' }}"></script>
 <script src="{{ asset('builder.js') if asset else '/static/builder.js' }}"></script>
 {% endblock %}

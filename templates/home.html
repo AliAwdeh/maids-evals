@@ -327,5 +327,6 @@
   sampleRow: {{ (sample_row or {})|tojson }},
   totalRows: {{ total_rows or 0 }}
 };</script>
+<script src="{{ asset('upload.js') if asset else '/static/upload.js' }}"></script>
 <script src="{{ asset('run.js') if asset else '/static/run.js' }}"></script>
 {% endblock %}

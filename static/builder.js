@@ -264,17 +264,99 @@
   syncModelSlot();
   loadSavedKey(currentProvider());
 
+  function pickColumn(btn) {
+    document.querySelectorAll("#column-chips .chip").forEach((c) => c.classList.remove("is-picked"));
+    btn.classList.add("is-picked");
+    if (contentInput) contentInput.value = btn.getAttribute("data-col") || "";
+    if (contentTag) {
+      contentTag.textContent = contentInput.value;
+      contentTag.classList.remove("warn");
+      contentTag.classList.add("ok");
+    }
+  }
+
   document.querySelectorAll("#column-chips .chip[data-col]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll("#column-chips .chip").forEach((c) => c.classList.remove("is-picked"));
-      btn.classList.add("is-picked");
-      if (contentInput) contentInput.value = btn.getAttribute("data-col") || "";
-      if (contentTag) {
-        contentTag.textContent = contentInput.value;
-        contentTag.classList.remove("warn");
-        contentTag.classList.add("ok");
+    btn.addEventListener("click", () => pickColumn(btn));
+  });
+
+  /* ======================================================================
+     Uploading. Picking a file starts it, and the reply is data rather than
+     a redirect, so the goal someone has already written stays on screen.
+     ====================================================================== */
+
+  function applyBuilderDataset(data) {
+    const columns = data.columns || [];
+    cfg.hasFile = (data.rows || 0) > 0;
+
+    const section = document.getElementById("step-data");
+    if (section) section.classList.add("done");
+    const tag = section?.querySelector(".step-tag");
+    if (tag) {
+      tag.textContent = `${data.rows} rows · ${columns.length} columns`;
+      tag.className = "tag ok step-tag";
+    }
+
+    const preview = document.getElementById("builder-columns-preview");
+    if (preview) {
+      preview.innerHTML = "";
+      columns.slice(0, 14).forEach((name) => {
+        const chip = document.createElement("span");
+        chip.className = "tag";
+        chip.textContent = name;
+        preview.appendChild(chip);
+      });
+      if (columns.length > 14) {
+        const more = document.createElement("span");
+        more.className = "chip-empty";
+        more.textContent = `+${columns.length - 14} more`;
+        preview.appendChild(more);
       }
+      preview.hidden = !columns.length;
+    }
+
+    // The column you click to say where the text lives.
+    const chips = document.getElementById("column-chips");
+    if (chips) {
+      const previous = contentInput?.value || "";
+      chips.innerHTML = "";
+      columns.forEach((name) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "chip";
+        btn.dataset.col = name;
+        btn.textContent = name;
+        btn.addEventListener("click", () => pickColumn(btn));
+        chips.appendChild(btn);
+      });
+      // A new sheet may not have the column that was chosen for the old one.
+      if (previous && columns.includes(previous)) {
+        const same = chips.querySelector(`.chip[data-col="${CSS.escape(previous)}"]`);
+        if (same) pickColumn(same);
+      } else if (contentInput) {
+        contentInput.value = "";
+        if (contentTag) {
+          contentTag.textContent = "Pick a column";
+          contentTag.classList.remove("ok");
+          contentTag.classList.add("warn");
+        }
+      }
+    }
+
+    ["discover-button", "deep-button", "availability-button"].forEach((id) => {
+      const btn = document.getElementById(id);
+      if (btn) btn.disabled = false;
     });
+    const inline = document.getElementById("avail-inline");
+    if (inline) inline.hidden = true;
+  }
+
+  window.autoUpload({
+    input: "builder-file",
+    form: "builder-upload-form",
+    status: "builder-upload-status",
+    busy: "builder-upload-button",
+    next: "/builder",
+    onLoaded: applyBuilderDataset,
   });
 
   function requireReady() {

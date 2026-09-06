@@ -791,16 +791,6 @@
      prompt boxes survives.
      ====================================================================== */
 
-  const uploadForm = document.getElementById("upload-form");
-  const fileInput = document.getElementById("csv_file");
-  const uploadStatus = document.getElementById("upload-status");
-
-  function setUploadMsg(msg, isError) {
-    if (!uploadStatus) return;
-    uploadStatus.textContent = msg || "";
-    uploadStatus.style.color = isError ? "var(--bad)" : "var(--muted)";
-  }
-
   function applyDataset(data) {
     const M = window.MAIDS || (window.MAIDS = {});
     M.csvCols = data.columns || [];
@@ -887,42 +877,16 @@
     if (active && active.dataset.pane === "pane-preview") renderPreview();
   }
 
-  async function uploadFile(file) {
-    if (!file) return;
-    setUploadMsg(`Reading ${file.name}…`);
-    window.setBusy("upload-button", true, "Reading…");
-    const body = new FormData();
-    body.append("csv_file", file);
-    body.append("next", "/");
-    body.append("json_response", "1");
-    try {
-      const resp = await fetch("/upload", {
-        method: "POST",
-        body,
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        setUploadMsg(data.error || "Could not read this file.", true);
-        return;
-      }
+  window.autoUpload({
+    input: "csv_file",
+    form: "upload-form",
+    status: "upload-status",
+    busy: "upload-button",
+    next: "/",
+    onLoaded: (data) => {
       applyDataset(data);
-      const parts = [`${data.rows} rows, ${(data.columns || []).length} columns`];
-      if (data.sheet) parts.push(`sheet “${data.sheet}”`);
-      setUploadMsg(`${file.name} loaded — ${parts.join(" · ")}.${data.note ? " " + data.note : ""}`);
       queueSaveState();
-    } catch (err) {
-      setUploadMsg("Upload failed. Check your connection and try again.", true);
-    } finally {
-      window.setBusy("upload-button", false);
-    }
-  }
-
-  fileInput?.addEventListener("change", () => uploadFile(fileInput.files?.[0]));
-  uploadForm?.addEventListener("submit", (ev) => {
-    ev.preventDefault();
-    uploadFile(fileInput?.files?.[0]);
+    },
   });
 
   let readyTimer = null;
