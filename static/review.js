@@ -20,7 +20,7 @@
   function setKeyLine(msg, ok = true) {
     if (!keyStatus) return;
     keyStatus.textContent = msg || "";
-    keyStatus.style.color = ok ? "#2a6b4e" : "#8d2c2c";
+    keyStatus.style.color = ok ? "var(--ok)" : "var(--bad)";
   }
 
   async function loadReviewKey() {
@@ -69,10 +69,15 @@
 
   loadReviewKey();
 
+  document.getElementById("fixer-settings-toggle")?.addEventListener("click", () => {
+    const box = document.getElementById("fixer-settings");
+    if (box) { box.open = !box.open; if (box.open) box.scrollIntoView({ block: "nearest" }); }
+  });
+
   function setStatus(el, msg, ok = true) {
     if (!el) return;
     el.textContent = msg;
-    el.style.color = ok ? "#2a6b4e" : "#8d2c2c";
+    el.style.color = ok ? "var(--ok)" : "var(--bad)";
   }
 
   async function saveNote() {
@@ -124,7 +129,8 @@
     const resp = await fetch("/review/improve/status", { credentials: "same-origin" });
     if (!resp.ok) return "error";
     const data = await resp.json();
-    setStatus(fixerStatus, data.message || data.status || "", data.status !== "error");
+    const bad = data.status === "error" || data.unchanged || (data.warnings || []).length > 0;
+    setStatus(fixerStatus, data.message || data.status || "", !bad);
     return data.status;
   }
 
@@ -135,7 +141,7 @@
     body.append("model", document.getElementById("fixer-model")?.value || "");
     body.append("api_key", llmPass?.value || "");
     body.append("prompt_draft", promptBox?.value || "");
-    setStatus(fixerStatus, "Running analyst → editor → critic… this can take a minute.", true);
+    setStatus(fixerStatus, "Reading your notes, grouping the problems, and rewriting… about a minute.", true);
     window.setBusy("improve-button", true, "Working…");
     try {
       const resp = await fetch("/review/improve", { method: "POST", body, credentials: "same-origin" });
@@ -163,7 +169,7 @@
   });
 
   document.getElementById("accept-button")?.addEventListener("click", async () => {
-    const base = prompt("Shared prompt name for the new version?", cfg.acceptedName || "prompt");
+    const base = window.prompt("Name this version:", cfg.acceptedName || "prompt");
     if (!base) return;
     const body = new FormData();
     body.append("prompt_name", base);
@@ -175,9 +181,96 @@
         return;
       }
       const data = await resp.json();
-      setStatus(fixerStatus, `Saved shared prompt ${data.name}. See it under Prompts.`, true);
+      const where = data.catalogue_mode === "updated"
+        ? "Updated the shared question — everyone who uses it gets this now."
+        : "Saved as your own copy under Prompts.";
+      setStatus(fixerStatus, `${where} The old text is kept and can be put back.`, true);
     } finally {
       window.setBusy("accept-button", false);
+    }
+  });
+
+  /* ======================================================================
+     Re-check: run the proposed question on the rows that were marked.
+     A diff says what the wording became; only this says what it does.
+     ====================================================================== */
+
+  const recheckStatus = document.getElementById("recheck-status");
+
+  function renderRecheck(data) {
+    const box = document.getElementById("recheck-result");
+    const host = document.getElementById("recheck-rows");
+    if (!box || !host) return;
+    const s = data.summary || {};
+    box.hidden = false;
+    host.innerHTML = "";
+
+    const summaryEl = box.querySelector(".recheck-summary");
+    if (summaryEl) {
+      summaryEl.innerHTML = `
+        <div class="good"><span class="k">Fixed</span><span class="v">${s.moved || 0}/${s.targets || 0}</span></div>
+        <div class="${s.unmoved ? "warn" : ""}"><span class="k">Still wrong</span><span class="v">${s.unmoved || 0}</span></div>
+        <div class="${s.regressions ? "bad" : ""}"><span class="k">Broke</span><span class="v">${s.regressions || 0}</span></div>
+        <div><span class="k">Checked</span><span class="v">${s.checked || 0}</span></div>`;
+    }
+
+    (data.rows || []).forEach((r) => {
+      const d = document.createElement("details");
+      d.className = "recheck-row";
+      const verdictClass = r.verdict === "ok" ? "ok" : r.verdict === "wrong" ? "bad" : r.verdict === "unclear" ? "warn" : "";
+      d.innerHTML = `
+        <summary>
+          <span class="tag ${verdictClass}"></span>
+          <span class="tag ${r.changed ? "ai" : ""}">${r.changed ? "changed" : "same answer"}</span>
+          <span class="note"></span>
+        </summary>
+        <div class="recheck-body">
+          <div class="recheck-cell"><div class="k">Before</div><pre></pre></div>
+          <div class="recheck-cell after"><div class="k">After this fix</div><pre></pre></div>
+        </div>`;
+      d.querySelector("summary .tag").textContent = `row ${r.row + 1} · you said ${r.verdict || "—"}`;
+      d.querySelector(".note").textContent = r.note || "";
+      const cells = d.querySelectorAll("pre");
+      cells[0].textContent = r.before || "";
+      cells[1].textContent = r.error || r.after || "";
+      // Open the rows that need a human eye: a regression, or a flagged row
+      // the fix did not move.
+      if ((r.verdict === "ok" && r.changed) || (r.verdict !== "ok" && !r.changed)) d.open = true;
+      host.appendChild(d);
+    });
+  }
+
+  document.getElementById("recheck-button")?.addEventListener("click", async () => {
+    const body = new FormData();
+    body.append("provider", document.getElementById("fixer-provider")?.value || "openai");
+    body.append("model", document.getElementById("fixer-model")?.value || "");
+    body.append("api_key", llmPass?.value || "");
+    setStatus(recheckStatus, "Running the new question on your marked rows…", true);
+    window.setBusy("recheck-button", true, "Running…");
+    try {
+      const resp = await fetch("/review/recheck", { method: "POST", body, credentials: "same-origin" });
+      if (!resp.ok) {
+        setStatus(recheckStatus, await resp.text(), false);
+        return;
+      }
+      const deadline = Date.now() + 6 * 60 * 1000;
+      let data = { status: "running" };
+      while (data.status === "running" && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 900));
+        const poll = await fetch("/review/recheck/status", { credentials: "same-origin" });
+        if (!poll.ok) break;
+        data = await poll.json();
+      }
+      if (data.status === "done") {
+        renderRecheck(data);
+        setStatus(recheckStatus, data.message || "", !(data.summary || {}).regressions);
+      } else if (data.status === "error") {
+        setStatus(recheckStatus, data.message || "The re-check failed.", false);
+      } else {
+        setStatus(recheckStatus, "Still running. Reload this page to see the result.", false);
+      }
+    } finally {
+      window.setBusy("recheck-button", false);
     }
   });
 

@@ -33,6 +33,14 @@ Your job:
 - Quote the prompt section that likely caused each pattern.
 - Say what rule is missing, too weak, too strong, or contradictory.
 - Ignore one-off nits unless they repeat.
+- List every row that evidences a pattern in evidence_rows. Be honest: a pattern
+  seen in one row gets one row. Do not pad the list to make a change look safer.
+- A pattern backed by a single row must be written as a GENERAL rule that would
+  also catch cases you have not seen. Never propose a change that names the
+  specific customer, maid, agent, id, product or exact wording from that one
+  row -- that fixes one row and leaves the rest of the sheet worse.
+- If the notes conflict with each other, say so in the problem field instead of
+  siding with whichever row you read last.
 - Do not rewrite the prompt.
 - Keep maids.cc vocabulary (CC, MV, PTC, Enchanters, Resolvers, prospect vs client vs maid).
 - Never add prices, salaries, counts, ratings, or nationality availability from company notes.
@@ -81,11 +89,21 @@ You receive the original prompt, the editor's updated prompt, the analyst patter
 
 Reject or trim edits that:
 - Contradict an existing core rule that still looks correct
-- Overfit a single row
+- Overfit a single row. Treat these as overfitting and reject them:
+    * a rule that repeats a name, id, phone number, date, product or verbatim
+      phrase that appears in only ONE of the reviewer notes
+    * a rule whose only support is one row, written narrowly enough that it
+      would not catch a similar case worded differently
+    * an example bolted into the instructions to make one row come out right
+  A single-row pattern may still be fixed -- but only by a general rule.
 - Rewrite large unrelated sections
 - Weaken a rule that other notes still need
 - Introduce prices, salaries, counts, ratings, or nationality availability from company notes
 - Pull large input data into the instructions, add {row_json}, or ask the model to echo input identifiers
+
+For each pattern, weigh how many rows support it against how much of the prompt
+the edit changes. A one-row pattern that rewrites a core rule is the most
+dangerous edit you can approve.
 
 If the update is mostly good, keep it and list remaining risks.
 If an edit is harmful, revert that part by returning a safer prompt.
@@ -211,6 +229,68 @@ def build_example(
     }
 
 
+_WORD_RE = re.compile(r"[\w'’]+")
+SHINGLE = 6
+
+
+def _shingles(text: str, n: int = SHINGLE) -> set:
+    words = [w.lower() for w in _WORD_RE.findall(text or "")]
+    if len(words) < n:
+        return set()
+    return {" ".join(words[i : i + n]) for i in range(len(words) - n + 1)}
+
+
+def overfit_warnings(
+    original: str,
+    proposed: str,
+    examples: List[Dict[str, Any]],
+    analysis: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Catch the two tells of a fix written for one row.
+
+    The Critic is asked to reject overfitting, but it is the same kind of model
+    that just wrote the edit. These checks do not depend on it:
+
+    1. Wording lifted from exactly one reviewed row into the new prompt. A rule
+       carrying a phrase that appears in one note and nowhere else is that row's
+       patch, not a rule.
+    2. A pattern the Analyst itself backed with one row out of many.
+    """
+    warnings: List[str] = []
+    added = _shingles(proposed) - _shingles(original)
+    if added and len(examples) > 1:
+        culprits: Dict[int, List[str]] = {}
+        for phrase in added:
+            owners = [
+                ex for ex in examples
+                if phrase in _shingles(f"{ex.get('input', '')} {ex.get('output', '')} {ex.get('note', '')}")
+            ]
+            if len(owners) == 1:
+                row = owners[0].get("row", 0)
+                culprits.setdefault(row, []).append(phrase)
+        for row, phrases in sorted(culprits.items())[:3]:
+            sample = sorted(phrases, key=len, reverse=True)[0]
+            warnings.append(
+                f"The new prompt repeats wording that appears only in row {row}: "
+                f"“{sample}”. Check this is a rule and not a patch for that one row."
+            )
+
+    total = len(examples)
+    if total >= 4 and isinstance(analysis, dict):
+        thin = [
+            str(p.get("title") or "a pattern")
+            for p in (analysis.get("patterns") or [])
+            if isinstance(p, dict) and len(p.get("evidence_rows") or []) <= 1
+        ]
+        if thin:
+            names = ", ".join(f"“{t}”" for t in thin[:3])
+            warnings.append(
+                f"{len(thin)} of {len(analysis.get('patterns') or [])} changes rest on a single row "
+                f"out of {total} you reviewed ({names}). Re-run the noted rows before saving."
+            )
+    return warnings
+
+
 def unified_diff(original: str, updated: str) -> List[str]:
     left = (original or "").splitlines()
     right = (updated or "").splitlines()
@@ -327,6 +407,8 @@ def improve_prompt(
     summary = [str(x) for x in (edited.get("change_summary") or []) if str(x).strip()]
     diff = unified_diff(prompt, final_prompt)
     unchanged = str(final_prompt).strip() == str(prompt).strip()
+    if not unchanged:
+        warnings.extend(overfit_warnings(prompt, final_prompt, examples, analysis))
     if unchanged:
         # A summary that claims edits next to an identical prompt is how a
         # no-op gets saved as agent_eval.v2 and trusted as a real improvement.

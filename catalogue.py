@@ -382,19 +382,23 @@ def delete_prompt(prompt_id: str, username: str) -> None:
     if not any(
         (other.get("conversation_id") or other.get("id")) == conversation_id for other in _iter_metas()
     ):
-        try:
-            _conversation_path(conversation_id).unlink(missing_ok=True)
-        except Exception:
-            pass
+        safe = re.sub(r"[^a-zA-Z0-9._-]+", "", conversation_id or "")
+        for path in _conversations_dir().glob(f"{safe}*.json"):
+            # Every participant's side of this prompt's conversation, not just
+            # the owner's.
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def clone_prompt(prompt_id: str, username: str) -> Dict[str, Any]:
-    """Copy a prompt into the cloner's own space, chat history included.
+    """Copy a prompt into the cloner's own space, carrying your conversation.
 
-    The clone gets its own conversation from the start. Sharing one conversation
-    id between source and copy meant the first edit to either side silently
-    emptied the other side's chat -- so cloning someone else's prompt and
-    tweaking it destroyed their history, in their account, with no warning.
+    You worked something out with the helper on a prompt you can only view,
+    then cloned it to make the change -- that conversation is yours and comes
+    with you, so the helper does not start cold on the copy. Only your side
+    moves: the original and everyone else's history are untouched.
     """
     src = get_visible(prompt_id, username)
     src_meta = load_meta(prompt_id) or {}
@@ -412,7 +416,9 @@ def clone_prompt(prompt_id: str, username: str) -> Dict[str, Any]:
         clone_meta["purpose"] = src_meta.get("purpose") or ""
         clone_meta["change_log"] = list(src_meta.get("change_log") or [])
         _write_json(_meta_path(card["id"]), _normalize_meta(clone_meta))
-        _write_json(_conversation_path(clone_meta["conversation_id"]), load_chat(prompt_id))
+        mine = load_chat(prompt_id, username)
+        if mine:
+            _write_json(_conversation_path(clone_meta["conversation_id"], username), mine)
     return _public_card(load_meta(card["id"]) or clone_meta or {}, username)
 
 
@@ -471,11 +477,29 @@ def _conversations_dir() -> Path:
     return path
 
 
-def _conversation_path(conversation_id: str) -> Path:
+def _shared_conversation_path(conversation_id: str) -> Path:
+    """Where conversations lived before they were split per person."""
     safe = re.sub(r"[^a-zA-Z0-9._-]+", "", conversation_id or "")
     if not safe:
         raise ValueError("Invalid conversation id.")
     return _conversations_dir() / f"{safe}.json"
+
+
+def _conversation_path(conversation_id: str, username: str = "") -> Path:
+    """A conversation belongs to the person who had it, on the prompt it was about.
+
+    One file per prompt meant two people asking the helper about the same
+    shared prompt were typing into each other's history. Keying by person as
+    well means your conversation follows you when you clone, and nobody
+    else's is touched.
+    """
+    safe = re.sub(r"[^a-zA-Z0-9._-]+", "", conversation_id or "")
+    if not safe:
+        raise ValueError("Invalid conversation id.")
+    who = re.sub(r"[^a-zA-Z0-9._-]+", "_", (username or "").strip()).strip("._")
+    if not who:
+        return _conversations_dir() / f"{safe}.json"
+    return _conversations_dir() / f"{safe}__{who}.json"
 
 
 def _conversation_id_for(prompt_id: str) -> str:
@@ -485,20 +509,18 @@ def _conversation_id_for(prompt_id: str) -> str:
     return prompt_id
 
 
-def _migrate_legacy_chat(prompt_id: str, conversation_id: str) -> None:
-    dest = _conversation_path(conversation_id)
-    if dest.is_file():
-        return
-    legacy = _entry_dir(prompt_id) / "chat.json"
-    if legacy.is_file():
-        data = _read_json(legacy, [])
-        _write_json(dest, data if isinstance(data, list) else [])
-
-
-def load_chat(prompt_id: str) -> List[Dict[str, str]]:
-    conversation_id = _conversation_id_for(prompt_id)
-    _migrate_legacy_chat(prompt_id, conversation_id)
-    data = _read_json(_conversation_path(conversation_id), [])
+def _read_conversation(conversation_id: str, username: str, prompt_id: str = "") -> List[Dict[str, str]]:
+    path = _conversation_path(conversation_id, username)
+    if path.is_file():
+        data = _read_json(path, [])
+    else:
+        # Fall back to the pre-split file, then to the even older per-folder
+        # chat.json, so no history disappears on upgrade. The first message
+        # anyone sends is written to their own file from then on.
+        data = _read_json(_shared_conversation_path(conversation_id), None)
+        if data is None and prompt_id:
+            legacy = _entry_dir(prompt_id) / "chat.json"
+            data = _read_json(legacy, []) if legacy.is_file() else []
     if not isinstance(data, list):
         return []
     out = []
@@ -508,10 +530,15 @@ def load_chat(prompt_id: str) -> List[Dict[str, str]]:
     return out[-40:]
 
 
-def append_chat(prompt_id: str, role: str, text: str) -> List[Dict[str, str]]:
-    history = load_chat(prompt_id)
+def load_chat(prompt_id: str, username: str = "") -> List[Dict[str, str]]:
+    return _read_conversation(_conversation_id_for(prompt_id), username, prompt_id)
+
+
+def append_chat(prompt_id: str, username: str, role: str, text: str) -> List[Dict[str, str]]:
+    conversation_id = _conversation_id_for(prompt_id)
+    history = _read_conversation(conversation_id, username, prompt_id)
     history.append({"role": role, "text": text})
-    _write_json(_conversation_path(_conversation_id_for(prompt_id)), history[-40:])
+    _write_json(_conversation_path(conversation_id, username), history[-40:])
     return history
 
 

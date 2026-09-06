@@ -1,13 +1,20 @@
 {% extends "base.html" %}
 {% from "_components.html" import ai_output %}
-{% block title %}Test · Maids Evals{% endblock %}
+{% block title %}One row · Maids Evals{% endblock %}
 {% block body %}
-  <h1>Test row #{{ row_idx + 1 }} of {{ total_rows }}</h1>
-  <p class="lede">{{ provider }} · {{ model }} · {{ latency }}s</p>
-  {% if err %}<p class="error">{{ err }}</p>{% endif %}
+  <div class="page-head">
+    <div>
+      <h1>One row, tried out</h1>
+      <p class="lede">Row {{ row_idx + 1 }} of {{ total_rows }} · answered by {{ model }} in {{ latency }}s. If this looks right, go back and run the whole file.</p>
+    </div>
+    <div class="actions" style="margin:0;">
+      <a class="btn secondary" href="/">← Back to the run</a>
+    </div>
+  </div>
+  {% if err %}<p class="flash-err">{{ err }}</p>{% endif %}
   <div class="review-grid">
     <section class="card">
-      <div class="kicker">Selected columns</div>
+      <div class="kicker">What you sent</div>
       {% for col in selected_cols %}
       <div class="col-block">
         <div class="col-name">{{ col }}</div>
@@ -16,14 +23,14 @@
       {% else %}
       <p class="small">No columns selected.</p>
       {% endfor %}
-      <details style="margin-top:12px;">
-        <summary>Full row JSON</summary>
-        <pre class="out">{{ row_json }}</pre>
+      <details class="adv">
+        <summary>Everything in this row</summary>
+        <pre class="preview-box">{{ row_json }}</pre>
       </details>
     </section>
     <section class="card">
-      <div class="kicker">Model response</div>
-      {{ ai_output(raw_output, mode='inline', label='Model response') }}
+      <div class="kicker">What came back</div>
+      {{ ai_output(raw_output, mode='inline', label='Answer') }}
     </section>
   </div>
 
@@ -36,52 +43,48 @@
     {% for col in selected_cols %}<input type="hidden" name="test_cols" value="{{ col }}" />{% endfor %}
     <input type="hidden" name="api_key" id="again-api-key" value="" />
     <div class="actions">
-      <button type="submit">Another random row</button>
-      <a class="btn secondary" href="/">Back</a>
+      <button type="submit" class="secondary">Try a different row</button>
     </div>
-    <p class="small">If your password manager filled the API key on New run, go back and test from there. This page does not keep the key.</p>
   </form>
 
   <div class="review-tools" style="margin-top:16px;">
     <section class="card">
-      <div class="kicker">Your note on this test row</div>
+      <div class="kicker">Is this answer right?</div>
       <div class="verdicts">
-        <button type="button" data-verdict="ok" aria-pressed="false">Ok</button>
-        <button type="button" data-verdict="wrong" class="warning" aria-pressed="false">Wrong</button>
-        <button type="button" data-verdict="unclear" class="secondary" aria-pressed="false">Unclear</button>
+        <button type="button" data-verdict="ok" aria-pressed="false">Right</button>
+        <button type="button" data-verdict="wrong" aria-pressed="false">Wrong</button>
+        <button type="button" data-verdict="unclear" aria-pressed="false">Not sure</button>
       </div>
-      <label for="test-note">What should the prompt have done?</label>
-      <textarea id="test-note" style="min-height:120px;" placeholder="e.g. It marked this as escalation but the customer only asked a question."></textarea>
-      <p class="small">This note is used only to improve the prompt from this single example. It is not saved to a run.</p>
+      <label for="test-note">What should it have said instead?</label>
+      <textarea id="test-note" style="min-height:120px;" placeholder="e.g. it marked this as an escalation, but the customer only asked a question"></textarea>
+      <p class="small">One row is a thin basis for a change. For a real fix, run the file and mark several rows on <a href="/review">Check &amp; improve</a>.</p>
     </section>
     <section class="card">
-      <div class="kicker">Improve the shared prompt from this test</div>
+      <div class="kicker">Fix the question from this one row</div>
       <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on">
-        <label for="llm-username">Key name</label>
-        <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
+        <input id="llm-username" name="username" type="hidden" autocomplete="username" value="{{ provider }}" />
+        <label for="fixer-model">Model</label>
+        <input id="fixer-model" type="text" value="{{ model }}" />
+        <input type="hidden" id="fixer-provider" value="{{ provider }}" />
         <label for="llm-password">API key</label>
         <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Needed only to improve the prompt{% endif %}" value="" />
         <div class="actions tight">
           <button type="button" id="key-save" class="secondary">Save key</button>
           <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>
         </div>
-        <p class="slot-msg" id="key-status">{% if saved_key_exists %}Saved for your account only.{% else %}Optional: save to this account.{% endif %}</p>
-        <label for="fixer-model">Model for the fixer</label>
-        <input id="fixer-model" type="text" value="{{ model }}" />
-        <input type="hidden" id="fixer-provider" value="{{ provider }}" />
+        <p class="slot-msg" id="key-status">{% if saved_key_exists %}Using your saved key.{% else %}Save one in Settings to skip this.{% endif %}</p>
       </form>
       <div class="actions">
-        <button type="button" id="improve-button">Improve prompt from this test</button>
-        <button type="button" id="accept-button" class="secondary" disabled>Save proposed as shared version</button>
-        <button type="button" id="discard-button" class="ghost" disabled>Discard</button>
+        <button type="button" id="improve-button" class="ai">Rewrite from this row</button>
+        <button type="button" id="accept-button" disabled>Save as the new version</button>
+        <button type="button" id="discard-button" class="ghost" disabled>Throw it away</button>
       </div>
-      <p class="small">Runs the same Analyst → Editor → Critic pass, using this one row + your note.</p>
-      <p class="small" id="fixer-status"></p>
+      <p class="slot-msg" id="fixer-status"></p>
     </section>
   </div>
 
-  <section class="card" id="proposed-card" style="margin-top:16px;display:none;">
-    <div class="kicker">Proposed update</div>
+  <section class="card fixer" id="proposed-card" style="margin-top:16px;display:none;">
+    <div class="kicker">Exactly what would change</div>
     <pre class="diff" id="proposed-diff"></pre>
     <p class="small" id="analyst-line" style="display:none;"></p>
     <p class="small" id="critic-line" style="display:none;"></p>

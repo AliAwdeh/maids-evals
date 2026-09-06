@@ -5,25 +5,66 @@
   let page = 1;
   const people = { viewers: [], editors: [] };
 
+  // A raw ISO timestamp in the UI reads as a bug to anyone non-technical.
+  function when(iso) {
+    const d = new Date(/Z$|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + "Z");
+    if (isNaN(d)) return iso;
+    const mins = Math.round((Date.now() - d.getTime()) / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return `${mins} min ago`;
+    if (mins < 60 * 24) return `${Math.round(mins / 60)}h ago`;
+    if (mins < 60 * 24 * 7) return `${Math.round(mins / 1440)}d ago`;
+    return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  }
+
   function setMsg(id, msg, isError) {
     const el = document.getElementById(id);
     if (!el) return;
     el.textContent = msg || "";
-    el.style.color = isError ? "#8d2c2c" : "";
+    el.style.color = isError ? "var(--bad)" : "";
   }
 
   function renderChat(history) {
     const log = document.getElementById("chat-log");
     if (!log) return;
     log.innerHTML = "";
-    (history || []).forEach((item) => {
-      const p = document.createElement("p");
-      p.className = item.role === "user" ? "chat-user" : "chat-bot";
-      p.textContent = (item.role === "user" ? "You: " : "Helper: ") + (item.text || "");
-      log.appendChild(p);
+    const items = history || [];
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "chat-empty";
+      empty.textContent = "No messages yet. Ask anything about this prompt.";
+      log.appendChild(empty);
+      return;
+    }
+    items.forEach((item) => {
+      const mine = item.role === "user";
+      const row = document.createElement("div");
+      row.className = `chat-msg ${mine ? "me" : "bot"}`;
+      const avatar = document.createElement("span");
+      avatar.className = "chat-avatar";
+      avatar.textContent = mine ? "You" : "AI";
+      if (mine) avatar.textContent = "";
+      const bubble = document.createElement("div");
+      bubble.className = "chat-bubble";
+      bubble.textContent = item.text || "";
+      row.appendChild(avatar);
+      row.appendChild(bubble);
+      log.appendChild(row);
     });
     log.scrollTop = log.scrollHeight;
   }
+
+  function showThinking() {
+    const log = document.getElementById("chat-log");
+    if (!log) return;
+    const row = document.createElement("div");
+    row.className = "chat-msg bot";
+    row.id = "chat-thinking";
+    row.innerHTML = '<span class="chat-avatar">AI</span><div class="chat-bubble"><span class="typing"><i></i><i></i><i></i></span></div>';
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+  }
+  function hideThinking() { document.getElementById("chat-thinking")?.remove(); }
 
   function rowButton(item, extra) {
     const btn = document.createElement("button");
@@ -213,22 +254,24 @@
     }
     host.innerHTML = "";
     rows.forEach((row) => {
-      const span = document.createElement("span");
-      if (row.sign === "+") span.className = "add";
-      else if (row.sign === "-") span.className = "del";
-      span.textContent = row.sign + row.text + "\n";
-      host.appendChild(span);
+      const line = document.createElement("div");
+      line.className = "diff-line " + (row.sign === "+" ? "add" : row.sign === "-" ? "del" : "same");
+      const gut = document.createElement("span");
+      gut.className = "gut";
+      gut.textContent = row.sign.trim();
+      const txt = document.createElement("span");
+      txt.className = "txt";
+      txt.textContent = row.text;
+      line.appendChild(gut);
+      line.appendChild(txt);
+      host.appendChild(line);
     });
     panel.hidden = false;
   }
 
   function hideProposal() {
     proposed = null;
-    const apply = document.getElementById("chat-apply");
-    const reject = document.getElementById("chat-reject");
     const panel = document.getElementById("chat-diff-panel");
-    if (apply) apply.hidden = true;
-    if (reject) reject.hidden = true;
     if (panel) panel.hidden = true;
   }
 
@@ -253,7 +296,11 @@
     document.getElementById("detail").hidden = false;
     document.getElementById("d-name").textContent = current.name || "Prompt";
     document.getElementById("d-role").textContent = current.role || "";
-    document.getElementById("d-meta").textContent = `Owner ${current.owner} · ${current.visibility} · updated ${current.updated_at || ""}`;
+    document.getElementById("d-meta").textContent = [
+      `Made by ${current.owner}`,
+      { personal: "private", everyone: "open to everyone", selected: "shared with some people" }[current.visibility] || current.visibility,
+      current.updated_at ? `updated ${when(current.updated_at)}` : "",
+    ].filter(Boolean).join(" · ");
     document.getElementById("d-purpose").textContent = current.purpose
       ? `This prompt: ${current.purpose}`
       : "";
@@ -275,8 +322,14 @@
     people.editors = (current.editors || []).slice();
     renderPeople();
     renderRequests(current.edit_requests || []);
-    renderChat(current.chat || []);
+    current.chat = current.chat || [];
+    renderChat(current.chat);
     hideProposal();
+    document.querySelectorAll(".editor-tab").forEach((tab, i) => {
+      tab.setAttribute("aria-selected", i === 0 ? "true" : "false");
+      const pane = document.getElementById(tab.dataset.pane);
+      if (pane) pane.hidden = i !== 0;
+    });
     const saveBtn = document.getElementById("d-save");
     if (saveBtn) saveBtn.hidden = true;
     const versionPanel = document.getElementById("d-version-panel");
@@ -335,6 +388,7 @@
       row.className = "acl-row";
       row.innerHTML = `<strong></strong><span class="small"></span><button type="button" class="ghost">Preview</button><button type="button" class="secondary">Restore</button>`;
       row.querySelector("strong").textContent = v.at || "";
+      row.querySelector("strong").title = v.at || "";
       row.querySelector("span").textContent = `${v.by || "unknown"} · ${v.chars} chars`;
       row.querySelectorAll("button")[0].addEventListener("click", () => {
         document.getElementById("d-prompt").value = v.prompt || "";
@@ -458,8 +512,10 @@
     if (!current) return;
     const message = (document.getElementById("chat-input")?.value || "").trim();
     if (!message) return setMsg("chat-status", "Write a message.", true);
-    setMsg("chat-status", "Thinking… this can take a minute.");
-    window.setBusy(["chat-send", "chat-apply"], true, "Thinking…");
+    setMsg("chat-status", "");
+    renderChat([...(current.chat || []), { role: "user", text: message }]);
+    showThinking();
+    window.setBusy(["chat-send"], true, "Thinking…");
     const form = new FormData();
     form.append("message", message);
     form.append("provider", cfg.provider || "");
@@ -471,8 +527,11 @@
         return;
       }
       const data = await resp.json();
-      document.getElementById("chat-input").value = "";
-      renderChat(data.chat || []);
+      const box = document.getElementById("chat-input");
+      if (box) { box.value = ""; autoGrow(box); }
+      current.chat = data.chat || [];
+      hideThinking();
+      renderChat(current.chat);
       hideProposal();
       if (data.updated_prompt || data.updated_input) {
         if (current.can_edit) {
@@ -482,12 +541,10 @@
             summary: data.change_summary || "",
             purpose: data.purpose || "",
           };
-          document.getElementById("chat-apply").hidden = false;
-          document.getElementById("chat-reject").hidden = false;
           renderDiff(current.prompt || "", proposed.prompt || current.prompt || "");
           setMsg("chat-status", data.change_summary
-            ? `Proposed: ${data.change_summary}. Read the diff, then apply or reject.`
-            : "The helper proposed an edit. Read the diff, then apply or reject.");
+            ? `It suggests: ${data.change_summary}. Check the change below before you apply it.`
+            : "It suggests a change. Check it below before you apply it.");
         } else {
           setMsg("chat-status", noEditMessage(), true);
         }
@@ -497,8 +554,47 @@
         setMsg("chat-status", "");
       }
     } finally {
-      window.setBusy(["chat-send", "chat-apply"], false);
+      hideThinking();
+      window.setBusy(["chat-send"], false);
     }
+  });
+
+  // Starter questions, so a first-time user is never staring at an empty box.
+  document.getElementById("chat-hints")?.addEventListener("click", (ev) => {
+    const ask = ev.target?.dataset?.ask;
+    if (!ask) return;
+    const box = document.getElementById("chat-input");
+    if (!box) return;
+    box.value = ask;
+    autoGrow(box);
+    document.getElementById("chat-send")?.click();
+  });
+
+  function autoGrow(box) {
+    if (!box) return;
+    box.style.height = "auto";
+    box.style.height = Math.min(box.scrollHeight, 170) + "px";
+  }
+
+  const chatInput = document.getElementById("chat-input");
+  chatInput?.addEventListener("input", () => autoGrow(chatInput));
+  chatInput?.addEventListener("keydown", (ev) => {
+    // Enter sends; Shift+Enter is a newline. What every chat box does.
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      document.getElementById("chat-send")?.click();
+    }
+  });
+
+  document.querySelectorAll(".editor-tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".editor-tab").forEach((other) => {
+        const on = other === tab;
+        other.setAttribute("aria-selected", on ? "true" : "false");
+        const pane = document.getElementById(other.dataset.pane);
+        if (pane) pane.hidden = !on;
+      });
+    });
   });
 
   document.getElementById("chat-apply")?.addEventListener("click", async () => {

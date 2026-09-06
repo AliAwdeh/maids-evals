@@ -80,6 +80,8 @@ DATA_EXACT = {
     "/review/prompt",
     "/review/improve",
     "/review/improve/status",
+    "/review/recheck",
+    "/review/recheck/status",
     "/review/accept",
     "/review/discard",
     "/test/improve",
@@ -499,6 +501,12 @@ def home(request: Request):
             "recent_runs": recent,
             "sid_token": work_serializer.dumps(sid),
             "divide_default": min(total_rows, 100) if total_rows else 1,
+            # One real row, so the prompt preview shows what the model will
+            # actually receive rather than a description of it.
+            "sample_row": {
+                str(k): (str(v)[:600] if v is not None else "")
+                for k, v in (sess.get("rows") or [{}])[0].items()
+            } if has_csv else {},
             "saved_key_exists": bool(saved_key),
             "upload_note": sess.get("upload_note") or "",
         },
@@ -1418,6 +1426,69 @@ def review(
     qs = filter_qs(pairs)
     review_provider = sess.get("provider", "openai")
     review_saved_key = saved_key_for(request.state.user, review_provider)
+
+    # A sidebar of every row in the filter, so walking 50 rows is 50 clicks
+    # rather than 50 guesses at what is left to check.
+    notes_map = review_data.get("notes") or {}
+    row_links = []
+    for pos, ridx in enumerate(filtered_indices):
+        rec = notes_map.get(str(ridx)) or {}
+        label = ""
+        for col in csv_cols:
+            value = str((results[ridx] or {}).get(col, "") or "").strip()
+            if value:
+                label = value[:46]
+                break
+        row_links.append({
+            "pos": pos,
+            "idx": ridx,
+            "verdict": (rec.get("verdict") or ""),
+            "noted": bool((rec.get("note") or "").strip()),
+            "label": label or f"Row {ridx + 1}",
+            "current": pos == idx,
+        })
+
+    # The analyst JSON rendered as structured patterns instead of a raw dump.
+    raw_analysis = fixer.get("analysis")
+    patterns = []
+    do_not_change = []
+    if isinstance(raw_analysis, dict):
+        for item in raw_analysis.get("patterns") or []:
+            if not isinstance(item, dict):
+                continue
+            rows_cited = [r for r in (item.get("evidence_rows") or []) if isinstance(r, int)]
+            patterns.append({
+                "title": str(item.get("title") or "Change"),
+                "problem": str(item.get("problem") or ""),
+                "needed_change": str(item.get("needed_change") or ""),
+                "prompt_section": str(item.get("prompt_section") or ""),
+                "rows": rows_cited,
+                "thin": len(rows_cited) <= 1 and noted_count >= 4,
+            })
+        do_not_change = [str(x) for x in (raw_analysis.get("do_not_change") or []) if str(x).strip()]
+
+    raw_critic = fixer.get("critic")
+    rejected, risks = [], []
+    if isinstance(raw_critic, dict):
+        rejected = [str(x) for x in (raw_critic.get("rejected_edits") or []) if str(x).strip()]
+        risks = [str(x) for x in (raw_critic.get("risks") or []) if str(x).strip()]
+
+    def _diff_rows(lines):
+        out = []
+        for line in lines or []:
+            text = str(line)
+            if text.startswith("+++") or text.startswith("---") or text.startswith("@@"):
+                kind, gut = "meta", ""
+            elif text.startswith("+"):
+                kind, gut = "add", "+"
+            elif text.startswith("-"):
+                kind, gut = "del", "-"
+            else:
+                kind, gut = "same", ""
+            out.append({"kind": kind, "gut": gut, "text": text[1:] if kind in ("add", "del") else text})
+        return out
+
+    recheck = review_data.get("recheck") or {}
     resp = render(
         request,
         "review.html",
@@ -1449,12 +1520,35 @@ def review(
             "analysis": analysis or "",
             "critic": critic or "",
             "fixer_status": fixer.get("error") or fixer.get("status") or "",
+            "fixer_message": (
+                fixer.get("error")
+                or {
+                    "running": "Working through your notes…",
+                    "done": (
+                        "The fixer ran but did not change anything."
+                        if fixer.get("unchanged")
+                        else "A change is proposed below."
+                    ),
+                }.get(fixer.get("status") or "", "")
+            ),
             "current_run_id": run_id or "",
             "result_idx": result_idx,
             "accepted_name": sess.get("prompt_name") or "prompt",
             "noted_count": noted_count,
             "fixer_fix_id": fixer.get("fix_id") or "",
             "prompt_name": sess.get("prompt_name") or "",
+            "row_links": row_links,
+            "patterns": patterns,
+            "do_not_change": do_not_change,
+            "rejected_edits": rejected,
+            "risks": risks,
+            "diff_rows": _diff_rows(fixer.get("diff") or []),
+            "fixer_warnings": fixer.get("warnings") or [],
+            "fixer_unchanged": bool(fixer.get("unchanged")),
+            "examples_used": fixer.get("examples_used") or 0,
+            "recheck": recheck,
+            "recheck_rows": recheck.get("rows") or [],
+            "recheck_summary": recheck.get("summary") or {},
         },
     )
     return attach_session(resp, request, sid)
@@ -1508,6 +1602,7 @@ async def start_prompt_improve(
     if prev_fixer.get("status") == "done" and prev_fixer.get("fix_id"):
         storage.update_prompt_fix(prev_fixer.get("source_name") or source_name, prev_fixer.get("fix_id"), status="superseded")
     review_data["prompt_draft"] = prompt
+    review_data["recheck"] = {"status": "idle", "rows": [], "summary": {}, "error": "", "prompt": ""}
     review_data["fixer"] = {
         "status": "running", "proposed_prompt": "", "diff": [], "analysis": "",
         "critic": "", "error": "", "fix_id": "", "source_name": source_name,
@@ -1601,6 +1696,169 @@ def prompt_improve_status(request: Request):
         "message": message,
         "unchanged": bool(fixer.get("unchanged")),
         "warnings": fixer.get("warnings") or [],
+    })
+    return attach_session(resp, request, sid)
+
+
+RECHECK_MAX_ROWS = 30
+
+
+def _noted_row_indexes(notes: Dict[str, Any], total: int) -> List[int]:
+    out = []
+    for key, note in (notes or {}).items():
+        try:
+            idx = int(key)
+        except Exception:
+            continue
+        if not (0 <= idx < total):
+            continue
+        if (note or {}).get("verdict") or ((note or {}).get("note") or "").strip():
+            out.append(idx)
+    return sorted(out)
+
+
+@app.post("/review/recheck")
+async def start_review_recheck(
+    request: Request,
+    provider: str = Form(...),
+    model: str = Form(...),
+    api_key: str = Form(""),
+):
+    """Run the proposed prompt over the rows you reviewed and show what moved.
+
+    A diff says what the wording became. It cannot say whether the fix repaired
+    the rows you called wrong, or quietly changed rows you had already called
+    ok. Re-running both kinds is the only thing that answers that.
+    """
+    sid, sess, run_id, review_data = _review_state(request)
+    if not run_id:
+        return PlainTextResponse("Open or finish a saved run first.", status_code=400)
+    fixer = review_data.get("fixer") or {}
+    proposed = (fixer.get("proposed_prompt") or "").strip()
+    if not proposed:
+        return PlainTextResponse("Improve the prompt first, then re-check the rows.", status_code=400)
+    if fixer.get("unchanged"):
+        return PlainTextResponse("The prompt did not change, so there is nothing to re-check.", status_code=400)
+    results = sess.get("results") or []
+    picked = _noted_row_indexes(review_data.get("notes") or {}, len(results))
+    if not picked:
+        return PlainTextResponse("Mark a few rows first — those are the rows to re-check.", status_code=400)
+    if not api_key.strip():
+        _p, _m, api_key = resolve_ai(request, "fixer", provider=provider, model=model, api_key=api_key)
+    if provider_requires_key(provider) and not api_key.strip():
+        return PlainTextResponse(
+            "No API key for this provider. Save one in Settings, or paste one here.", status_code=400
+        )
+
+    trimmed = picked[:RECHECK_MAX_ROWS]
+    csv_cols = sess.get("csv_cols") or []
+    input_template = sess.get("input_template") or review_data.get("input_template") or ""
+    column_map = sess.get("column_map") or {}
+    json_mode = bool(sess.get("json_mode", True))
+    notes = review_data.get("notes") or {}
+    user = request.state.user
+    key_once = api_key.strip()
+
+    review_data["recheck"] = {
+        "status": "running", "rows": [], "summary": {}, "error": "", "prompt": proposed,
+    }
+    storage.save_review(user, run_id, review_data)
+
+    def job():
+        rows_out: List[Dict[str, Any]] = []
+
+        def one(idx: int) -> Dict[str, Any]:
+            row = results[idx]
+            note = notes.get(str(idx)) or {}
+            base = {c: row.get(c, "") for c in csv_cols}
+            text = ""
+            err = ""
+            try:
+                composed = compose_model_input(proposed, base, input_template, column_map=column_map)
+                text = call_provider(provider, key_once, model, composed, json_mode) or ""
+                storage.log_usage(user, provider, model, estimate_tokens(composed), estimate_tokens(text))
+            except Exception as e:
+                err = str(e)
+            before = str(row.get("llm_output", "") or "")
+            return {
+                "row": idx,
+                "verdict": (note.get("verdict") or ""),
+                "note": (note.get("note") or ""),
+                "input": " | ".join(
+                    f"{c}: {str(base.get(c, ''))[:160]}" for c in csv_cols[:4] if base.get(c)
+                ),
+                "before": before,
+                "after": text,
+                "error": err,
+                "changed": bool(text) and text.strip() != before.strip(),
+            }
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(8, len(trimmed))) as pool:
+                for res in pool.map(one, trimmed):
+                    rows_out.append(res)
+            rows_out.sort(key=lambda r: r["row"])
+            fixed = [r for r in rows_out if r["verdict"] in ("wrong", "unclear") and r["changed"]]
+            still = [r for r in rows_out if r["verdict"] in ("wrong", "unclear") and not r["changed"]]
+            moved_ok = [r for r in rows_out if r["verdict"] == "ok" and r["changed"]]
+            failed = [r for r in rows_out if r["error"]]
+            current = storage.load_review(user, run_id)
+            current["recheck"] = {
+                "status": "done",
+                "rows": rows_out,
+                "prompt": proposed,
+                "error": "",
+                "summary": {
+                    "checked": len(rows_out),
+                    "skipped": max(0, len(picked) - len(trimmed)),
+                    "targets": len(fixed) + len(still),
+                    "moved": len(fixed),
+                    "unmoved": len(still),
+                    "regressions": len(moved_ok),
+                    "failed": len(failed),
+                },
+            }
+            storage.save_review(user, run_id, current)
+        except Exception as e:
+            current = storage.load_review(user, run_id)
+            current["recheck"] = {
+                "status": "error", "rows": [], "summary": {}, "error": str(e), "prompt": proposed,
+            }
+            storage.save_review(user, run_id, current)
+
+    threading.Thread(target=job, daemon=True).start()
+    resp = JSONResponse({"ok": True, "status": "running", "rows": len(trimmed), "skipped": max(0, len(picked) - len(trimmed))})
+    return attach_session(resp, request, sid)
+
+
+@app.get("/review/recheck/status")
+def review_recheck_status(request: Request):
+    sid, sess, run_id, review_data = _review_state(request)
+    check = review_data.get("recheck") or {}
+    status = check.get("status") or "idle"
+    summary = check.get("summary") or {}
+    if status == "error":
+        message = check.get("error") or "The re-check failed."
+    elif status == "running":
+        message = "Running the proposed prompt on the rows you reviewed…"
+    elif status == "done":
+        bits = [f"{summary.get('moved', 0)} of {summary.get('targets', 0)} flagged rows answered differently"]
+        if summary.get("regressions"):
+            bits.append(f"{summary['regressions']} row(s) you marked ok also changed")
+        else:
+            bits.append("no rows you marked ok changed")
+        if summary.get("failed"):
+            bits.append(f"{summary['failed']} call(s) failed")
+        if summary.get("skipped"):
+            bits.append(f"{summary['skipped']} row(s) not checked (limit {RECHECK_MAX_ROWS})")
+        message = " · ".join(bits)
+    else:
+        message = ""
+    resp = JSONResponse({
+        "status": status,
+        "message": message,
+        "summary": summary,
+        "rows": check.get("rows") or [],
     })
     return attach_session(resp, request, sid)
 
@@ -2667,7 +2925,7 @@ def catalogue_get(request: Request, prompt_id: str):
         return PlainTextResponse(str(e), status_code=403)
     except Exception as e:
         return PlainTextResponse(str(e), status_code=404)
-    item["chat"] = catalogue.load_chat(prompt_id)
+    item["chat"] = catalogue.load_chat(prompt_id, request.state.user)
     ctx = catalogue.change_context(prompt_id)
     item["purpose"] = ctx.get("purpose") or item.get("purpose") or ""
     item["change_log"] = ctx.get("change_log") or item.get("change_log") or []
@@ -2851,7 +3109,7 @@ async def catalogue_chat(
         return PlainTextResponse("An API key is required for this provider. Save one in Settings.", status_code=400)
     if not chosen:
         return PlainTextResponse("Set a model in Settings first.", status_code=400)
-    history = catalogue.load_chat(prompt_id)
+    history = catalogue.load_chat(prompt_id, user)
     ctx = catalogue.change_context(prompt_id)
     can_edit = catalogue.can_edit(item, user)
     try:
@@ -2863,8 +3121,8 @@ async def catalogue_chat(
         )
     except Exception as e:
         return PlainTextResponse(f"The helper did not answer: {e}", status_code=502)
-    catalogue.append_chat(prompt_id, "user", message.strip())
-    catalogue.append_chat(prompt_id, "assistant", turn["reply"])
+    catalogue.append_chat(prompt_id, user, "user", message.strip())
+    catalogue.append_chat(prompt_id, user, "assistant", turn["reply"])
     applied = False
     if apply == "1" and (turn.get("updated_prompt") or turn.get("updated_input")):
         if not can_edit:
@@ -2888,7 +3146,7 @@ async def catalogue_chat(
         "applied": applied,
         "can_edit": can_edit,
         "owner": item.get("owner") or "",
-        "chat": catalogue.load_chat(prompt_id),
+        "chat": catalogue.load_chat(prompt_id, user),
     })
 
 
@@ -2921,7 +3179,7 @@ async def catalogue_apply(
         )
     except Exception as e:
         return PlainTextResponse(str(e), status_code=400)
-    return JSONResponse({"ok": True, **item, "chat": catalogue.load_chat(prompt_id)})
+    return JSONResponse({"ok": True, **item, "chat": catalogue.load_chat(prompt_id, user)})
 
 
 if __name__ == "__main__":

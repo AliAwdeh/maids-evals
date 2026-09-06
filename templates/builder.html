@@ -3,8 +3,8 @@
 {% block title %}Build prompt · Maids Evals{% endblock %}
 {% block body %}
   <div class="wizard-page">
-  <h1>Build an analysis prompt</h1>
-  <p class="lede">Describe what you want to find out. We look at a few rows, draft a prompt, and test it on one row. When it looks right, it is saved to the shared library and ready for a full run. The helper already reads the team’s <a href="/context">company info</a> so it uses the right names — that text is not pasted into the prompt unless you copy it in yourself.</p>
+  <h1>Build a prompt</h1>
+  <p class="lede">Tell the assistant what you want to know about each row. It reads a few example rows, asks you a couple of questions, and writes the question for you. You try it on one row before anything else happens. It already knows the team's <a href="/context">company notes</a>, so it uses the right names.</p>
 
   <div class="wizard">
     <section class="step{% if has_csv %} done{% endif %}" id="step-data">

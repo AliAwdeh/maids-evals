@@ -1,272 +1,302 @@
 {% extends "base.html" %}
 {% block title %}New run · Maids Evals{% endblock %}
 {% block body %}
-  <div class="wizard-page">
-  <h1>New run</h1>
-  <p class="lede">Four steps, in order. Upload a spreadsheet, load or write a prompt, pick a provider, then run. Need a new analysis prompt from scratch? <a href="/builder">Build one with help</a>. Shared <a href="/context">company info</a> grounds the helper and the fixer.</p>
-
-  <div class="wizard">
-    <section class="step{% if has_csv %} done{% endif %}" id="step-dataset">
-      <div class="step-head">
-        <div class="step-title">
-          <span class="step-num">1</span>
-          <h2>Dataset</h2>
-        </div>
-        <span class="tag {% if has_csv %}ok{% else %}warn{% endif %} step-tag">{% if has_csv %}{{ total_rows }} rows · {{ csv_cols|length }} columns{% else %}Waiting for a file{% endif %}</span>
-      </div>
-      <p class="empty-hint" id="dataset-hint">{% if has_csv %}Replace the file if you need a different sheet. Empty rows are dropped on upload.{% else %}Choose a CSV or Excel file, then Upload. That unlocks the rest of the page.{% endif %}</p>
-      {% if upload_note %}<p class="slot-msg">{{ upload_note }}</p>{% endif %}
-      <form action="/upload" method="post" enctype="multipart/form-data">
-        <input type="hidden" name="next" value="/" />
-        <label for="csv_file">Spreadsheet</label>
-        <input id="csv_file" type="file" name="csv_file" accept=".csv,.xlsx,.xls" required />
-        <div class="actions">
-          <button type="submit"{% if has_csv %} class="secondary"{% endif %}>{% if has_csv %}Replace file{% else %}Upload{% endif %}</button>
-        </div>
-      </form>
-      <details class="adv">
-        <summary>Advanced — keep a random subset</summary>
-        <p class="small">Useful before an expensive full pass. The rest are discarded from this session only.</p>
-        <div class="actions">
-          <button type="button" id="divide-button" class="secondary" {% if not has_csv %}disabled{% endif %}>Choose how many rows to keep</button>
-        </div>
-      </details>
-    </section>
-
-    <section class="step{% if prompt_template %} done{% endif %}" id="step-prompt">
-      <div class="step-head">
-        <div class="step-title">
-          <span class="step-num">2</span>
-          <h2>Prompt</h2>
-        </div>
-        <span class="tag {% if prompt_name %}ok{% else %}warn{% endif %} step-tag">{% if prompt_name %}{{ prompt_name }}{% else %}Write or load one{% endif %}</span>
-      </div>
-      <p class="empty-hint">Instructions are the rules (short columns like nationality can sit here as <code>{nationality}</code> next to IF/THEN conditions). Input data is the conversation — it is added at the end when the model runs. Click a column chip to insert it into the box you last clicked (starts in Input data). Prompt fields do not have to match the sheet names — map them if they differ.</p>
-      <label for="prompt-search">Find a prompt</label>
-      <div class="actions tight">
-        <input id="prompt-search" type="search" placeholder="Search name or username" autocomplete="off" />
-        <button type="button" id="prompt-last" class="secondary" {% if not last_prompt_id %}disabled{% endif %}>Last used{% if last_prompt_name %}: {{ last_prompt_name }}{% endif %}</button>
-      </div>
-      <label for="prompt-select">Catalogue</label>
-      <div class="actions tight">
-        <select id="prompt-select">
-          <option value="">Select a prompt you can use</option>
-          {% for item in prompts %}
-          <option value="{{ item.id }}" data-owner="{{ item.owner }}" data-name="{{ item.name }}" {% if item.id == prompt_id or item.name == prompt_name %}selected{% endif %}>{{ item.name }} · {{ item.owner }}{% if item.mine %} (yours){% endif %}</option>
-          {% endfor %}
-        </select>
-        <button type="button" id="prompt-load">Load</button>
-        <a class="btn ghost" href="/catalogue">Open catalogue</a>
-      </div>
-      <p class="slot-msg" id="prompt-status">Search, load last used, or open Catalogue. Change who can see a prompt there.</p>
-      <div class="chips" id="prompt-toolbar">
-        {% if csv_cols %}
-          {% for col in csv_cols %}
-          <button type="button" class="chip" data-insert="{{ '{' ~ col ~ '}' }}">{{ col }}</button>
-          {% endfor %}
-        {% else %}
-          <span class="chip-empty">Upload a spreadsheet in step 1 to insert column names.</span>
-        {% endif %}
-        <button type="button" class="chip" data-insert="{row_json}">row_json</button>
-      </div>
-      <p class="slot-msg" id="chip-target-status">Chips start in Input data. Click Instructions if you need a small placeholder there.</p>
-      <label for="prompt-template">Instructions</label>
-      <p class="empty-hint">The task and the JSON you want back. Do not paste the conversation here — it belongs below.</p>
-      <textarea form="run-form" name="prompt_template" id="prompt-template" class="instructions-box">{{ prompt_template }}</textarea>
-      <label for="input-template">Input data</label>
-      <p class="empty-hint">The actual data/conversation. It is added at the end, after your instructions, when the model runs. Placeholders become the raw cell — write any label next to them yourself.</p>
-      <textarea form="run-form" name="input_template" id="input-template" class="input-data-box">{{ input_template }}</textarea>
-      <div class="map-panel" id="map-panel">
-        <div class="step-head">
-          <div class="step-title"><h3>Field mapping</h3></div>
-          <span class="tag" id="map-tag">{% if mapping_needed %}Needs mapping{% elif column_map %}Mapped{% else %}Match names or map{% endif %}</span>
-        </div>
-        <p class="empty-hint">Prompt fields do not have to match the sheet. If you mapped the wrong column, change it here.</p>
-        <div id="map-inline-rows"></div>
-        <div class="actions tight">
-          <button type="button" id="map-inline-save" class="secondary">Save mapping</button>
-        </div>
-        <p class="slot-msg" id="map-inline-status"></p>
-      </div>
-    </section>
-
-    <section class="step" id="step-provider">
-      <div class="step-head">
-        <div class="step-title">
-          <span class="step-num">3</span>
-          <h2>Provider and key</h2>
-        </div>
-        <span class="tag step-tag" id="provider-tag">{{ provider }}</span>
-      </div>
-      <p class="empty-hint">Defaults come from <a href="/settings">Settings</a>. Change them here only if this run needs something else.</p>
-
-      <form id="run-form" action="/run" method="post" data-total-rows="{{ total_rows }}" data-sid-token="{{ sid_token }}">
-        <label for="provider-select">Provider</label>
-        <select name="provider" id="provider-select">
-          <option value="langcc" {% if provider == 'langcc' %}selected{% endif %}>LangCC</option>
-          <option value="openai" {% if provider == 'openai' %}selected{% endif %}>OpenAI</option>
-          <option value="gemini" {% if provider == 'gemini' %}selected{% endif %}>Gemini</option>
-          <option value="ollama" {% if provider == 'ollama' %}selected{% endif %}>Ollama</option>
-        </select>
-
-        <label for="model-input">Model</label>
-        <div id="model-slot" class="model-slot {% if provider in ['ollama', 'langcc'] %}is-list{% else %}is-text{% endif %}">
-          <div class="model-text">
-            <input type="text" name="{% if provider in ['ollama', 'langcc'] %}{% else %}model{% endif %}" id="model-input" value="{{ model }}" autocomplete="off" {% if provider in ['ollama', 'langcc'] %}disabled{% endif %} />
-          </div>
-          <div class="model-list">
-            <div class="model-list-controls">
-              <input type="text" id="model-search" placeholder="Search models…" autocomplete="off" aria-label="Search models" />
-              <button type="button" id="model-refresh" class="secondary" title="Re-fetch models for this provider">Refresh</button>
-            </div>
-            <select name="{% if provider in ['ollama', 'langcc'] %}model{% endif %}" id="model-select" {% if provider not in ['ollama', 'langcc'] %}disabled{% endif %}><option value="">Loading…</option></select>
-          </div>
-        </div>
-        <p class="slot-msg error" id="model-error"></p>
-      </form>
-
-      <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on">
-        <label for="key-pick">Saved key</label>
-        <select id="key-pick" name="key_id">
-          <option value="">Use default / paste below</option>
-          {% for k in named_keys %}
-          <option value="{{ k.id }}" data-provider="{{ k.provider }}" {% if k.id == key_id %}selected{% endif %}>{{ k.label }} · {{ k.provider }}</option>
-          {% endfor %}
-        </select>
-        <details class="adv" {% if not saved_key_exists %}open{% endif %}>
-          <summary>{% if saved_key_exists %}Use a different key{% else %}Paste or save a key{% endif %}</summary>
-          <label for="llm-username">Key name</label>
-          <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
-          <label for="llm-password">API key</label>
-          <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Required for OpenAI, LangCC, Gemini{% endif %}" value="" />
-          <div class="actions tight">
-            <button type="button" id="key-save" class="secondary">Save key</button>
-            <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>
-          </div>
-        </details>
-        <p class="slot-msg" id="key-status">{% if saved_key_exists %}Using a saved key. Manage keys in Settings.{% else %}Save a key in Settings to skip this next time.{% endif %}</p>
-      </form>
-    </section>
-
-    <section class="step" id="step-run">
-      <div class="step-head">
-        <div class="step-title">
-          <span class="step-num">4</span>
-          <h2>Run</h2>
-        </div>
-        <span class="tag {% if has_csv %}ok{% else %}warn{% endif %} step-tag">{% if has_csv %}Ready{% else %}Needs a file{% endif %}</span>
-      </div>
-      <p class="empty-hint">{% if has_csv %}Name the batch if you want, then Run. Test one row first if you are unsure.{% else %}Upload a spreadsheet in step 1 before you can run.{% endif %}</p>
-      <label for="run-name">Run name</label>
-      <input id="run-name" type="text" name="run_name" form="run-form" value="{{ run_name }}" placeholder="Optional, e.g. August agent audit" />
-      <div class="actions run-actions">
-        <button type="submit" form="run-form" id="run-button" {% if not has_csv %}disabled{% endif %}>Run</button>
-        <button type="button" id="test-button" class="secondary" {% if not has_csv %}disabled{% endif %}>Test one row</button>
-        <button type="button" id="retest-button" class="warning" {% if last_test_row_idx is none %}disabled{% endif %}>Test same row</button>
-      </div>
-      <details class="adv">
-        <summary>Advanced — workers and model parameters</summary>
-        <label for="max-workers">Max concurrent requests</label>
-        <input id="max-workers" type="number" name="max_workers" form="run-form" value="{{ max_workers }}" min="1" max="{{ workers_cap }}" />
-        <label><input type="checkbox" name="json_mode" form="run-form" value="1" {% if json_mode %}checked{% endif %} /> Output is JSON</label>
-        <label><input type="checkbox" name="send_model_params" id="send-model-params" form="run-form" value="1" {% if send_model_params %}checked{% endif %} /> Send model parameters</label>
-        <div class="box param-box" id="model-params-box">
-          <label><input type="checkbox" name="enabled_params" form="run-form" value="temperature" {% if 'temperature' in enabled_params %}checked{% endif %} /> Temperature</label>
-          <input type="text" name="temperature" form="run-form" value="{{ model_params.temperature }}" />
-          <label><input type="checkbox" name="enabled_params" form="run-form" value="top_p" {% if 'top_p' in enabled_params %}checked{% endif %} /> Top P</label>
-          <input type="text" name="top_p" form="run-form" value="{{ model_params.top_p }}" />
-          <label><input type="checkbox" name="enabled_params" form="run-form" value="max_output_tokens" {% if 'max_output_tokens' in enabled_params %}checked{% endif %} /> Max output tokens</label>
-          <input type="text" name="max_output_tokens" form="run-form" value="{{ model_params.max_output_tokens }}" />
-          <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="presence_penalty" {% if 'presence_penalty' in enabled_params %}checked{% endif %} /> Presence penalty</label>
-          <input class="param-openai" type="text" name="presence_penalty" form="run-form" value="{{ model_params.presence_penalty }}" />
-          <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="frequency_penalty" {% if 'frequency_penalty' in enabled_params %}checked{% endif %} /> Frequency penalty</label>
-          <input class="param-openai" type="text" name="frequency_penalty" form="run-form" value="{{ model_params.frequency_penalty }}" />
-          <label class="param-advanced"><input type="checkbox" name="enabled_params" form="run-form" value="seed" {% if 'seed' in enabled_params %}checked{% endif %} /> Seed</label>
-          <input class="param-advanced" type="text" name="seed" form="run-form" value="{{ model_params.seed }}" />
-          <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="reasoning_effort" {% if 'reasoning_effort' in enabled_params %}checked{% endif %} /> Reasoning effort</label>
-          <select class="param-openai" name="reasoning_effort" form="run-form">
-            <option value="">Default</option>
-            {% for opt in ['minimal', 'low', 'medium', 'high'] %}
-            <option value="{{ opt }}" {% if model_params.reasoning_effort == opt %}selected{% endif %}>{{ opt }}</option>
-            {% endfor %}
-          </select>
-        </div>
-      </details>
-    </section>
+  <div class="page-head">
+    <div>
+      <h1>New run</h1>
+      <p class="lede">Pick your data, pick the question, run it over every row. If you don't have a question written yet, <a href="/builder">let the assistant write one with you</a>.</p>
+    </div>
   </div>
 
-  <section class="recent">
-    <div class="kicker">Your recent runs</div>
-    {% if recent_runs %}
-      {% for run in recent_runs %}
-      <div class="recent-row">
-        <div>
-          <strong>{{ run.title }}</strong>
-          <div class="small">{{ run.created }} · {{ run.provider }} / {{ run.model }} · {{ run.row_count }} rows</div>
+  <div class="run-layout">
+
+    <!-- ============ main column: data + prompt ============ -->
+    <div class="run-main">
+
+      <section class="step{% if has_csv %} done{% endif %}" id="step-dataset">
+        <div class="step-head">
+          <div class="step-title">
+            <span class="step-num">1</span>
+            <h2>Your data</h2>
+          </div>
+          <span class="tag {% if has_csv %}ok{% else %}warn{% endif %} step-tag">{% if has_csv %}{{ total_rows }} rows · {{ csv_cols|length }} columns{% else %}No file yet{% endif %}</span>
         </div>
-        <form action="/runs/{{ run.run_id }}/open" method="post">
-          <button type="submit" class="secondary">Open</button>
+        <p class="empty-hint" id="dataset-hint">{% if has_csv %}Each row is analysed on its own. Upload a different file to start over.{% else %}A CSV or Excel file. Anything with text in it works — chats, call transcripts, SMS, tickets, survey answers.{% endif %}</p>
+        {% if upload_note %}<p class="slot-msg">{{ upload_note }}</p>{% endif %}
+        <form action="/upload" method="post" enctype="multipart/form-data">
+          <input type="hidden" name="next" value="/" />
+          <input id="csv_file" type="file" name="csv_file" accept=".csv,.xlsx,.xls" required aria-label="Spreadsheet" />
+          <div class="actions tight">
+            <button type="submit"{% if has_csv %} class="secondary"{% endif %}>{% if has_csv %}Use a different file{% else %}Upload{% endif %}</button>
+            {% if has_csv %}<button type="button" id="divide-button" class="ghost">Try a smaller sample first</button>{% endif %}
+          </div>
         </form>
-      </div>
-      {% endfor %}
-    {% else %}
-      <p class="empty-hint">No runs yet. After a batch finishes it appears here and in History.</p>
-    {% endif %}
-    <div class="actions"><a class="btn secondary" href="/runs">View all of your runs</a></div>
-  </section>
+        {% if csv_cols %}
+        <div class="chips" style="margin-top:12px;">
+          {% for col in csv_cols[:14] %}<span class="tag">{{ col }}</span>{% endfor %}
+          {% if csv_cols|length > 14 %}<span class="chip-empty">+{{ csv_cols|length - 14 }} more</span>{% endif %}
+        </div>
+        {% endif %}
+      </section>
+
+      <section class="step{% if prompt_template %} done{% endif %}" id="step-prompt">
+        <div class="step-head">
+          <div class="step-title">
+            <span class="step-num">2</span>
+            <h2>Your question</h2>
+          </div>
+          <span class="tag {% if prompt_name %}ok{% else %}warn{% endif %} step-tag">{% if prompt_name %}{{ prompt_name }}{% else %}Nothing loaded{% endif %}</span>
+        </div>
+
+        <div class="actions tight" style="margin-top:6px;">
+          <select id="prompt-select" style="flex:1;min-width:200px;">
+            <option value="">Choose a saved question…</option>
+            {% for item in prompts %}
+            <option value="{{ item.id }}" data-owner="{{ item.owner }}" data-name="{{ item.name }}" {% if item.id == prompt_id or item.name == prompt_name %}selected{% endif %}>{{ item.name }} — {{ item.owner }}{% if item.mine %} (yours){% endif %}</option>
+            {% endfor %}
+          </select>
+          <button type="button" id="prompt-load" class="secondary">Load</button>
+          <button type="button" id="prompt-last" class="ghost" {% if not last_prompt_id %}disabled{% endif %}>{% if last_prompt_name %}Last: {{ last_prompt_name }}{% else %}Last used{% endif %}</button>
+        </div>
+        <input id="prompt-search" type="search" placeholder="Filter by name or who made it" autocomplete="off" style="margin-top:8px;" aria-label="Filter saved questions" />
+        <p class="slot-msg" id="prompt-status">Or write your own below. <a href="/catalogue">Browse all questions</a>.</p>
+
+        <div class="editor" style="margin-top:14px;">
+          <div class="editor-tabs" role="tablist">
+            <button type="button" class="editor-tab" role="tab" data-pane="pane-instructions" aria-selected="true">What to do<span class="count" id="count-instructions"></span></button>
+            <button type="button" class="editor-tab" role="tab" data-pane="pane-input" aria-selected="false">What to read<span class="count" id="count-input"></span></button>
+            <button type="button" class="editor-tab" role="tab" data-pane="pane-preview" aria-selected="false">Preview</button>
+          </div>
+
+          <div class="editor-pane" id="pane-instructions" role="tabpanel">
+            <p class="empty-hint">The rules, and the answer you want back. Short values like <code>{nationality}</code> can sit here next to an if/then rule. Don't paste the conversation here.</p>
+            <textarea form="run-form" name="prompt_template" id="prompt-template" class="instructions-box" placeholder="Read the conversation and decide whether the customer was frustrated.&#10;&#10;Return only this JSON object:&#10;{&#10;  &quot;is_frustrated&quot;: true,&#10;  &quot;reason&quot;: &quot;short explanation&quot;&#10;}">{{ prompt_template }}</textarea>
+          </div>
+
+          <div class="editor-pane" id="pane-input" role="tabpanel" hidden>
+            <p class="empty-hint">The text to analyse. It is added at the end, after your rules, so the model always reads the instructions first.</p>
+            <textarea form="run-form" name="input_template" id="input-template" class="input-data-box" placeholder="Conversation:&#10;{Messages}">{{ input_template }}</textarea>
+          </div>
+
+          <div class="editor-pane" id="pane-preview" role="tabpanel" hidden>
+            <p class="empty-hint">Exactly what one row sends to the model. <span class="preview-fill">Green</span> is a value filled in from your sheet. <span class="preview-gap">Red</span> is a field that is missing — fix those before running.</p>
+            <pre class="preview-box" id="prompt-preview">Upload a file and write your question to see the preview.</pre>
+          </div>
+
+          <div class="editor-foot">
+            <span>Insert a column:</span>
+            <div class="chips" id="prompt-toolbar" style="margin:0;">
+              {% if csv_cols %}
+                {% for col in csv_cols %}
+                <button type="button" class="chip" data-insert="{{ '{' ~ col ~ '}' }}">{{ col }}</button>
+                {% endfor %}
+              {% else %}
+                <span class="chip-empty">Upload a file first.</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+        <p class="slot-msg" id="chip-target-status"></p>
+
+        <div class="map-panel" id="map-panel" hidden>
+          <div class="step-head" style="margin-bottom:8px;">
+            <div class="step-title"><h3>Match fields to your columns</h3></div>
+            <span class="tag warn" id="map-tag">Needs matching</span>
+          </div>
+          <p class="empty-hint">This question asks for something your sheet does not have under that name. Point each one at the right column.</p>
+          <div id="map-inline-rows"></div>
+          <div class="actions tight">
+            <button type="button" id="map-inline-save" class="secondary">Save matches</button>
+          </div>
+          <p class="slot-msg" id="map-inline-status"></p>
+        </div>
+      </section>
+
+      <section class="recent">
+        <div class="kicker">Your recent runs</div>
+        {% if recent_runs %}
+          {% for run in recent_runs %}
+          <div class="recent-row">
+            <div>
+              <strong>{{ run.title }}</strong>
+              <div class="small">{{ run.created }} · {{ run.provider }}/{{ run.model }} · {{ run.row_count }} rows</div>
+            </div>
+            <form action="/runs/{{ run.run_id }}/open" method="post">
+              <button type="submit" class="secondary">Open</button>
+            </form>
+          </div>
+          {% endfor %}
+          <div class="actions"><a class="btn ghost" href="/runs">See all your runs</a></div>
+        {% else %}
+          <p class="empty-hint">Nothing yet. Your finished runs will appear here.</p>
+        {% endif %}
+      </section>
+    </div>
+
+    <!-- ============ right rail: settings + run ============ -->
+    <aside class="run-rail">
+      <section class="card">
+        <div class="kicker">Ready to run?</div>
+
+        <div class="ready" id="ready-strip">
+          <div class="ready-cell" id="ready-rows">
+            <span class="k">Rows</span><span class="v">{{ total_rows or '—' }}</span>
+          </div>
+          <div class="ready-cell" id="ready-fields">
+            <span class="k">Fields</span><span class="v">—</span>
+          </div>
+          <div class="ready-cell" id="ready-size">
+            <span class="k">Per row</span><span class="v">—</span>
+          </div>
+          <div class="ready-note" id="ready-note" hidden></div>
+        </div>
+
+        <div class="actions run-actions" style="margin-top:0;">
+          <button type="submit" form="run-form" id="run-button" style="flex:1;" {% if not has_csv %}disabled{% endif %}>Run on all rows</button>
+        </div>
+        <div class="actions tight">
+          <button type="button" id="test-button" class="secondary" style="flex:1;" {% if not has_csv %}disabled{% endif %}>Try one row first</button>
+          <button type="button" id="retest-button" class="ghost" {% if last_test_row_idx is none %}disabled{% endif %}>Same row again</button>
+        </div>
+        <p class="empty-hint" style="margin-top:10px;margin-bottom:0;">Trying one row costs one call. Running costs one call per row.</p>
+
+        <label for="run-name">Name this run <span class="small" style="font-weight:400;">(optional)</span></label>
+        <input id="run-name" type="text" name="run_name" form="run-form" value="{{ run_name }}" placeholder="e.g. August agent audit" />
+      </section>
+
+      <section class="card">
+        <div class="kicker">Model</div>
+        <form id="run-form" action="/run" method="post" data-total-rows="{{ total_rows }}" data-sid-token="{{ sid_token }}">
+          <label for="provider-select">Provider</label>
+          <select name="provider" id="provider-select">
+            <option value="langcc" {% if provider == 'langcc' %}selected{% endif %}>LangCC</option>
+            <option value="openai" {% if provider == 'openai' %}selected{% endif %}>OpenAI</option>
+            <option value="gemini" {% if provider == 'gemini' %}selected{% endif %}>Gemini</option>
+            <option value="ollama" {% if provider == 'ollama' %}selected{% endif %}>Ollama</option>
+          </select>
+
+          <label for="model-input">Model</label>
+          <div id="model-slot" class="model-slot {% if provider in ['ollama', 'langcc'] %}is-list{% else %}is-text{% endif %}">
+            <div class="model-text">
+              <input type="text" name="{% if provider in ['ollama', 'langcc'] %}{% else %}model{% endif %}" id="model-input" value="{{ model }}" autocomplete="off" {% if provider in ['ollama', 'langcc'] %}disabled{% endif %} />
+            </div>
+            <div class="model-list">
+              <div class="model-list-controls">
+                <input type="text" id="model-search" placeholder="Search models…" autocomplete="off" aria-label="Search models" />
+                <button type="button" id="model-refresh" class="ghost" title="Re-fetch models">Refresh</button>
+              </div>
+              <select name="{% if provider in ['ollama', 'langcc'] %}model{% endif %}" id="model-select" {% if provider not in ['ollama', 'langcc'] %}disabled{% endif %}><option value="">Loading…</option></select>
+            </div>
+          </div>
+          <p class="slot-msg error" id="model-error"></p>
+        </form>
+
+        <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on">
+          <label for="key-pick">API key</label>
+          <select id="key-pick" name="key_id">
+            <option value="">{% if saved_key_exists %}Your saved key{% else %}Choose a saved key{% endif %}</option>
+            {% for k in named_keys %}
+            <option value="{{ k.id }}" data-provider="{{ k.provider }}" {% if k.id == key_id %}selected{% endif %}>{{ k.label }} · {{ k.provider }}</option>
+            {% endfor %}
+          </select>
+          <details class="adv" {% if not saved_key_exists %}open{% endif %}>
+            <summary>{% if saved_key_exists %}Use a different key{% else %}Add a key{% endif %}</summary>
+            <label for="llm-username">Label</label>
+            <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
+            <label for="llm-password">Key</label>
+            <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Required for OpenAI, LangCC, Gemini{% endif %}" value="" />
+            <div class="actions tight">
+              <button type="button" id="key-save" class="secondary">Save key</button>
+              <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget</button>
+            </div>
+          </details>
+          <p class="slot-msg" id="key-status">{% if saved_key_exists %}Using your saved key. It never leaves the server.{% else %}Save one in <a href="/settings">Settings</a> to skip this.{% endif %}</p>
+        </form>
+
+        <details class="adv">
+          <summary>Advanced</summary>
+          <label for="max-workers">Requests at once</label>
+          <input id="max-workers" type="number" name="max_workers" form="run-form" value="{{ max_workers }}" min="1" max="{{ workers_cap }}" />
+          <label><input type="checkbox" name="json_mode" form="run-form" value="1" {% if json_mode %}checked{% endif %} /> The answer is JSON</label>
+          <label><input type="checkbox" name="send_model_params" id="send-model-params" form="run-form" value="1" {% if send_model_params %}checked{% endif %} /> Send model settings</label>
+          <div class="box param-box" id="model-params-box">
+            <label><input type="checkbox" name="enabled_params" form="run-form" value="temperature" {% if 'temperature' in enabled_params %}checked{% endif %} /> Temperature</label>
+            <input type="text" name="temperature" form="run-form" value="{{ model_params.temperature }}" />
+            <label><input type="checkbox" name="enabled_params" form="run-form" value="top_p" {% if 'top_p' in enabled_params %}checked{% endif %} /> Top P</label>
+            <input type="text" name="top_p" form="run-form" value="{{ model_params.top_p }}" />
+            <label><input type="checkbox" name="enabled_params" form="run-form" value="max_output_tokens" {% if 'max_output_tokens' in enabled_params %}checked{% endif %} /> Max output tokens</label>
+            <input type="text" name="max_output_tokens" form="run-form" value="{{ model_params.max_output_tokens }}" />
+            <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="presence_penalty" {% if 'presence_penalty' in enabled_params %}checked{% endif %} /> Presence penalty</label>
+            <input class="param-openai" type="text" name="presence_penalty" form="run-form" value="{{ model_params.presence_penalty }}" />
+            <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="frequency_penalty" {% if 'frequency_penalty' in enabled_params %}checked{% endif %} /> Frequency penalty</label>
+            <input class="param-openai" type="text" name="frequency_penalty" form="run-form" value="{{ model_params.frequency_penalty }}" />
+            <label class="param-advanced"><input type="checkbox" name="enabled_params" form="run-form" value="seed" {% if 'seed' in enabled_params %}checked{% endif %} /> Seed</label>
+            <input class="param-advanced" type="text" name="seed" form="run-form" value="{{ model_params.seed }}" />
+            <label class="param-openai"><input type="checkbox" name="enabled_params" form="run-form" value="reasoning_effort" {% if 'reasoning_effort' in enabled_params %}checked{% endif %} /> Reasoning effort</label>
+            <select class="param-openai" name="reasoning_effort" form="run-form">
+              <option value="">Default</option>
+              {% for opt in ['minimal', 'low', 'medium', 'high'] %}
+              <option value="{{ opt }}" {% if model_params.reasoning_effort == opt %}selected{% endif %}>{{ opt }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </details>
+      </section>
+    </aside>
   </div>
 
   <div class="overlay" id="progress-overlay">
     <div class="modal">
-      <h3>Processing rows</h3>
-      <p class="small">Processed <span id="progress-done">0</span> / <span id="progress-total">0</span></p>
-      <p class="small">In progress <span id="progress-running">0</span> · Pending <span id="progress-pending">0</span></p>
+      <h3>Working through your rows</h3>
+      <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+      <p class="small"><strong><span id="progress-done">0</span> of <span id="progress-total">0</span></strong> done · <span id="progress-running">0</span> in flight · <span id="progress-pending">0</span> waiting</p>
       <p class="slot-msg error" id="progress-error"></p>
       <div class="actions">
-        <button type="button" id="progress-stop" class="warning">Stop the run</button>
+        <button type="button" id="progress-stop" class="warning">Stop</button>
         <button type="button" id="progress-close" class="secondary" hidden>Close</button>
       </div>
-      <p class="small">Stopping leaves the rows already sent to finish. Nothing is archived, but the finished rows stay on this session.</p>
+      <p class="small">Stopping lets the rows already sent finish. Nothing is saved, but the finished rows stay on this page.</p>
     </div>
   </div>
 
   <div class="overlay" id="test-overlay">
     <div class="modal">
-      <h3>Columns to show on the test page</h3>
-      <div class="box">
+      <h3>Which columns should the test page show?</h3>
+      <p class="small">This only changes what you see next to the answer.</p>
+      <div class="box" style="max-height:280px;overflow:auto;">
         {% for col in csv_cols %}
         <label><input type="checkbox" name="test_cols" value="{{ col }}" {% if col in test_cols %}checked{% endif %} /> {{ col }}</label>
         {% else %}
-        <div class="small">Upload a spreadsheet first.</div>
+        <div class="small">Upload a file first.</div>
         {% endfor %}
       </div>
       <div class="actions">
-        <button type="button" id="test-cancel" class="secondary">Cancel</button>
-        <button type="button" id="test-confirm">Run test</button>
+        <button type="button" id="test-confirm">Run the test</button>
+        <button type="button" id="test-cancel" class="ghost">Cancel</button>
       </div>
     </div>
   </div>
 
   <div class="overlay" id="divide-overlay">
     <div class="modal">
-      <h3>Keep a random subset</h3>
+      <h3>Try a smaller sample</h3>
       <form action="/divide" method="post">
         <input type="hidden" name="sid_token" value="{{ sid_token }}" />
-        <label>Rows to keep (of {{ total_rows }})</label>
+        <label>How many rows to keep, out of {{ total_rows }}</label>
         <input type="number" name="divide_rows" min="1" max="{{ total_rows or 1 }}" value="{{ divide_default }}" />
-        <p class="small">The rest are discarded from this session. Original files are unchanged.</p>
+        <p class="small">A random sample. The rest are dropped from this session — your original file is untouched, so you can upload it again.</p>
         <div class="actions">
-          <button type="button" id="divide-cancel" class="secondary">Cancel</button>
-          <button type="submit">Apply</button>
+          <button type="submit">Keep this many</button>
+          <button type="button" id="divide-cancel" class="ghost">Cancel</button>
         </div>
       </form>
     </div>
   </div>
 
-  <div class="overlay" id="map-overlay" {% if mapping_needed %}style="display:flex"{% endif %}>
+  <div class="overlay" id="map-overlay">
     <div class="modal">
-      <h3>Match prompt fields to your sheet</h3>
-      <p class="small">This prompt expects columns that are not in the file. Pick which column in your sheet is which field in the prompt. Both viewers and editors can run after you map them.</p>
+      <h3>Match fields to your columns</h3>
+      <p class="small">This question asks for something your sheet does not have under that name. Point each one at the right column — otherwise those fields go to the model empty.</p>
       <div id="map-rows">
         {% for name in mapping_needed %}
         <label>{{ name }}
@@ -281,13 +311,22 @@
       </div>
       <p class="slot-msg" id="map-status"></p>
       <div class="actions">
-        <button type="button" id="map-cancel" class="secondary">Later</button>
-        <button type="button" id="map-save">Save mapping</button>
+        <button type="button" id="map-save">Save matches</button>
+        <button type="button" id="map-cancel" class="ghost">Later</button>
       </div>
     </div>
   </div>
 {% endblock %}
 {% block scripts %}
-<script>window.MAIDS = { lastTestRow: {{ last_test_row_idx if last_test_row_idx is not none else 'null' }}, workersCap: {{ workers_cap }}, mappingNeeded: {{ mapping_needed|tojson }}, csvCols: {{ (csv_cols or [])|tojson }}, columnMap: {{ (column_map or {})|tojson }}, lastPromptId: {{ (last_prompt_id or '')|tojson }} };</script>
+<script>window.MAIDS = {
+  lastTestRow: {{ last_test_row_idx if last_test_row_idx is not none else 'null' }},
+  workersCap: {{ workers_cap }},
+  mappingNeeded: {{ mapping_needed|tojson }},
+  csvCols: {{ (csv_cols or [])|tojson }},
+  columnMap: {{ (column_map or {})|tojson }},
+  lastPromptId: {{ (last_prompt_id or '')|tojson }},
+  sampleRow: {{ (sample_row or {})|tojson }},
+  totalRows: {{ total_rows or 0 }}
+};</script>
 <script src="/static/run.js"></script>
 {% endblock %}

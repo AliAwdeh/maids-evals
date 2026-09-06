@@ -56,7 +56,7 @@
     const el = document.getElementById(id);
     if (!el) return;
     el.textContent = msg || "";
-    el.style.color = isError ? "#8d2c2c" : "";
+    el.style.color = isError ? "var(--bad)" : "";
   }
   function setBusy(ids, busy, busyLabel) {
     (ids || []).forEach((id) => {
@@ -93,7 +93,7 @@
   function setKeyStatus(msg, isError) {
     if (!keyStatus) return;
     keyStatus.textContent = msg || "";
-    keyStatus.style.color = isError ? "#8d2c2c" : "#2a6b4e";
+    keyStatus.style.color = isError ? "var(--bad)" : "var(--ok)";
   }
   function setKeyActions(saved) {
     if (keyForget) keyForget.disabled = !saved;

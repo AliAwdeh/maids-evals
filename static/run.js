@@ -117,7 +117,7 @@
   function setKeyStatus(msg, isError = false) {
     if (!keyStatus) return;
     keyStatus.textContent = msg || "";
-    keyStatus.style.color = isError ? "#8d2c2c" : "#2a6b4e";
+    keyStatus.style.color = isError ? "var(--bad)" : "var(--ok)";
   }
 
   function setKeyActions(saved) {
@@ -376,8 +376,8 @@
     insertTarget = el;
     if (chipTargetStatus) {
       chipTargetStatus.textContent = el === inputBox
-        ? "Chips insert into Input data."
-        : "Chips insert into Instructions.";
+        ? "Column buttons insert into “What to read”."
+        : "Column buttons insert into “What to do”.";
     }
   }
   promptBox?.addEventListener("focus", () => setInsertTarget(promptBox));
@@ -443,10 +443,12 @@
   function setPromptStatus(msg, isError = false) {
     if (!promptStatus) return;
     promptStatus.textContent = msg;
-    promptStatus.style.color = isError ? "#8d2c2c" : (msg ? "#2a6b4e" : "");
+    promptStatus.style.color = isError ? "var(--bad)" : (msg ? "var(--ok)" : "");
   }
 
-  const PLACEHOLDER_RE = /\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g;
+  // Must match engine.PLACEHOLDER_RE exactly: real column names have spaces
+  // and accents, and a literal JSON example is not a placeholder.
+  const PLACEHOLDER_RE = /\{([^{}\n"':,]+)\}/g;
   let columnMap = Object.assign({}, (window.MAIDS || {}).columnMap || {});
 
   function placeholderNames() {
@@ -455,8 +457,8 @@
     let match;
     PLACEHOLDER_RE.lastIndex = 0;
     while ((match = PLACEHOLDER_RE.exec(text))) {
-      const name = match[1];
-      if (name === "row_json" || names.includes(name)) continue;
+      const name = (match[1] || "").trim();
+      if (!name || name === "row_json" || names.includes(name)) continue;
       names.push(name);
     }
     return names;
@@ -631,6 +633,161 @@
   });
   refreshMappingPanel((window.MAIDS || {}).mappingNeeded || []);
 
+  /* ======================================================================
+     Editor tabs, live preview, and the readiness strip.
+
+     The old page asked people to run and find out. These three together
+     answer "will this work?" before a single call is paid for: the preview
+     shows the exact text one row sends, and the strip counts the fields
+     that resolved against the sheet.
+     ====================================================================== */
+
+  const TABS = Array.from(document.querySelectorAll(".editor-tab"));
+
+  function showPane(id) {
+    TABS.forEach((tab) => {
+      const on = tab.dataset.pane === id;
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+      const pane = document.getElementById(tab.dataset.pane);
+      if (pane) pane.hidden = !on;
+    });
+    if (id === "pane-instructions") setInsertTarget(promptBox);
+    if (id === "pane-input") setInsertTarget(inputBox);
+    if (id === "pane-preview") renderPreview();
+  }
+
+  TABS.forEach((tab) => tab.addEventListener("click", () => showPane(tab.dataset.pane)));
+
+  function esc(text) {
+    return String(text == null ? "" : text)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function sampleValue(name) {
+    const row = (window.MAIDS || {}).sampleRow || {};
+    if (Object.prototype.hasOwnProperty.call(row, name)) return String(row[name] ?? "");
+    const mapped = columnMap[name];
+    if (mapped && Object.prototype.hasOwnProperty.call(row, mapped)) return String(row[mapped] ?? "");
+    return null;
+  }
+
+  function unesc(text) {
+    return String(text).replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  }
+
+  // Escape first, then substitute, so nothing in a prompt or a transcript can
+  // inject markup into the preview.
+  function fillPreview(text) {
+    PLACEHOLDER_RE.lastIndex = 0;
+    return esc(text).replace(PLACEHOLDER_RE, (whole, raw) => {
+      const name = unesc((raw || "").trim());
+      if (name === "row_json") return '<span class="preview-mark">{row_json}</span>';
+      const value = sampleValue(name);
+      if (value === null) return `<span class="preview-gap">{${esc(name)}}</span>`;
+      const shown = value.length > 400 ? value.slice(0, 400) + "…" : value;
+      return `<span class="preview-fill">${esc(shown) || "(empty in this row)"}</span>`;
+    });
+  }
+
+  function renderPreview() {
+    const host = document.getElementById("prompt-preview");
+    if (!host) return;
+    const rows = (window.MAIDS || {}).totalRows || 0;
+    const instructions = promptBox?.value || "";
+    const extra = inputBox?.value || "";
+    if (!instructions.trim() && !extra.trim()) {
+      host.textContent = "Write your question above to see what a row will send.";
+      return;
+    }
+    if (!rows) {
+      host.textContent = "Upload a file to see this filled in with a real row.";
+      return;
+    }
+    let html = fillPreview(instructions);
+    if (extra.trim()) {
+      html += '\n\n<span class="preview-mark">===== INPUT =====</span>\n' + fillPreview(extra);
+    }
+    host.innerHTML = html;
+  }
+
+  function setCell(id, value, tone) {
+    const cell = document.getElementById(id);
+    if (!cell) return;
+    const v = cell.querySelector(".v");
+    if (v) v.textContent = value;
+    cell.classList.remove("is-good", "is-bad", "is-warn");
+    if (tone) cell.classList.add(tone);
+  }
+
+  function updateReadiness() {
+    const cols = (window.MAIDS || {}).csvCols || [];
+    const rows = (window.MAIDS || {}).totalRows || 0;
+    const names = placeholderNames();
+    const unresolved = names.filter((n) => sampleValue(n) === null && !cols.includes(n));
+
+    setCell("ready-rows", rows ? String(rows) : "—");
+
+    if (!names.length) {
+      setCell("ready-fields", "none", rows ? "is-warn" : null);
+    } else if (unresolved.length) {
+      setCell("ready-fields", `${names.length - unresolved.length}/${names.length}`, "is-bad");
+    } else {
+      setCell("ready-fields", `${names.length}/${names.length}`, "is-good");
+    }
+
+    const composed = (promptBox?.value || "") + (inputBox?.value || "");
+    let chars = composed.length;
+    names.forEach((n) => {
+      const v = sampleValue(n);
+      if (v !== null) chars += v.length;
+    });
+    setCell("ready-size", chars ? `~${Math.max(1, Math.round(chars / 4)).toLocaleString()} tok` : "—");
+
+    const note = document.getElementById("ready-note");
+    const runBtn = document.getElementById("run-button");
+    if (note) {
+      if (unresolved.length) {
+        note.hidden = false;
+        note.innerHTML = `Not in your sheet: <b>${unresolved.map((n) => "{" + esc(n) + "}").join(", ")}</b>. Match them below, or they go to the model empty.`;
+      } else if (rows && !names.length && !/\{row_json\}/.test(composed)) {
+        note.hidden = false;
+        note.textContent = "Your question does not use any column yet, so every row would send the same text.";
+      } else {
+        note.hidden = true;
+      }
+    }
+    if (runBtn && rows) {
+      // Block the click rather than letting a batch run on empty fields.
+      runBtn.dataset.keepDisabled = unresolved.length ? "1" : "";
+      runBtn.disabled = unresolved.length > 0;
+      runBtn.title = unresolved.length ? "Match the missing fields to your columns first." : "";
+    }
+
+    const panel = document.getElementById("map-panel");
+    if (panel) panel.hidden = !(names.length && rows);
+
+    const ci = document.getElementById("count-instructions");
+    const cin = document.getElementById("count-input");
+    if (ci) ci.textContent = (promptBox?.value || "").trim() ? "•" : "";
+    if (cin) cin.textContent = (inputBox?.value || "").trim() ? "•" : "";
+  }
+
+  let readyTimer = null;
+  function queueReadiness() {
+    clearTimeout(readyTimer);
+    readyTimer = setTimeout(() => {
+      updateReadiness();
+      refreshMappingPanel([]);
+      const active = TABS.find((t) => t.getAttribute("aria-selected") === "true");
+      if (active && active.dataset.pane === "pane-preview") renderPreview();
+    }, 200);
+  }
+
+  promptBox?.addEventListener("input", queueReadiness);
+  inputBox?.addEventListener("input", queueReadiness);
+  updateReadiness();
+
+
   window.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") queueSaveState(true);
   });
@@ -724,6 +881,8 @@
     const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
     set("progress-done", done);
     set("progress-total", total);
+    const fill = document.getElementById("progress-fill");
+    if (fill) fill.style.width = total ? `${Math.round((done / total) * 100)}%` : "0%";
     set("progress-running", Math.max(sent - done, 0));
     set("progress-pending", Math.max(total - sent, 0));
     const err = document.getElementById("progress-error");

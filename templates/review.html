@@ -1,128 +1,248 @@
 {% extends "base.html" %}
 {% from "_components.html" import ai_output %}
-{% block title %}Review · Maids Evals{% endblock %}
+{% block title %}Check &amp; improve · Maids Evals{% endblock %}
 {% block body %}
-  <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+  <div class="page-head">
     <div>
-      <h1>Review</h1>
-      <p class="lede">Row {{ display_index }} of {{ total }}{% if total_all != total %} (filtered from {{ total_all }}){% endif %}. Notes stay on this run. The prompt is shared when you save a new version.</p>
+      <h1>Check &amp; improve</h1>
+      <p class="lede">Read the answers, say which ones are wrong and why, then let the assistant rewrite the question. Your notes stay on this run — only a saved version is shared.</p>
     </div>
-    <div class="actions">
-      <a class="btn secondary" href="/review?idx={{ prev_idx }}{{ filter_qs }}" {% if total == 0 or idx == 0 %}aria-disabled="true"{% endif %}>Previous</a>
-      <a class="btn secondary" href="/review?idx={{ next_idx }}{{ filter_qs }}" {% if total == 0 or idx >= total - 1 %}aria-disabled="true"{% endif %}>Next</a>
+    <div class="actions" style="margin:0;">
+      <a class="btn secondary" href="/review?idx={{ prev_idx }}{{ filter_qs }}" {% if total == 0 or idx == 0 %}aria-disabled="true"{% endif %}>← Previous</a>
+      <a class="btn secondary" href="/review?idx={{ next_idx }}{{ filter_qs }}" {% if total == 0 or idx >= total - 1 %}aria-disabled="true"{% endif %}>Next →</a>
     </div>
   </div>
-
-  <section class="card" style="margin-bottom:14px;">
-    <form action="/review" method="get">
-      <input type="hidden" name="idx" value="0" />
-      {% for pair in filter_pairs %}
-      <div class="grid-2" style="grid-template-columns:1fr 1fr;margin-top:8px;">
-        <div>
-          <label>JSON attribute</label>
-          <select name="filter_key">
-            <option value="">All attributes</option>
-            {% for key in detected_keys %}
-            <option value="{{ key }}" {% if key == pair.key %}selected{% endif %}>{{ key }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div>
-          <label>Value</label>
-          <select name="filter_val">
-            <option value="">Any value</option>
-            <option value="true" {% if pair.val == 'true' %}selected{% endif %}>True</option>
-            <option value="false" {% if pair.val == 'false' %}selected{% endif %}>False</option>
-          </select>
-        </div>
-      </div>
-      {% endfor %}
-      <div class="actions">
-        <button type="submit">Apply filter</button>
-        <a class="btn secondary" href="/review?idx=0">Clear</a>
-      </div>
-    </form>
-    <p class="small">Keyboard: ←/→ or K/J for rows. 1 ok · 2 wrong · 3 unclear. Notes save as you type.</p>
-  </section>
 
   {% if row %}
-  <div class="review-grid">
-    <section class="card">
-      <div class="kicker">Input</div>
-      {% for col in csv_cols %}
-      <div class="col-block">
-        <div class="col-name">{{ col }}</div>
-        <div class="col-val">{{ row.get(col, '') }}</div>
-      </div>
+  <div class="review-layout">
+
+    <!-- ============ row list ============ -->
+    <aside class="row-list">
+      <div class="kicker" style="padding:4px 9px;">Row {{ display_index }} of {{ total }}{% if total_all != total %} · filtered{% endif %}</div>
+      {% for link in row_links %}
+      <a class="row-link{% if link.current %} current{% endif %}" href="/review?idx={{ link.pos }}{{ filter_qs }}" {% if link.current %}aria-current="true"{% endif %}>
+        <span class="dot {{ link.verdict }}" title="{{ link.verdict or 'not checked yet' }}"></span>
+        <span class="n">{{ link.idx + 1 }}</span>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ link.label }}</span>
+      </a>
       {% endfor %}
-    </section>
-    <section class="card">
-      <div class="kicker">Model response</div>
-      {% if err %}<p class="error">{{ err }}</p>{% endif %}
-      {{ ai_output(row.get('llm_output', '') or pretty_text, mode='inline', label='Model response') }}
-    </section>
-  </div>
+    </aside>
 
-  <div class="review-tools">
-    <section class="card">
-      <div class="kicker">Your note</div>
-      <div class="verdicts">
-        <button type="button" data-verdict="ok" aria-pressed="{{ 'true' if verdict == 'ok' else 'false' }}">Ok</button>
-        <button type="button" data-verdict="wrong" class="warning" aria-pressed="{{ 'true' if verdict == 'wrong' else 'false' }}">Wrong</button>
-        <button type="button" data-verdict="unclear" class="secondary" aria-pressed="{{ 'true' if verdict == 'unclear' else 'false' }}">Unclear</button>
+    <!-- ============ the row ============ -->
+    <div>
+      <div class="review-grid">
+        <section class="card">
+          <div class="kicker">What you sent</div>
+          {% for col in csv_cols %}
+          <div class="col-block">
+            <div class="col-name">{{ col }}</div>
+            <div class="col-val">{{ row.get(col, '') }}</div>
+          </div>
+          {% endfor %}
+        </section>
+        <section class="card">
+          <div class="kicker">What came back</div>
+          {% if err %}<p class="flash-err">{{ err }}</p>{% endif %}
+          {{ ai_output(row.get('llm_output', '') or pretty_text, mode='inline', label='Answer') }}
+        </section>
       </div>
-      <label for="review-note">What should change?</label>
-      <textarea id="review-note" style="min-height:140px;">{{ note }}</textarea>
-      <p class="small" id="note-status">Saved on this run only.</p>
-    </section>
-    <section class="card">
-      <div class="kicker" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
-        <span>Prompt used for this run</span>
-        <a class="small" href="/prompts/history{% if prompt_name %}?name={{ prompt_name }}{% endif %}">Fix history →</a>
+
+      <div class="review-tools">
+        <section class="card">
+          <div class="kicker">Is this answer right?</div>
+          <div class="verdicts">
+            <button type="button" data-verdict="ok" aria-pressed="{{ 'true' if verdict == 'ok' else 'false' }}">Right</button>
+            <button type="button" data-verdict="wrong" aria-pressed="{{ 'true' if verdict == 'wrong' else 'false' }}">Wrong</button>
+            <button type="button" data-verdict="unclear" aria-pressed="{{ 'true' if verdict == 'unclear' else 'false' }}">Not sure</button>
+          </div>
+          <label for="review-note">What should it have said instead?</label>
+          <textarea id="review-note" style="min-height:130px;" placeholder="e.g. the customer clearly complained about a no-show, this should have been marked frustrated">{{ note }}</textarea>
+          <p class="slot-msg" id="note-status">Saves as you type. Only you can see this.</p>
+          <p class="small" style="margin-top:12px;">
+            <kbd>←</kbd> <kbd>→</kbd> move between rows · <kbd>1</kbd> right · <kbd>2</kbd> wrong · <kbd>3</kbd> not sure
+          </p>
+          <details class="adv">
+            <summary>Filter which rows you see</summary>
+            <form action="/review" method="get">
+              <input type="hidden" name="idx" value="0" />
+              {% for pair in filter_pairs %}
+              <div class="map-row">
+                <select name="filter_key" aria-label="Answer field">
+                  <option value="">Any field</option>
+                  {% for key in detected_keys %}
+                  <option value="{{ key }}" {% if key == pair.key %}selected{% endif %}>{{ key }}</option>
+                  {% endfor %}
+                </select>
+                <select name="filter_val" aria-label="Value">
+                  <option value="">Any value</option>
+                  <option value="true" {% if pair.val == 'true' %}selected{% endif %}>is true</option>
+                  <option value="false" {% if pair.val == 'false' %}selected{% endif %}>is false</option>
+                </select>
+              </div>
+              {% endfor %}
+              <div class="actions tight">
+                <button type="submit" class="secondary">Apply</button>
+                <a class="btn ghost" href="/review?idx=0">Clear</a>
+              </div>
+            </form>
+          </details>
+        </section>
+
+        <!-- ============ the fixer ============ -->
+        <section class="card fixer">
+          <div class="step-head" style="margin-bottom:2px;">
+            <div class="step-title"><h2>Improve the question</h2></div>
+            <span class="tag {% if noted_count %}ai{% else %}warn{% endif %}">{{ noted_count }} note{{ '' if noted_count == 1 else 's' }}</span>
+          </div>
+          <p class="empty-hint">
+            Every row you marked goes in together, in one pass. Mark as many rows as you like first —
+            the assistant groups them into a handful of problems and fixes them all at once.
+          </p>
+
+          <div class="actions tight">
+            <button type="button" id="improve-button" class="ai" {% if not noted_count %}disabled{% endif %}>
+              {% if noted_count %}Fix using all {{ noted_count }} notes{% else %}Mark a row first{% endif %}
+            </button>
+            <button type="button" id="fixer-settings-toggle" class="ghost">Model</button>
+          </div>
+          <p class="slot-msg" id="fixer-status">{{ fixer_message }}</p>
+
+          <details class="adv" id="fixer-settings">
+            <summary>Which model runs the fix</summary>
+            <form id="llm-credentials" method="post" action="/" autocomplete="on">
+              <label for="fixer-model">Model</label>
+              <input id="fixer-model" type="text" value="{{ model }}" />
+              <input type="hidden" id="fixer-provider" value="{{ provider }}" />
+              <label for="llm-password">API key</label>
+              <input id="llm-username" name="username" type="hidden" autocomplete="username" value="{{ provider }}" />
+              <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Needed to run the fix{% endif %}" value="" />
+              <div class="actions tight">
+                <button type="button" id="key-save" class="secondary">Save key</button>
+                <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget</button>
+              </div>
+              <p class="slot-msg" id="key-status">{% if saved_key_exists %}Using your saved key.{% else %}Save one in Settings to skip this.{% endif %}</p>
+            </form>
+          </details>
+
+          <details class="adv">
+            <summary>See the question this run used</summary>
+            <label for="review-prompt">What to do</label>
+            <textarea id="review-prompt" class="instructions-box">{{ prompt_draft }}</textarea>
+            <label for="review-input-template">What to read <span class="small" style="font-weight:400;">(read-only)</span></label>
+            <textarea id="review-input-template" class="input-data-box" readonly>{{ input_template }}</textarea>
+            <p class="small"><a href="/prompts/history{% if prompt_name %}?name={{ prompt_name }}{% endif %}">See every past change to this question →</a></p>
+          </details>
+        </section>
       </div>
-      <label for="review-prompt">Instructions (editable)</label>
-      <textarea id="review-prompt" class="instructions-box">{{ prompt_draft }}</textarea>
-      <label for="review-input-template">Input data (read-only)</label>
-      <p class="empty-hint">{% if input_template %}Added after the instructions, under ===== INPUT =====, when this run was sent.{% else %}This run used instructions only (no separate input section).{% endif %}</p>
-      <textarea id="review-input-template" class="input-data-box" readonly>{{ input_template }}</textarea>
-      <p class="small">The fixer edits instructions only. Accepting an automated fix writes a new version into the shared library.</p>
-      <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on" style="margin-top:12px;">
-        <label for="llm-username">Key name</label>
-        <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
-        <label for="llm-password">API key</label>
-        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Needed only to improve the prompt{% endif %}" value="" />
-        <div class="actions tight">
-          <button type="button" id="key-save" class="secondary">Save key</button>
-          <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>
+
+      <!-- ============ proposal ============ -->
+      {% if proposed_prompt or fixer_warnings %}
+      <section class="card fixer" style="margin-top:16px;" id="proposal">
+        <div class="step-head">
+          <div class="step-title"><h2>Proposed change</h2></div>
+          {% if examples_used %}<span class="tag ai">built from {{ examples_used }} note{{ '' if examples_used == 1 else 's' }}</span>{% endif %}
         </div>
-        <p class="slot-msg" id="key-status">{% if saved_key_exists %}Saved for your account only.{% else %}Optional: save to this account.{% endif %}</p>
-        <label for="fixer-model">Model for the fixer</label>
-        <input id="fixer-model" type="text" value="{{ model }}" />
-        <input type="hidden" id="fixer-provider" value="{{ provider }}" />
-      </form>
-      <div class="actions">
-        <button type="button" id="improve-button">{% if noted_count %}Improve prompt from all {{ noted_count }} notes{% else %}Improve prompt from notes{% endif %}</button>
-        <button type="button" id="accept-button" class="secondary" {% if not proposed_prompt %}disabled{% endif %}>Save proposed as shared version</button>
-        <button type="button" id="discard-button" class="ghost" {% if not proposed_prompt %}disabled{% endif %}>Discard</button>
-      </div>
-      <p class="small">One pass batches every reviewed row's note + verdict on this run into a single Analyst → Editor → Critic run.</p>
-      <p class="small" id="fixer-status">{{ fixer_status }}</p>
-    </section>
-  </div>
 
-  {% if diff_lines %}
-  <section class="card" style="margin-top:16px;">
-    <div class="kicker">Proposed update</div>
-    <pre class="diff">{% for line in diff_lines %}{% if line.startswith('+') and not line.startswith('+++') %}<span class="add">{{ line }}</span>
-{% elif line.startswith('-') and not line.startswith('---') %}<span class="del">{{ line }}</span>
-{% else %}{{ line }}
-{% endif %}{% endfor %}</pre>
-    {% if analysis %}<p class="small"><strong>Analyst:</strong> {{ analysis }}</p>{% endif %}
-    {% if critic %}<p class="small"><strong>Critic:</strong> {{ critic }}</p>{% endif %}
-  </section>
-  {% endif %}
+        {% for warning in fixer_warnings %}
+        <div class="fixer-callout warn"><span class="ico">!</span><span>{{ warning }}</span></div>
+        {% endfor %}
+
+        {% if patterns %}
+        <div class="kicker" style="margin-top:8px;">What it thinks went wrong</div>
+        <div class="pattern-list">
+          {% for pattern in patterns %}
+          <article class="pattern{% if pattern.thin %} thin{% endif %}">
+            <div class="pattern-head">
+              <h4>{{ pattern.title }}</h4>
+              {% if pattern.thin %}<span class="tag warn">only 1 row</span>{% endif %}
+              {% if pattern.rows %}
+              <span class="evidence-rows">
+                {% for r in pattern.rows %}<a href="/review?idx={{ r }}{{ filter_qs }}">row {{ r + 1 }}</a>{% endfor %}
+              </span>
+              {% endif %}
+            </div>
+            {% if pattern.problem %}<p>{{ pattern.problem }}</p>{% endif %}
+            {% if pattern.needed_change %}<p><b>Fix:</b> {{ pattern.needed_change }}</p>{% endif %}
+            {% if pattern.prompt_section %}<div class="pattern-quote">{{ pattern.prompt_section }}</div>{% endif %}
+          </article>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if diff_rows %}
+        <div class="kicker" style="margin-top:16px;">Exactly what changes</div>
+        <div class="diff">
+          {% for line in diff_rows %}<div class="diff-line {{ line.kind }}"><span class="gut">{{ line.gut }}</span><span class="txt">{{ line.text }}</span></div>{% endfor %}
+        </div>
+        {% endif %}
+
+        {% if rejected_edits or risks %}
+        <div class="kicker" style="margin-top:16px;">The reviewer's second opinion</div>
+        {% for item in rejected_edits %}
+        <div class="fixer-callout good"><span class="ico">✓</span><span><strong>Rejected:</strong> {{ item }}</span></div>
+        {% endfor %}
+        {% for item in risks %}
+        <div class="fixer-callout warn"><span class="ico">!</span><span><strong>Still a risk:</strong> {{ item }}</span></div>
+        {% endfor %}
+        {% endif %}
+
+        <!-- ============ re-check ============ -->
+        <div class="kicker" style="margin-top:18px;">Does it actually work better?</div>
+        <p class="empty-hint">
+          Run the new question on the rows you marked — including the ones you said were right.
+          A good fix moves the wrong answers and leaves the right ones alone.
+        </p>
+        <div class="actions tight">
+          <button type="button" id="recheck-button" class="ai secondary" {% if not proposed_prompt or fixer_unchanged %}disabled{% endif %}>Re-run my marked rows</button>
+        </div>
+        <p class="slot-msg" id="recheck-status">{% if recheck.status == 'error' %}{{ recheck.error }}{% endif %}</p>
+
+        <div id="recheck-result" {% if recheck.status != 'done' %}hidden{% endif %}>
+          {% if recheck_summary %}
+          <div class="recheck-summary" style="margin-top:10px;">
+            <div class="good"><span class="k">Fixed</span><span class="v">{{ recheck_summary.moved }}/{{ recheck_summary.targets }}</span></div>
+            <div{% if recheck_summary.unmoved %} class="warn"{% endif %}><span class="k">Still wrong</span><span class="v">{{ recheck_summary.unmoved }}</span></div>
+            <div{% if recheck_summary.regressions %} class="bad"{% endif %}><span class="k">Broke</span><span class="v">{{ recheck_summary.regressions }}</span></div>
+            <div><span class="k">Checked</span><span class="v">{{ recheck_summary.checked }}</span></div>
+          </div>
+          {% if recheck_summary.regressions %}
+          <div class="fixer-callout bad" style="margin-top:10px;"><span class="ico">!</span><span><strong>{{ recheck_summary.regressions }} row{{ '' if recheck_summary.regressions == 1 else 's' }} you marked right changed too.</strong> Open them below — if the new answer is worse, do not save this version.</span></div>
+          {% elif recheck_summary.checked %}
+          <div class="fixer-callout good" style="margin-top:10px;"><span class="ico">✓</span><span>Nothing you had already marked right changed.</span></div>
+          {% endif %}
+          {% endif %}
+          <div class="recheck-rows" id="recheck-rows">
+            {% for r in recheck_rows %}
+            <details class="recheck-row"{% if (r.verdict == 'ok' and r.changed) or (r.verdict != 'ok' and not r.changed) %} open{% endif %}>
+              <summary>
+                <span class="tag {% if r.verdict == 'ok' %}ok{% elif r.verdict == 'wrong' %}bad{% elif r.verdict == 'unclear' %}warn{% endif %}">row {{ r.row + 1 }} · you said {{ r.verdict or '—' }}</span>
+                <span class="tag {% if r.changed %}ai{% endif %}">{{ 'changed' if r.changed else 'same answer' }}</span>
+                <span class="note">{{ r.note }}</span>
+              </summary>
+              <div class="recheck-body">
+                <div class="recheck-cell"><div class="k">Before</div><pre>{{ r.before }}</pre></div>
+                <div class="recheck-cell after"><div class="k">After this fix</div><pre>{{ r.error or r.after }}</pre></div>
+              </div>
+            </details>
+            {% endfor %}
+          </div>
+        </div>
+
+        <div class="actions" style="margin-top:18px;padding-top:16px;border-top:1px solid var(--line-soft);">
+          <button type="button" id="accept-button" {% if not proposed_prompt or fixer_unchanged %}disabled{% endif %}>Save as the new version</button>
+          <button type="button" id="discard-button" class="ghost" {% if not proposed_prompt %}disabled{% endif %}>Throw it away</button>
+        </div>
+        <p class="small">Saving shares this with everyone who can use the question. The old text is kept, so it can be put back.</p>
+      </section>
+      {% endif %}
+    </div>
+  </div>
   {% else %}
-  <div class="card empty">No rows match this filter, or you have not run a batch yet.</div>
+  <div class="card empty">
+    <h2>Nothing to check yet</h2>
+    <p class="empty-hint">Run a question over some rows first, or open a past run.</p>
+    <div class="actions" style="justify-content:center;"><a class="btn" href="/">Start a run</a><a class="btn secondary" href="/runs">Past runs</a></div>
+  </div>
   {% endif %}
 {% endblock %}
 {% block scripts %}

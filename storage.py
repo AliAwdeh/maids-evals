@@ -708,6 +708,9 @@ def _empty_review() -> Dict[str, Any]:
             "accepted_name": "",
             "error": "",
         },
+        # Re-running the reviewed rows against a proposed prompt, so a fix is
+        # judged on what it does to the rows rather than on how the diff reads.
+        "recheck": {"status": "idle", "rows": [], "summary": {}, "error": "", "prompt": ""},
     }
 
 
@@ -726,6 +729,8 @@ def load_review(username: str, run_id: str) -> Dict[str, Any]:
         base["notes"] = data.get("notes") if isinstance(data.get("notes"), dict) else {}
         if isinstance(data.get("fixer"), dict):
             base["fixer"].update(data["fixer"])
+        if isinstance(data.get("recheck"), dict):
+            base["recheck"].update(data["recheck"])
     return base
 
 

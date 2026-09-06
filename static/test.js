@@ -25,7 +25,7 @@
   function setStatus(el, msg, ok = true) {
     if (!el) return;
     el.textContent = msg || "";
-    el.style.color = ok ? "#1f6b46" : "#a12626";
+    el.style.color = ok ? "var(--ok)" : "var(--bad)";
   }
 
   function withSid(body) {

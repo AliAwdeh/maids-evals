@@ -143,6 +143,19 @@ When you open New run, it uses your Settings defaults so you do not re-enter a k
 
 ---
 
+## The interface
+
+A left rail carries every page, grouped by what you are doing: **Analyse** (New run, Build a prompt, Prompts), **Results** (Answers, Check & improve, Past runs), and **Team** (Prompt changes, Company notes, Settings, People).
+
+Two conventions are worth knowing, because they are the only thing you have to learn:
+
+- **A violet button means an AI runs.** It costs money and takes time. Every other button is instant and free.
+- **Green means a value was filled in from your sheet; red means it was not.** You see this in the prompt Preview and in the *Ready to run?* panel.
+
+The app follows your system light or dark theme.
+
+---
+
 ## Walkthrough
 
 ### 1. Upload a spreadsheet
@@ -152,6 +165,10 @@ On **New run**, step 1, choose a `.csv` or Excel `.xlsx` and click **Upload**. E
 If the Excel file has more than one sheet, the first sheet is used and a short note tells you so. Older `.xls` files are accepted when possible; if one fails, save it as `.xlsx` and try again. Downloads and run archives stay CSV.
 
 Optional, under **Advanced**: keep a random subset for a cheap first pass.
+
+The right-hand **Ready to run?** panel answers "will this work?" before you spend anything: how many rows, how many of the prompt's fields resolved against your sheet, and roughly how many tokens one row will send. If a field is not in your sheet it is named in red and **Run is disabled** until you match it to a column.
+
+The prompt editor has three tabs: **What to do** (the rules and the answer you want), **What to read** (the text to analyse, appended last), and **Preview** — the exact text one real row will send, with filled values in green and missing fields in red.
 
 ### 2. Pick or write a prompt
 
@@ -184,7 +201,9 @@ If you do not already have a prompt, open **Build prompt** in the nav (or the li
 
 **Catalogue** lists prompts you own, prompts shared with you, and everyone-visible prompts. Search by name or username, page through results, or ask the helper to find one — it only sees prompts you can use.
 
-Open a prompt to read it, edit it, clone it, or talk to the helper. The helper keeps that conversation. A clone **copies** the chat and then runs on its own — editing a copy never touches the original or anyone else's history.
+Open a prompt to read it, edit it, clone it, or talk to the helper.
+
+**Conversations belong to the person who had them.** Two people asking the helper about the same shared prompt each get their own thread — you are never typing into someone else's history. When you clone, *your* conversation comes with you to the copy, so the helper does not start cold on the prompt you were just discussing. The original and everyone else's threads are untouched.
 
 If you can edit, the Instructions and Input data boxes are live: change them and **Save changes** appears. Every save keeps the previous text under **Earlier versions**, where you can preview or restore it. When the helper proposes an edit you see a diff of exactly which lines move before you **Apply** or **Reject** it — a shared prompt never changes on trust alone.
 
@@ -244,7 +263,26 @@ When you have a few notes:
 1. Nothing to do if you already saved a key in Settings — the fixer picks it up. Paste one in the Review key card only for a different key.
 2. Click **Improve prompt from all N notes**. This is a single batched pass: every reviewed row's note + verdict on the run is grouped into one Analyst → Editor → Critic run — not one row at a time.
 3. Three agents run on your key: Analyst (clusters failures) → Editor (surgical edits only) → Critic (rejects overfitting and contradictions). A stage that answers in prose instead of JSON is asked once more; if the Critic still fails, the Editor's version is offered with a warning rather than the whole pass being thrown away. Very large batches send the most informative notes (wrong and unclear first) and tell you how many were used.
-4. A diff appears. **Save proposed as shared version**, or **Discard** (which is recorded in the fix history).
+
+**Overfitting guards.** The Analyst must list the rows behind each pattern honestly and write single-row patterns as general rules. The Critic is told to reject a rule that repeats a name, id, date or verbatim phrase from one note. On top of that, two checks run in code, independent of any model:
+
+- If the new prompt contains wording that appears in exactly one reviewed row, you are shown the phrase and told to check it is a rule and not a patch.
+- If the Analyst backed a change with one row out of four or more, that change is flagged `only 1 row` on its card.
+
+4. You get the Analyst's problems as cards (each linking back to the row that evidenced it), a line-by-line diff, and the Critic's rejections and residual risks.
+
+5. **Re-run my marked rows.** This is the step that says whether the fix actually worked. It runs the *proposed* prompt over every row you marked — including the ones you marked **right** — and reports four numbers:
+
+   | | |
+   |---|---|
+   | **Fixed** | flagged rows that now answer differently |
+   | **Still wrong** | flagged rows the fix did not move |
+   | **Broke** | rows you had marked right that changed anyway |
+   | **Checked** | rows re-run (capped at 30) |
+
+   Any row that regressed, and any flagged row the fix missed, is expanded automatically with the old and new answers side by side. A fix that repairs three noted failures while breaking thirty unnoted ones no longer looks the same as a good one.
+
+6. **Save as the new version**, or **Throw it away** (which is recorded in the fix history).
 
 That writes a new file into the version library, e.g. `agent_eval.v2`, **and** publishes the text into the catalogue so other people can actually load it:
 

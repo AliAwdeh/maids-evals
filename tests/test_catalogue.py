@@ -39,20 +39,30 @@ class CatalogueSearchAndChatTests(unittest.TestCase):
         self.assertEqual(paged["total"], 1)
         self.assertEqual(paged["pages"], 1)
 
-    def test_clone_copies_chat_and_leaves_the_source_alone(self):
+    def test_your_conversation_follows_you_to_your_clone(self):
+        """Sara works something out on Ali's prompt, then clones it to make the
+        change. Her side of the conversation comes with her; Ali's does not
+        move and is not touched."""
         src = catalogue.create_prompt("ali", "source", "Read {Messages}.", "{Messages}", visibility="everyone")
-        catalogue.append_chat(src["id"], "user", "what does this do?")
-        catalogue.append_chat(src["id"], "assistant", "it classifies chats")
+        catalogue.append_chat(src["id"], "ali", "user", "ali's own question")
+        catalogue.append_chat(src["id"], "sara", "user", "why does it miss refunds?")
+        catalogue.append_chat(src["id"], "sara", "assistant", "the rule only covers cancellations")
+
+        self.assertEqual(len(catalogue.load_chat(src["id"], "sara")), 2)
+        self.assertEqual(len(catalogue.load_chat(src["id"], "ali")), 1)
+
         clone = catalogue.clone_prompt(src["id"], "sara")
-        copied = catalogue.load_chat(clone["id"])
-        self.assertEqual(len(copied), 2)
-        self.assertEqual(copied[0]["text"], "what does this do?")
-        # The two conversations are independent from the moment of the clone.
-        catalogue.append_chat(clone["id"], "user", "make it stricter")
-        self.assertEqual(len(catalogue.load_chat(src["id"])), 2)
+        carried = catalogue.load_chat(clone["id"], "sara")
+        self.assertEqual(len(carried), 2)
+        self.assertEqual(carried[0]["text"], "why does it miss refunds?")
+        # Ali keeps his, and does not inherit hers on the copy he cannot see.
+        self.assertEqual(len(catalogue.load_chat(src["id"], "ali")), 1)
+        self.assertEqual(catalogue.load_chat(clone["id"], "ali"), [])
+
+        # Editing the copy leaves every conversation on the original intact.
         catalogue.update_prompt(clone["id"], "sara", prompt="Read {Messages}. Be strict.")
-        self.assertEqual(len(catalogue.load_chat(clone["id"])), 3)
-        self.assertEqual(len(catalogue.load_chat(src["id"])), 2)
+        self.assertEqual(len(catalogue.load_chat(src["id"], "sara")), 2)
+        self.assertEqual(len(catalogue.load_chat(src["id"], "ali")), 1)
 
     def test_editing_snapshots_the_previous_text(self):
         src = catalogue.create_prompt("ali", "shared", "Version one {Messages}.", "{Messages}")
@@ -81,12 +91,15 @@ class CatalogueSearchAndChatTests(unittest.TestCase):
         self.assertEqual(catalogue.load_body(src["id"])["prompt"], "New {Messages}.")
 
     def test_delete_removes_the_conversation(self):
-        src = catalogue.create_prompt("ali", "temp", "Read {Messages}.", "{Messages}")
-        catalogue.append_chat(src["id"], "user", "internal context")
-        path = catalogue._conversation_path(catalogue._conversation_id_for(src["id"]))
-        self.assertTrue(path.is_file())
+        src = catalogue.create_prompt("ali", "temp", "Read {Messages}.", "{Messages}", visibility="everyone")
+        catalogue.append_chat(src["id"], "ali", "user", "internal context")
+        catalogue.append_chat(src["id"], "sara", "user", "sara's side")
+        conv = catalogue._conversation_id_for(src["id"])
+        paths = [catalogue._conversation_path(conv, "ali"), catalogue._conversation_path(conv, "sara")]
+        self.assertTrue(all(p.is_file() for p in paths))
         catalogue.delete_prompt(src["id"], "ali")
-        self.assertFalse(path.is_file())
+        # Every participant's side goes, not just the owner's.
+        self.assertFalse(any(p.is_file() for p in paths))
 
     def test_viewer_cannot_edit(self):
         src = catalogue.create_prompt("ali", "locked", "Read {Messages}.", "{Messages}", visibility="everyone")

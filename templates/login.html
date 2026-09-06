@@ -6,14 +6,17 @@
   <title>Log in · Maids Evals</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
   <div class="login-wrap">
     <form class="login-card" method="post" action="/login" autocomplete="on">
-      <div class="mark">Maids Evals</div>
-      <p class="lede">This tool is locked. Enter the username and access token you were given. Without them, nothing on this platform is reachable.</p>
+      <div class="brand" style="padding:0 0 14px;">
+        <span class="brand-mark">M</span>
+        <span><strong style="font-size:17px;">Maids Evals</strong><span>Ask a question about every row</span></span>
+      </div>
+      <p class="lede" style="margin-bottom:14px;">Sign in with the username and access token you were given.</p>
       {% if error %}
       <p class="flash-err">{{ error }}</p>
       {% endif %}

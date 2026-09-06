@@ -3,7 +3,7 @@
     const el = document.getElementById(id);
     if (!el) return;
     el.textContent = msg || "";
-    el.style.color = isError ? "#8d2c2c" : "";
+    el.style.color = isError ? "var(--bad)" : "";
   }
 
   function collectTools() {
