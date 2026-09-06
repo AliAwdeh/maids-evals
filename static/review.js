@@ -24,15 +24,19 @@
   }
 
   async function loadReviewKey() {
+    // Only asks whether a key is saved. The fixer route resolves the value
+    // server-side, so the secret never has to reach this page.
     const provider = (fixerProvider?.value || "").toLowerCase();
-    if (!KEY_PROVIDERS.includes(provider) || (llmPass && llmPass.value)) return;
+    if (!KEY_PROVIDERS.includes(provider)) return;
     try {
       const resp = await fetch(`/credentials?provider=${encodeURIComponent(provider)}`, { credentials: "same-origin" });
       if (!resp.ok) return;
       const data = await resp.json();
-      if (llmPass && data.api_key) llmPass.value = data.api_key;
       if (keyForget) keyForget.disabled = !data.saved;
-      if (data.saved) setKeyLine("Saved for your account only.");
+      if (data.saved) {
+        setKeyLine("Saved key in use for your account.");
+        if (llmPass && !llmPass.value) llmPass.placeholder = "Saved key in use — leave blank";
+      }
     } catch (_) {}
   }
 
@@ -131,18 +135,31 @@
     body.append("model", document.getElementById("fixer-model")?.value || "");
     body.append("api_key", llmPass?.value || "");
     body.append("prompt_draft", promptBox?.value || "");
-    setStatus(fixerStatus, "Running analyst → editor → critic…", true);
-    const resp = await fetch("/review/improve", { method: "POST", body, credentials: "same-origin" });
-    if (!resp.ok) {
-      setStatus(fixerStatus, await resp.text(), false);
-      return;
+    setStatus(fixerStatus, "Running analyst → editor → critic… this can take a minute.", true);
+    window.setBusy("improve-button", true, "Working…");
+    try {
+      const resp = await fetch("/review/improve", { method: "POST", body, credentials: "same-origin" });
+      if (!resp.ok) {
+        setStatus(fixerStatus, await resp.text(), false);
+        return;
+      }
+      let status = "running";
+      // Bounded wait. The fixer runs in a background thread; if that thread
+      // dies without writing a status the old loop span forever with the
+      // button stuck on "Working…".
+      const deadline = Date.now() + 6 * 60 * 1000;
+      while (status === "running" && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 800));
+        status = await pollFixer();
+      }
+      if (status === "running") {
+        setStatus(fixerStatus, "The fixer is taking longer than six minutes. Reload this page to check on it.", false);
+        return;
+      }
+      if (status === "done") window.location.reload();
+    } finally {
+      window.setBusy("improve-button", false);
     }
-    let status = "running";
-    while (status === "running") {
-      await new Promise((r) => setTimeout(r, 800));
-      status = await pollFixer();
-    }
-    if (status === "done") window.location.reload();
   });
 
   document.getElementById("accept-button")?.addEventListener("click", async () => {
@@ -150,13 +167,18 @@
     if (!base) return;
     const body = new FormData();
     body.append("prompt_name", base);
-    const resp = await fetch("/review/accept", { method: "POST", body, credentials: "same-origin" });
-    if (!resp.ok) {
-      setStatus(fixerStatus, await resp.text(), false);
-      return;
+    window.setBusy("accept-button", true, "Saving…");
+    try {
+      const resp = await fetch("/review/accept", { method: "POST", body, credentials: "same-origin" });
+      if (!resp.ok) {
+        setStatus(fixerStatus, await resp.text(), false);
+        return;
+      }
+      const data = await resp.json();
+      setStatus(fixerStatus, `Saved shared prompt ${data.name}. See it under Prompts.`, true);
+    } finally {
+      window.setBusy("accept-button", false);
     }
-    const data = await resp.json();
-    setStatus(fixerStatus, `Saved shared prompt ${data.name}. See it under Prompts.`, true);
   });
 
   document.getElementById("discard-button")?.addEventListener("click", async () => {

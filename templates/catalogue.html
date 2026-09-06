@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Catalogue · Maids Evals{% endblock %}
+{% block body %}
+  <h1>Prompt catalogue</h1>
+  <p class="lede">Prompts you can see and run. Search by name or username. Talk to the helper to find one, or open a prompt and ask it to explain or edit.</p>
+
+  <div class="catalog-grid">
+    <section class="card">
+      <label for="cat-search">Search</label>
+      <input id="cat-search" type="search" placeholder="Name, purpose, or username" autocomplete="off" />
+      <div class="actions tight">
+        <input id="cat-owner" type="search" placeholder="Owner username" autocomplete="off" />
+        <select id="cat-access">
+          <option value="">Any access</option>
+          <option value="mine">Mine</option>
+          <option value="shared">Shared with me</option>
+          <option value="everyone">Everyone</option>
+        </select>
+      </div>
+      <div class="actions tight">
+        <button type="button" id="cat-search-btn">Search</button>
+      </div>
+      <div id="cat-list" class="prompt-list"></div>
+      <div class="pager" id="cat-pager"></div>
+      <p class="slot-msg" id="cat-list-status"></p>
+
+      <h3>Find a prompt</h3>
+      <p class="empty-hint">Describe what you need. The helper only sees prompts you can use.</p>
+      <textarea id="find-input" style="min-height:70px;" placeholder="e.g. classify chats as related to maids.cc, from ali"></textarea>
+      <div class="actions tight">
+        <button type="button" id="find-send">Ask helper</button>
+      </div>
+      <p class="slot-msg" id="find-status"></p>
+      <div id="find-reply" class="chat-log" hidden></div>
+      <div id="find-matches" class="prompt-list"></div>
+    </section>
+
+    <section class="card" id="detail-empty">
+      <h2>Open a prompt</h2>
+      <p class="empty-hint">Search or click one on the left. You can read it, ask the helper what it does, clone it, or change who can see it if you created it.</p>
+    </section>
+
+    <section class="card" id="detail" hidden>
+      <div class="step-head">
+        <div class="step-title"><h2 id="d-name">Prompt</h2></div>
+        <span class="tag" id="d-role"></span>
+      </div>
+      <p class="small" id="d-meta"></p>
+      <p class="small" id="d-purpose"></p>
+      <label>Instructions</label>
+      <textarea id="d-prompt" class="instructions-box" readonly></textarea>
+      <label>Input data</label>
+      <textarea id="d-input" class="input-data-box" readonly></textarea>
+      <p class="small" id="d-required"></p>
+      <div class="actions tight">
+        <button type="button" id="d-save" hidden>Save changes</button>
+        <button type="button" id="d-use" class="secondary">Use on New run</button>
+        <button type="button" id="d-clone" class="secondary">Clone</button>
+        <button type="button" id="d-versions" class="ghost">Earlier versions</button>
+        <button type="button" id="d-request" class="secondary" hidden>Request edit access</button>
+        <button type="button" id="d-delete" class="ghost" hidden>Delete</button>
+      </div>
+      <p class="slot-msg" id="d-status"></p>
+      <div id="d-version-panel" hidden>
+        <h3>Earlier versions</h3>
+        <p class="empty-hint">Every edit keeps the text that came before it. Restoring puts one back and keeps the current text as a version too.</p>
+        <div id="d-version-list" class="prompt-list"></div>
+      </div>
+
+      <div id="acl-box" hidden>
+        <h3>Who can see this</h3>
+        <label for="acl-visibility">Access</label>
+        <select id="acl-visibility">
+          <option value="personal">Only me</option>
+          <option value="everyone">Everyone logged in</option>
+          <option value="selected">Only people I choose</option>
+        </select>
+        <label for="acl-everyone-role">If everyone can see it, they are</label>
+        <select id="acl-everyone-role">
+          <option value="viewer">Viewers (can run)</option>
+          <option value="editor">Editors (can run and edit)</option>
+        </select>
+        <label for="user-search">Add a person</label>
+        <div class="actions tight">
+          <input id="user-search" type="text" placeholder="Search username" autocomplete="off" />
+        </div>
+        <div id="user-hits" class="user-hits"></div>
+        <p class="small">Viewers and editors can both run the prompt.</p>
+        <div id="acl-people" class="acl-people"></div>
+        <div id="acl-requests"></div>
+        <div class="actions">
+          <button type="button" id="acl-save" class="secondary">Save access</button>
+        </div>
+      </div>
+
+      <h3>Talk to the helper</h3>
+      <p class="empty-hint">Ask what this prompt does, or say what to change. The helper uses this conversation’s history. If you cannot edit, it will tell you to clone or request access.</p>
+      <div id="chat-log" class="chat-log"></div>
+      <label for="chat-input">Message</label>
+      <textarea id="chat-input" style="min-height:80px;"></textarea>
+      <div class="actions tight">
+        <button type="button" id="chat-send">Send</button>
+        <button type="button" id="chat-apply" class="secondary" hidden>Apply proposed edit</button>
+        <button type="button" id="chat-reject" class="ghost" hidden>Reject</button>
+      </div>
+      <p class="slot-msg" id="chat-status"></p>
+      <div id="chat-diff-panel" hidden>
+        <div class="kicker">What would change</div>
+        <pre class="diff" id="chat-diff"></pre>
+      </div>
+    </section>
+  </div>
+{% endblock %}
+{% block scripts %}
+<script>
+window.MAIDS_CATALOGUE = {
+  provider: {{ provider|tojson }},
+  model: {{ model|tojson }},
+  hasKey: {{ saved_key_exists|tojson }}
+};
+</script>
+<script src="/static/catalogue.js"></script>
+{% endblock %}

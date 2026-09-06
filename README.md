@@ -1,6 +1,6 @@
 # Maids Evals
 
-A shared workspace for running evaluation prompts over CSV rows — usually support conversations — then reviewing the model’s JSON, taking notes, and tightening the prompt.
+A shared workspace for running evaluation prompts over spreadsheet rows — usually support conversations — then reviewing the model’s JSON, taking notes, and tightening the prompt.
 
 It is meant for people who already write or maintain eval prompts (quality, policy, identifier, tool-use). You upload a sheet, pick a prompt from the shared library, run OpenAI / LangCC / Gemini / Ollama across the rows, then walk the results one row at a time.
 
@@ -10,13 +10,14 @@ If you do not have an access token, you cannot open the app, list prompts, see h
 
 ## What you can do
 
-1. Upload a CSV of conversations or any other rows.
-2. Load a shared prompt (or write a new one) with `{column}` and `{row_json}` placeholders.
+1. Upload a CSV or Excel (`.xlsx`) file of conversations or any other rows.
+2. Load a shared prompt, write one, or **Build prompt** with a guided helper. Instructions and Input data are separate. Placeholders stay `{column}` (raw cell, no automatic label). `{row_json}` still works for older prompts.
 3. Run the prompt across the sheet, or test a single random row first.
 4. Filter, review, compute true/false stats, and download a flattened CSV. Model answers render as a collapsible JSON tree (with a Pretty/Raw toggle and copy button), not a wall of text.
 5. Leave a note on each row (`ok` / `wrong` / `unclear`) and ask the fixer to improve the prompt — either from **all** of a run's notes in one batched pass, or from a single **Test** row + note.
 6. Save the accepted update as a new shared version (`agent_eval.v2`). Your run history stays private.
 7. Browse the shared **Prompts** fix history: every improvement run, who ran it, the failure patterns, the diff, and whether it was accepted or discarded.
+8. View or edit shared **Company** notes so the prompt helper and fixer stay on maids.cc vocabulary. Volatile figures in that file are not treated as facts.
 
 ---
 
@@ -120,31 +121,35 @@ Without a valid session:
 
 ## Save your LLM API key
 
-You must be logged in. Keys are per user and per provider (`openai`, `langcc`, `gemini`). Ollama does not use a key.
+You must be logged in. Keys are per user. Ollama does not use a key.
 
-On **New run** (and on **Review** when you improve a prompt):
+**Settings** is the place to keep defaults: default provider and model, more than one named API key, which key is default, and which model each helper uses (New run, Build prompt, Fixer, Catalogue chat, Find a prompt). New run still lets you change the model or key for that batch.
+
+On **Settings** or **New run**:
 
 | Field label | Suggested value | Autocomplete |
 |---|---|---|
-| **Key name** | `openai`, `langcc`, or `gemini` | `username` |
-| **API key** | your provider secret | `current-password` |
+| **Key name** | a label such as `Work LangCC` | `username` |
+| **API key** | your provider secret | `current-password` / `new-password` |
 
 Two ways to keep it:
 
-1. **This account** — click **Save key**. It is written under `data/users/<you>/secrets.json`, encrypted with `SECRET_FERNET` or a key derived from `SESSION_SECRET`. Nobody else can load it. **Forget saved key** deletes only your copy for that provider.
-2. **Your password manager** — Apple Passwords, Google Password Manager, or Bitwarden. The fields stay password-manager friendly. Saving to the account is extra, not a replacement.
+1. **This account** — save the key. It is written under `data/users/<you>/secrets.json`, encrypted with `SECRET_FERNET` or a key derived from `SESSION_SECRET`. Nobody else can load it.
+2. **Your password manager** — Apple Passwords, Google Password Manager, or Bitwarden. The fields stay password-manager friendly.
 
 The key is never stored in `users.json`, shared prompts, run metadata, or `/session/save`. Unauthenticated `GET`/`POST` `/credentials` returns `401` and no key material.
 
-When you open New run, the password field is filled from *your* saved key for the selected provider. Switching provider loads that provider’s saved key.
+When you open New run, it uses your Settings defaults so you do not re-enter a key every time.
 
 ---
 
 ## Walkthrough
 
-### 1. Upload a CSV
+### 1. Upload a spreadsheet
 
-On **New run**, step 1, choose a `.csv` and click **Upload**. Empty rows are dropped. The step stays put and shows the row count.
+On **New run**, step 1, choose a `.csv` or Excel `.xlsx` and click **Upload**. Empty rows are dropped, blank cells become empty text, and column names stay in order. The step stays put and shows the row count.
+
+If the Excel file has more than one sheet, the first sheet is used and a short note tells you so. Older `.xls` files are accepted when possible; if one fails, save it as `.xlsx` and try again. Downloads and run archives stay CSV.
 
 Optional, under **Advanced**: keep a random subset for a cheap first pass.
 
@@ -152,11 +157,42 @@ Optional, under **Advanced**: keep a random subset for a cheap first pass.
 
 The prompt library is **shared**. Anyone logged in can load and save.
 
-- Choose a saved prompt and click **Load**.
+- Choose a saved prompt and click **Load**. The shared library stores **instructions only**.
 - Or type a name and **Save to library**.
-- Click a column chip to insert `{ThatColumn}`. `{row_json}` inserts the whole row.
+- **Instructions** are the task and the JSON you want back.
+- **Input data** is the conversation or other cells. It is appended at the end, after a line `===== INPUT =====`, when the model runs. Leave it blank to keep the old single-box behavior.
+- Click a column chip to insert `{ThatColumn}` into the box you last clicked (chips start in Input data). Write any label yourself — substitution is the raw cell, with no `Column:` prefix.
+- `{row_json}` still works for older prompts. Prefer named columns. Do not put the same column in both boxes, and do not put a long conversation in the middle of the instructions.
 
-The prompt must contain at least one placeholder.
+The prompt needs row data: a `{column}` that matches the sheet, `{row_json}`, or a mapped prompt field (the name in the prompt does not have to match the column name).
+
+### 2b. Build an analysis prompt (guided)
+
+If you do not already have a prompt, open **Build prompt** in the nav (or the link on New run).
+
+1. Upload a CSV/Excel file, or keep the one already loaded.
+2. Write what you want to find out about each row, in everyday language.
+3. Click the column that holds the conversation or main text.
+4. Optionally note what the other columns mean.
+5. Pick provider and model (LangCC by default; same saved-key card as New run) and click **Study a few rows**. The helper sees 3–8 short sample rows only — not the whole sheet — plus the shared company notes so it uses maids.cc names (Enchanters, CC, MV, PTC). It will not put prices or headcounts from those notes into the prompt. If a short column is already clear (for example nationality values in the sample), it will not ask about it.
+6. Answer up to three follow-up questions if they appear. Or click **Deep analysis** to keep answering rounds of questions until the helper has about 80–90% of what it needs for a detailed, multi-condition prompt.
+7. **Write the prompt**. You get two parts: **instructions** (task, IF/THEN rules using short columns like `{nationality}`, and an explicit flat JSON object — saved to the shared library) and **input data** (the conversation column only, kept on this session/run). The helper will not use `{row_json}`, will not echo input ids, and will not put the conversation mid-instructions. Company notes stay with the helper; they are not pasted into the prompt unless you copy them in.
+8. **Test a random row** (or pick a row / test the same row again). The answer uses the same JSON/text viewer as Review.
+9. Tweak the description and rewrite if needed. When it looks right, **Use … on a full run** takes you back to New run with that prompt already selected.
+
+### 2c. Catalogue
+
+**Catalogue** lists prompts you own, prompts shared with you, and everyone-visible prompts. Search by name or username, page through results, or ask the helper to find one — it only sees prompts you can use.
+
+Open a prompt to read it, edit it, clone it, or talk to the helper. The helper keeps that conversation. A clone **copies** the chat and then runs on its own — editing a copy never touches the original or anyone else's history.
+
+If you can edit, the Instructions and Input data boxes are live: change them and **Save changes** appears. Every save keeps the previous text under **Earlier versions**, where you can preview or restore it. When the helper proposes an edit you see a diff of exactly which lines move before you **Apply** or **Reject** it — a shared prompt never changes on trust alone.
+
+If you cannot edit, the helper says so: clone the prompt or request edit access from the owner. Only the creator can delete a prompt; deleting also removes its conversation.
+
+Each accepted fix stores a short summary of what changed and what the prompt is for, so the next incremental fix does not undo an earlier one.
+
+On **New run**, search the same list, or click **Last used**.
 
 ### 3. Choose a provider and run
 
@@ -169,7 +205,7 @@ Steps 3 and 4: pick a provider and model, then **Run**. Fill or **Save key** if 
 | Gemini | Yes | Known Gemini ids |
 | Ollama | No | List from the configured Ollama host |
 
-**Test one row** is the cheap check. On the test result you can also drop a note + verdict and click **Improve prompt from this test** to run the same Analyst → Editor → Critic pass on that single example, then save the result as a new shared version. **Run** fans the prompt out across the sheet (concurrency is capped by the server). When it finishes you land on **Results**.
+A run stops if a `{field}` in the prompt is not a column in your sheet and is not mapped — the message names the fields. Nothing is substituted blank silently. **Test one row** is the cheap check. On the test result you can also drop a note + verdict and click **Improve prompt from this test** to run the same Analyst → Editor → Critic pass on that single example, then save the result as a new shared version. **Run** fans the prompt out across the sheet (concurrency is capped by the server). **Stop the run** halts dispatch — rows already sent finish, the finished rows stay on the session, and nothing is archived. When a run finishes you land on **Results**.
 
 Each finished batch is saved only under your account: input CSV, output CSV, results JSON, the prompt used, and an empty review file.
 
@@ -205,12 +241,17 @@ The prompt used for the run is editable in the same page.
 
 When you have a few notes:
 
-1. Put your LLM key in the Review key card (same fields as New run).
+1. Nothing to do if you already saved a key in Settings — the fixer picks it up. Paste one in the Review key card only for a different key.
 2. Click **Improve prompt from all N notes**. This is a single batched pass: every reviewed row's note + verdict on the run is grouped into one Analyst → Editor → Critic run — not one row at a time.
-3. Three agents run on your key: Analyst (clusters failures) → Editor (surgical edits only) → Critic (rejects overfitting and contradictions).
+3. Three agents run on your key: Analyst (clusters failures) → Editor (surgical edits only) → Critic (rejects overfitting and contradictions). A stage that answers in prose instead of JSON is asked once more; if the Critic still fails, the Editor's version is offered with a warning rather than the whole pass being thrown away. Very large batches send the most informative notes (wrong and unclear first) and tell you how many were used.
 4. A diff appears. **Save proposed as shared version**, or **Discard** (which is recorded in the fix history).
 
-That writes a new file into the shared library, e.g. `agent_eval.v2`. Other people can load it. Your notes stay on your run.
+That writes a new file into the version library, e.g. `agent_eval.v2`, **and** publishes the text into the catalogue so other people can actually load it:
+
+- If you can edit the prompt the run used, its catalogue entry is updated in place and the old text is kept under Earlier versions.
+- If you only have view access, you get your own catalogue copy carrying the same reach as the prompt it came from.
+
+If the pass ends with the prompt unchanged, saving is refused rather than creating an identical `.v2`. Your notes stay on your run.
 
 You can run the same improvement from a single **Test** row + note when you do not have a full reviewed batch (see step 3).
 
@@ -226,7 +267,15 @@ Every improvement run — from Review or from a Test row — is recorded in a sh
 
 History is shared like the prompts themselves, but each record keeps the username of whoever ran the fix. It is still gated behind login.
 
-### 8. History
+### 8. Company info
+
+**Company** (`/context`) is a shared page — like the prompt library — for short notes about maids.cc. The prompt builder (study rows, questions, write prompt) and the prompt fixer (Analyst, Editor, Critic) read this on every helper call so they stay on the internal vocabulary and service lines.
+
+Anyone logged in can view and edit it. The file lives at `context/maids_cc.md`. The **Volatile facts** section is intentionally not authoritative: helpers are told never to quote or invent prices, salaries, benefit amounts, employee/client counts, ratings, branch counts, or nationality availability from it. If a figure is needed, the generated prompt should say it must be pulled from the owning source.
+
+You can copy the notes into a prompt yourself. They are not forced into every prompt’s text.
+
+### 9. History
 
 **History** lists only your runs. Search by name, prompt, provider, or date. **Open** loads that batch back into Results and Review.
 
@@ -251,6 +300,7 @@ These fire when you are not typing in a text box.
 | Thing | Who sees it |
 |---|---|
 | Prompts in `prompts/` | Every logged-in user |
+| Company notes in `context/maids_cc.md` | Every logged-in user |
 | New prompt versions from the fixer | Every logged-in user |
 | Prompt fix history in `prompts/history/` | Every logged-in user (records who ran each fix) |
 | Your runs, notes, usage | Only you |
@@ -268,17 +318,20 @@ engine.py              Provider calls, JSON flatten, row processing
 auth.py                Token hash + login cookie
 storage.py             Per-user runs, usage, shared prompts, prompt-fix history
 prompt_fixer.py        Analyst / editor / critic
+prompt_builder.py      Guided analysis-prompt helper (sample → plan → prompt)
+company_context.py     Load/save shared maids.cc notes; prepended to helper/fixer calls
 manage_users.py        add / list / revoke / reset-token (shares auth.py with the Admin UI)
 templates/             Pages (incl. prompt_history.html, _components.html macros)
 static/                CSS and JS (incl. ai-output.js viewer, test.js)
 prompts/               Shared prompt library (*.txt)
 prompts/history/       Shared prompt-fix history (<family>.jsonl)
+context/maids_cc.md    Shared company notes (editable at /context)
 data/users/<name>/     Private runs, usage.jsonl, encrypted secrets.json
 users.json             Hashed tokens — do not commit
 .env                   SESSION_SECRET, ADMIN_USERNAME, ADMIN_TOKEN, optional SECRET_FERNET — do not commit
 ```
 
-A run folder contains `input.csv`, `output.csv`, `results.json`, `metadata.json`, `prompt.txt`, and `review.json`.
+A run folder contains `input.csv`, `output.csv`, `results.json`, `metadata.json`, `prompt.txt` (instructions), `input_template.txt` (optional input-data section), and `review.json`. `metadata.json` also stores `input_template` so reopening a run restores both boxes.
 
 Each `prompts/history/<family>.jsonl` record holds: `fix_id`, timestamp, `user`, `source_name` + resulting `new_version`, `flow` (`review` or `test`), `run_id`, the notes it was based on, the Analyst `patterns`, the editor `change_summary`, the `diff`, the full `old_prompt`/`new_prompt`, and `status` (`proposed` / `accepted` / `discarded` / `superseded`).
 
@@ -306,6 +359,7 @@ Copy `.env.example` to `.env`.
 - Saved LLM keys live only under `data/users/<you>/secrets.json`, encrypted. Do not commit `data/` or paste keys into Slack. Changing `SESSION_SECRET` / `SECRET_FERNET` makes previously saved keys unreadable.
 - Extra-user tokens are stored as `sha256:...`. There is no way to recover a lost extra-user token — add a new user or replace the hash by creating the user again after a revoke. The env admin token is always the value in `.env`.
 - Downloads and prompt APIs are session-gated. Direct URLs without a cookie return `401`.
+- Saved LLM keys are never rendered into a page or returned to the browser. `GET /credentials` reports only whether a key exists; every route that needs the value reads it server-side.
 - This is an internal tool. Put it behind HTTPS and a trusted network if more than one person can reach the host.
 
 ---
@@ -315,5 +369,5 @@ Copy `.env.example` to `.env`.
 1. `pip install -r requirements.txt` and set `SESSION_SECRET`, `ADMIN_USERNAME`, and `ADMIN_TOKEN`.
 2. Log in as the env admin (or `python3 manage_users.py add ali` for an extra account) and store the token in your password manager as the site login.
 3. Run the app, log in, paste your LangCC or OpenAI key on New run, and click **Save key** (or leave it to your password manager).
-4. Upload a small CSV, load `agent_eval` or another shared prompt, test one row, then run.
+4. Upload a small CSV or Excel file, load `agent_eval` (or use **Build prompt**), test one row, then run.
 5. Review five rows, leave notes, run **Improve prompt from notes**, and save `agent_eval.v2` if the diff is honest.

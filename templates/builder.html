@@ -1,0 +1,252 @@
+{% extends "base.html" %}
+{% from "_components.html" import ai_output %}
+{% block title %}Build prompt · Maids Evals{% endblock %}
+{% block body %}
+  <div class="wizard-page">
+  <h1>Build an analysis prompt</h1>
+  <p class="lede">Describe what you want to find out. We look at a few rows, draft a prompt, and test it on one row. When it looks right, it is saved to the shared library and ready for a full run. The helper already reads the team’s <a href="/context">company info</a> so it uses the right names — that text is not pasted into the prompt unless you copy it in yourself.</p>
+
+  <div class="wizard">
+    <section class="step{% if has_csv %} done{% endif %}" id="step-data">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">1</span>
+          <h2>Your spreadsheet</h2>
+        </div>
+        <span class="tag {% if has_csv %}ok{% else %}warn{% endif %} step-tag">{% if has_csv %}{{ total_rows }} rows · {{ csv_cols|length }} columns{% else %}Waiting{% endif %}</span>
+      </div>
+      <p class="empty-hint">{% if has_csv %}This file is already loaded. Replace it if you meant a different one.{% else %}Upload a CSV or Excel file. We only look at a few rows while building the prompt.{% endif %}</p>
+      {% if upload_note %}<p class="slot-msg">{{ upload_note }}</p>{% endif %}
+      <form action="/upload" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="next" value="/builder" />
+        <label for="builder-file">Spreadsheet</label>
+        <input id="builder-file" type="file" name="csv_file" accept=".csv,.xlsx,.xls" {% if not has_csv %}required{% endif %} />
+        <div class="actions">
+          <button type="submit"{% if has_csv %} class="secondary"{% endif %}>{% if has_csv %}Replace file{% else %}Upload{% endif %}</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="step{% if builder.goal %} done{% endif %}" id="step-goal">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">2</span>
+          <h2>What to find out</h2>
+        </div>
+      </div>
+      <p class="empty-hint">In plain language. Example: “Did the agent solve the customer’s problem, and who caused any leftover issue?”</p>
+      <label for="builder-goal">What do you want to find out about each row?</label>
+      <textarea id="builder-goal" style="min-height:110px;">{{ builder.goal }}</textarea>
+    </section>
+
+    <section class="step{% if builder.content_col %} done{% endif %}" id="step-column">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">3</span>
+          <h2>Main content</h2>
+        </div>
+        <span class="tag {% if builder.content_col %}ok{% else %}warn{% endif %} step-tag" id="content-tag">{% if builder.content_col %}{{ builder.content_col }}{% else %}Pick a column{% endif %}</span>
+      </div>
+      <p class="empty-hint">Click the column that holds the conversation. Other short columns (nationality, status) can be used later as conditions in the instructions.</p>
+      <div class="chips" id="column-chips">
+        {% if csv_cols %}
+          {% for col in csv_cols %}
+          <button type="button" class="chip{% if col == builder.content_col %} is-picked{% endif %}" data-col="{{ col }}">{{ col }}</button>
+          {% endfor %}
+        {% else %}
+          <span class="chip-empty">Upload a file in step 1 first.</span>
+        {% endif %}
+      </div>
+      <input type="hidden" id="content-col" value="{{ builder.content_col }}" />
+    </section>
+
+    <section class="step" id="step-meanings">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">4</span>
+          <h2>Column notes</h2>
+        </div>
+        <span class="tag step-tag">Optional</span>
+      </div>
+      <p class="empty-hint">If a column name is unclear, say what it holds. Example: “STATUS is whether the chat is still open.”</p>
+      <label for="builder-meanings">What do the other columns mean?</label>
+      <textarea id="builder-meanings" style="min-height:90px;" placeholder="Optional">{{ builder.meanings }}</textarea>
+    </section>
+
+    <section class="step" id="step-helper">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">5</span>
+          <h2>Helper model</h2>
+        </div>
+        <span class="tag step-tag" id="provider-tag">{{ provider }}</span>
+      </div>
+      <p class="empty-hint">The helper uses your account’s provider and key. Default is LangCC. We send only a few short sample rows, plus the shared company notes.</p>
+      <label for="provider-select">Provider</label>
+      <select id="provider-select">
+        <option value="langcc" {% if provider == 'langcc' %}selected{% endif %}>LangCC</option>
+        <option value="openai" {% if provider == 'openai' %}selected{% endif %}>OpenAI</option>
+        <option value="gemini" {% if provider == 'gemini' %}selected{% endif %}>Gemini</option>
+        <option value="ollama" {% if provider == 'ollama' %}selected{% endif %}>Ollama</option>
+      </select>
+      <label for="model-input">Model</label>
+      <div id="model-slot" class="model-slot {% if provider in ['ollama', 'langcc'] %}is-list{% else %}is-text{% endif %}">
+        <div class="model-text">
+          <input type="text" id="model-input" value="{{ model }}" autocomplete="off" {% if provider in ['ollama', 'langcc'] %}disabled{% endif %} />
+        </div>
+        <div class="model-list">
+          <div class="model-list-controls">
+            <input type="text" id="model-search" placeholder="Search models…" autocomplete="off" aria-label="Search models" />
+            <button type="button" id="model-refresh" class="secondary">Refresh</button>
+          </div>
+          <select id="model-select" {% if provider not in ['ollama', 'langcc'] %}disabled{% endif %}><option value="">Loading…</option></select>
+        </div>
+      </div>
+      <p class="slot-msg error" id="model-error"></p>
+      <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on">
+        <label for="llm-username">Key name</label>
+        <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
+        <label for="llm-password">API key</label>
+        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Required for OpenAI, LangCC, Gemini{% endif %}" value="" />
+        <div class="actions tight">
+          <button type="button" id="key-save" class="secondary">Save key</button>
+          <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>
+        </div>
+        <p class="slot-msg" id="key-status">{% if saved_key_exists %}Saved for your account only.{% else %}Optional: save to this account.{% endif %}</p>
+      </form>
+      <div class="actions">
+        <button type="button" id="discover-button" {% if not has_csv %}disabled{% endif %}>Study a few rows</button>
+        <button type="button" id="deep-button" class="secondary" {% if not has_csv %}disabled{% endif %}>Deep analysis</button>
+      </div>
+      <p class="slot-msg" id="discover-status"></p>
+      <div class="plan-box" id="plan-box">
+        <p class="small" id="plan-approach">{% if builder.plan and builder.plan.approach %}{{ builder.plan.approach }}{% endif %}</p>
+        <ul class="guess-list" id="plan-guesses">
+          {% for g in builder.plan.column_guesses or [] %}
+          <li><strong>{{ g.column }}</strong> — {{ g.likely }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </section>
+
+    <section class="step" id="step-questions">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">6</span>
+          <h2>A few questions</h2>
+        </div>
+      </div>
+      <p class="empty-hint" id="questions-hint">Usually at most three, and only if a column or rule is unclear. Deep analysis keeps asking until it has enough for a detailed prompt.</p>
+      <div class="coverage-row" id="coverage-row" hidden>
+        <div class="coverage-bar"><span id="coverage-fill"></span></div>
+        <p class="small" id="coverage-label"></p>
+      </div>
+      <div class="q-slots" id="question-slots">
+        {% for q in builder.questions or [] %}
+        <div class="q-slot">
+          <label class="q-label">{{ q.text }}</label>
+          <input type="text" class="q-answer" data-qid="{{ q.id }}" value="{{ builder.answers.get(q.id, '') }}" />
+        </div>
+        {% endfor %}
+      </div>
+      <div class="actions">
+        <button type="button" id="deep-next-button" class="secondary" hidden>Answer and keep going</button>
+        <button type="button" id="availability-button" class="secondary" {% if not has_csv %}disabled{% endif %}>Check data availability</button>
+        <button type="button" id="generate-button" class="secondary" {% if not builder.plan %}disabled{% endif %}>Write the prompt</button>
+      </div>
+      <p class="slot-msg" id="questions-status"></p>
+      <p class="slot-msg" id="generate-status">{% if builder.prompt_name %}Draft ready as {{ builder.prompt_name }}{% endif %}</p>
+    </section>
+
+    <section class="step{% if builder.prompt %} done{% endif %}" id="step-prompt">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">7</span>
+          <h2>Your prompt</h2>
+        </div>
+        <span class="tag {% if builder.prompt_name %}ok{% else %}warn{% endif %} step-tag" id="prompt-name-tag">{{ builder.prompt_name or "Not written yet" }}</span>
+      </div>
+      <p class="empty-hint" id="prompt-summary">{{ builder.summary or "Write the prompt when you are ready. It is not saved until you put it in the catalogue, and it is not tested until you ask." }}</p>
+      <label for="builder-prompt">Instructions</label>
+      <p class="empty-hint">Rules and conditions. Short columns can sit here as placeholders, like “The maid nationality is: {nationality}” then If Filipina / If Kenyan.</p>
+      <textarea id="builder-prompt" readonly class="instructions-box">{{ builder.prompt }}</textarea>
+      <label for="builder-input">Input data</label>
+      <p class="empty-hint">The conversation (the column you clicked) is added at the end when you test or run. It does not go in the middle of the instructions.</p>
+      <textarea id="builder-input" readonly class="input-data-box">{{ builder.input_template }}</textarea>
+      <div class="actions tight">
+        <button type="button" id="copy-company" class="ghost">Copy company info</button>
+        <a class="btn ghost" href="/context">Edit company info</a>
+      </div>
+      <p class="slot-msg" id="copy-company-status">Optional. The helper already has these notes; copy only if you want them in this prompt.</p>
+    </section>
+
+    <section class="step" id="step-test">
+      <div class="step-head">
+        <div class="step-title">
+          <span class="step-num">8</span>
+          <h2>Try one row</h2>
+        </div>
+        <span class="tag step-tag" id="test-tag">{% if builder_test.row_idx is defined %}Row {{ builder_test.row_idx + 1 }}{% else %}Not tested{% endif %}</span>
+      </div>
+      <p class="empty-hint">We run a single random row so you can see the answer before a full batch.</p>
+      <div class="actions">
+        <button type="button" id="test-button" {% if not builder.prompt %}disabled{% endif %}>Test a random row</button>
+        <button type="button" id="retest-button" class="secondary" {% if last_test_row_idx is none %}disabled{% endif %}>Test same row again</button>
+        <label class="inline-pick" for="row-pick">Or pick a row</label>
+        <input type="number" id="row-pick" min="1" max="{{ total_rows or 1 }}" value="{{ (last_test_row_idx + 1) if last_test_row_idx is not none else 1 }}" {% if not has_csv %}disabled{% endif %} />
+        <button type="button" id="pick-test-button" class="secondary" {% if not builder.prompt %}disabled{% endif %}>Test this row</button>
+      </div>
+      <p class="slot-msg" id="test-status"></p>
+      <div class="preview-box" id="test-preview">
+        {% if builder_test.preview %}
+          {% for k, v in builder_test.preview.items() %}
+          <div class="col-block"><div class="col-name">{{ k }}</div><div class="col-val">{{ v }}</div></div>
+          {% endfor %}
+        {% endif %}
+      </div>
+      <div id="test-output-host">
+        {% if builder_test.output is defined %}
+          {{ ai_output(builder_test.output or '', mode='inline', label='Model response') }}
+        {% endif %}
+      </div>
+      <label for="fix-note">Fix the prompt</label>
+      <p class="empty-hint">Say what is wrong or missing. This only updates the prompt — it does not change your spreadsheet.</p>
+      <textarea id="fix-note" style="min-height:80px;" placeholder="e.g. Be stricter about PTC vs live-in. Add a rule for empty transcripts."></textarea>
+      <div class="actions tight">
+        <button type="button" id="fix-button" class="secondary" {% if not builder.prompt %}disabled{% endif %}>Fix the prompt</button>
+        <button type="button" id="save-catalogue" class="secondary" {% if not builder.prompt %}disabled{% endif %}>Save to catalogue (only me)</button>
+        <a class="btn" href="/" id="go-run">{% if builder.prompt_name %}Use {{ builder.prompt_name }} on a full run{% else %}Go to New run{% endif %}</a>
+      </div>
+      <p class="slot-msg" id="fix-status"></p>
+      <p class="slot-msg" id="save-status"></p>
+    </section>
+  </div>
+  </div>
+  <div class="overlay" id="avail-overlay">
+    <div class="modal wide">
+      <h3>Data availability</h3>
+      <p class="score-line">Score <strong id="avail-score">—</strong> / 100</p>
+      <p class="small" id="avail-summary"></p>
+      <ul class="guess-list" id="avail-have"></ul>
+      <ul class="guess-list" id="avail-missing"></ul>
+      <div class="q-slots" id="avail-questions"></div>
+      <p class="slot-msg" id="avail-status"></p>
+      <div class="actions">
+        <button type="button" id="avail-close" class="secondary">Close</button>
+        <button type="button" id="avail-build">Build the prompt</button>
+      </div>
+    </div>
+  </div>
+{% endblock %}
+{% block scripts %}
+<script>
+window.MAIDS_BUILDER = {
+  sidToken: {{ sid_token|tojson }},
+  lastTestRow: {{ last_test_row_idx if last_test_row_idx is not none else 'null' }},
+  totalRows: {{ total_rows }},
+  hasFile: {{ has_csv|tojson }}
+};
+</script>
+<script src="/static/ai-output.js"></script>
+<script src="/static/builder.js"></script>
+{% endblock %}

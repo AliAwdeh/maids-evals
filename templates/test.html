@@ -31,6 +31,7 @@
     <input type="hidden" name="provider" value="{{ provider }}" />
     <input type="hidden" name="model" value="{{ model }}" />
     <input type="hidden" name="prompt_template" value="{{ prompt_template }}" />
+    <input type="hidden" name="input_template" value="{{ input_template }}" />
     {% if json_mode %}<input type="hidden" name="json_mode" value="1" />{% endif %}
     {% for col in selected_cols %}<input type="hidden" name="test_cols" value="{{ col }}" />{% endfor %}
     <input type="hidden" name="api_key" id="again-api-key" value="" />
@@ -59,7 +60,7 @@
         <label for="llm-username">Key name</label>
         <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
         <label for="llm-password">API key</label>
-        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="Needed only to improve the prompt" value="{{ saved_api_key }}" />
+        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Needed only to improve the prompt{% endif %}" value="" />
         <div class="actions tight">
           <button type="button" id="key-save" class="secondary">Save key</button>
           <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>

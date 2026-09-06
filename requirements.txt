@@ -9,3 +9,4 @@ jinja2
 python-dotenv
 itsdangerous
 cryptography
+openpyxl

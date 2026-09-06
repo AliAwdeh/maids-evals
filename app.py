@@ -30,21 +30,36 @@ from engine import (
     _row_is_empty_dict,
     _row_is_empty_series,
     _normalize_value,
-    _prompt_has_placeholder,
     _build_output_dataframe,
+    compose_model_input,
     call_provider,
+    mapping_gaps,
+    required_placeholders,
     estimate_tokens,
     fetch_ollama_models,
     fetch_openai_compatible_models,
     filter_results_by_json,
+    load_tabular_file,
     parse_model_params,
     process_row,
     provider_requires_key,
-    render_prompt,
     result_to_base_row,
+    row_input_error,
     try_parse_json,
 )
+import catalogue
+import company_context
 from prompt_fixer import build_example, build_examples, improve_prompt, unified_diff
+from prompt_builder import (
+    answers_from_form,
+    catalogue_chat_turn,
+    check_availability,
+    discover_plan,
+    find_prompts_turn,
+    generate_prompt,
+    sample_rows,
+    MAX_DEEP_TOTAL_QUESTIONS,
+)
 
 load_dotenv()
 
@@ -72,6 +87,23 @@ DATA_EXACT = {
     "/test/accept",
     "/test/discard",
     "/prompts/raw",
+    "/builder/discover",
+    "/builder/deep-next",
+    "/builder/availability",
+    "/builder/generate",
+    "/builder/test",
+    "/builder/fix",
+    "/builder/save",
+    "/context/save",
+    "/context/text",
+    "/users/search",
+    "/catalogue/create",
+    "/catalogue/search",
+    "/catalogue/find",
+    "/mapping/save",
+    "/settings/save",
+    "/settings/keys",
+    "/settings/keys/forget",
 }
 
 
@@ -171,9 +203,11 @@ def is_data_request(request: Request) -> bool:
     path = request.url.path
     if path in DATA_EXACT:
         return True
+    if path.startswith("/catalogue/") and path != "/catalogue":
+        return True
     if "/download" in path:
         return True
-    if path == "/run":
+    if path == "/run" or path == "/run/cancel":
         return True
     accept = request.headers.get("accept", "")
     if "application/json" in accept and "text/html" not in accept:
@@ -234,10 +268,33 @@ def pretty_created(meta: Dict[str, Any]) -> str:
         return created
 
 
-def saved_key_for(user: str, provider: str) -> str:
+def saved_key_for(user: str, provider: str, key_id: str = "") -> str:
     if not provider_requires_key(provider):
         return ""
-    return storage.load_user_secret(user, provider) or ""
+    return storage.resolve_user_key(user, provider, key_id) or ""
+
+
+def resolve_ai(
+    request: Request,
+    tool: str,
+    provider: str = "",
+    model: str = "",
+    api_key: str = "",
+    key_id: str = "",
+) -> tuple[str, str, str]:
+    defaults = storage.tool_defaults(request.state.user, tool)
+    name = (provider or defaults.get("provider") or "langcc").strip().lower()
+    chosen_model = (model or defaults.get("model") or "").strip()
+    key = (api_key or "").strip()
+    if not key:
+        key = saved_key_for(request.state.user, name, key_id or defaults.get("key_id") or "")
+    return name, chosen_model, key
+
+
+def settings_payload(user: str) -> Dict[str, Any]:
+    settings = storage.load_user_settings(user)
+    keys = storage.list_named_keys(user)
+    return {"settings": settings, "keys": keys}
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -397,8 +454,13 @@ def home(request: Request):
         "seed": "",
         "reasoning_effort": "",
     }
-    current_provider = sess.get("provider", "langcc")
-    saved_key = saved_key_for(request.state.user, current_provider)
+    user_settings = storage.load_user_settings(request.state.user)
+    runner = storage.tool_defaults(request.state.user, "runner")
+    current_provider = sess.get("provider") or runner.get("provider") or "langcc"
+    current_model = sess.get("model") or runner.get("model") or "gpt-5-mini"
+    current_key_id = sess.get("key_id") or runner.get("key_id") or user_settings.get("default_key_id") or ""
+    saved_key = saved_key_for(request.state.user, current_provider, current_key_id)
+    named_keys = storage.list_named_keys(request.state.user)
     resp = render(
         request,
         "home.html",
@@ -408,12 +470,24 @@ def home(request: Request):
             "has_csv": has_csv,
             "total_rows": total_rows,
             "csv_cols": sess.get("csv_cols") or [],
-            "prompts": storage.list_prompts(),
+            "prompts": catalogue.list_visible(request.state.user),
+            "prompt_id": sess.get("prompt_id", ""),
             "prompt_name": sess.get("prompt_name", ""),
+            "last_prompt_id": user_settings.get("last_prompt_id") or "",
+            "last_prompt_name": user_settings.get("last_prompt_name") or "",
+            "named_keys": named_keys,
+            "key_id": current_key_id,
+            "column_map": sess.get("column_map") or {},
+            "mapping_needed": mapping_gaps(
+                required_placeholders(sess.get("prompt_template") or "", sess.get("input_template") or ""),
+                sess.get("csv_cols") or [],
+                sess.get("column_map") or {},
+            ),
             "prompt_template": sess.get("prompt_template", "Given this row:\n{row_json}\n\nReturn JSON with keys: status, note."),
+            "input_template": sess.get("input_template", ""),
             "run_name": sess.get("run_name", ""),
             "provider": current_provider,
-            "model": sess.get("model", "gpt-5-mini"),
+            "model": current_model,
             "max_workers": sess.get("max_workers", 16),
             "workers_cap": MAX_REQUEST_WORKERS_CAP,
             "json_mode": sess.get("json_mode", True),
@@ -425,8 +499,8 @@ def home(request: Request):
             "recent_runs": recent,
             "sid_token": work_serializer.dumps(sid),
             "divide_default": min(total_rows, 100) if total_rows else 1,
-            "saved_api_key": saved_key,
             "saved_key_exists": bool(saved_key),
+            "upload_note": sess.get("upload_note") or "",
         },
     )
     return attach_session(resp, request, sid)
@@ -441,8 +515,12 @@ def ollama_models():
 
 
 @app.post("/provider/models")
-async def provider_models(provider: str = Form(...), api_key: str = Form("")):
+async def provider_models(request: Request, provider: str = Form(...), api_key: str = Form("")):
     p = provider.lower().strip()
+    if not api_key.strip() and provider_requires_key(p):
+        # The page no longer holds the key, so fall back to the account's saved
+        # one; otherwise the model picker would break for everyone.
+        api_key = saved_key_for(request.state.user, p) or ""
     try:
         if p == "ollama":
             return {"models": fetch_ollama_models()}
@@ -501,6 +579,7 @@ async def save_session_state(
     provider: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
     prompt_template: Optional[str] = Form(None),
+    input_template: Optional[str] = Form(None),
     json_mode: Optional[str] = Form(None),
     max_workers: Optional[str] = Form(None),
     prompt_name: Optional[str] = Form(None),
@@ -522,6 +601,8 @@ async def save_session_state(
         sess["model"] = model
     if prompt_template is not None:
         sess["prompt_template"] = prompt_template
+    if input_template is not None:
+        sess["input_template"] = input_template
     if json_mode is not None:
         sess["json_mode"] = json_mode == "1"
     if max_workers is not None:
@@ -560,7 +641,11 @@ def get_credentials(request: Request, provider: str = ""):
     if name not in storage.KEY_PROVIDERS:
         return JSONResponse({"error": "unsupported provider"}, status_code=400)
     key = storage.load_user_secret(user, name) or ""
-    return JSONResponse({"provider": name, "api_key": key, "saved": bool(key), "needed": True})
+    # Only whether a key exists. The value used to be returned here and written
+    # straight into a form field, which put the decrypted provider key in the
+    # DOM of every page and in every request the page made afterwards. Routes
+    # that need it read it server-side.
+    return JSONResponse({"provider": name, "api_key": "", "saved": bool(key), "needed": True})
 
 
 @app.post("/credentials")
@@ -588,16 +673,46 @@ async def forget_credentials(request: Request, provider: str = Form(...)):
 
 
 @app.get("/prompts/get")
-def get_prompt(request: Request, name: str):
+def get_prompt(request: Request, name: str = "", id: str = ""):
     sid, sess = get_work_session(request)
+    user = request.state.user
+    prompt_id = (id or name or "").strip()
     try:
-        content = storage.load_prompt(name)
-        safe_name = storage._safe_prompt_name(name)
-    except Exception as e:
-        return PlainTextResponse(f"Failed to load prompt: {e}", status_code=400)
-    sess["prompt_name"] = safe_name
-    sess["prompt_template"] = content
-    resp = JSONResponse({"name": safe_name, "content": content})
+        item = catalogue.get_visible(prompt_id, user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception:
+        try:
+            content = storage.load_prompt(name)
+            item = {
+                "id": "",
+                "name": storage._safe_prompt_name(name),
+                "prompt": content,
+                "input_template": "",
+                "required_inputs": required_placeholders(content, ""),
+            }
+        except Exception as e:
+            return PlainTextResponse(f"Failed to load prompt: {e}", status_code=400)
+    sess["prompt_id"] = item.get("id") or ""
+    sess["prompt_name"] = item.get("name") or ""
+    sess["prompt_template"] = item.get("prompt") or ""
+    sess["input_template"] = item.get("input_template") or ""
+    if item.get("id"):
+        storage.remember_last_prompt(user, item.get("id") or "", item.get("name") or "")
+    gaps = mapping_gaps(
+        item.get("required_inputs") or required_placeholders(item.get("prompt") or "", item.get("input_template") or ""),
+        sess.get("csv_cols") or [],
+        sess.get("column_map") or {},
+    )
+    resp = JSONResponse({
+        "id": item.get("id") or "",
+        "name": item.get("name") or "",
+        "content": item.get("prompt") or "",
+        "input_template": item.get("input_template") or "",
+        "required_inputs": item.get("required_inputs") or [],
+        "mapping_needed": gaps,
+        "columns": sess.get("csv_cols") or [],
+    })
     return attach_session(resp, request, sid)
 
 
@@ -614,24 +729,40 @@ async def save_prompt(request: Request, prompt_name: str = Form(...), prompt_con
     return attach_session(resp, request, sid)
 
 
-@app.post("/upload")
-async def upload(request: Request, csv_file: UploadFile = File(...)):
-    sid, sess = get_work_session(request)
-    raw = await csv_file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(raw))
-    except Exception as e:
-        return PlainTextResponse(f"Failed to parse CSV: {e}", status_code=400)
-    df = df.loc[~df.apply(_row_is_empty_series, axis=1)].reset_index(drop=True)
-    df = df.map(_normalize_value) if hasattr(df, "map") else df.applymap(_normalize_value)
-    if df.empty:
-        return PlainTextResponse("Uploaded CSV has no non-empty rows.", status_code=400)
+def _store_uploaded_frame(sess: Dict[str, Any], df: pd.DataFrame, meta: Optional[Dict[str, Any]] = None) -> None:
     sess["csv_df"] = df
     sess["csv_cols"] = list(df.columns)
     sess["rows"] = df.to_dict(orient="records")
+    sess["upload_note"] = (meta or {}).get("note") or ""
+    sess["upload_source"] = (meta or {}).get("source") or "csv"
+    sess["upload_sheet"] = (meta or {}).get("used_sheet") or ""
     for key in ("results", "detected_json_keys", "progress", "current_run_id", "last_test_row_idx"):
         sess.pop(key, None)
-    resp = RedirectResponse(url="/", status_code=303)
+
+
+def _safe_next_path(next_path: Optional[str]) -> str:
+    allowed = {"/", "/builder"}
+    path = (next_path or "/").strip() or "/"
+    return path if path in allowed else "/"
+
+
+@app.post("/upload")
+async def upload(
+    request: Request,
+    csv_file: UploadFile = File(...),
+    next: Optional[str] = Form(None),
+):
+    sid, sess = get_work_session(request)
+    raw = await csv_file.read()
+    filename = csv_file.filename or ""
+    try:
+        df, meta = load_tabular_file(raw, filename)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(f"Could not read this file: {e}", status_code=400)
+    _store_uploaded_frame(sess, df, meta)
+    resp = RedirectResponse(url=_safe_next_path(next), status_code=303)
     return attach_session(resp, request, sid)
 
 
@@ -663,7 +794,9 @@ async def run(
     provider: str = Form(...),
     model: Optional[str] = Form(None),
     api_key: str = Form(""),
+    key_id: str = Form(""),
     prompt_template: str = Form(...),
+    input_template: str = Form(""),
     json_mode: Optional[str] = Form(None),
     max_workers: str = Form("16"),
     send_model_params: Optional[str] = Form(None),
@@ -688,8 +821,9 @@ async def run(
     if not rows:
         return PlainTextResponse("No usable rows in CSV after dropping empty rows.", status_code=400)
     csv_cols = sess["csv_cols"]
-    if not _prompt_has_placeholder(prompt_template, ["row_json"] + csv_cols):
-        return PlainTextResponse("Prompt must include at least one column placeholder or {row_json}.", status_code=400)
+    missing_input = row_input_error(prompt_template, input_template, csv_cols, sess.get("column_map") or {})
+    if missing_input:
+        return PlainTextResponse(missing_input, status_code=400)
     try:
         requested_workers = int(max_workers)
     except Exception:
@@ -701,6 +835,7 @@ async def run(
     sess["run_name"] = run_name
     sess["model"] = model
     sess["prompt_template"] = prompt_template
+    sess["input_template"] = input_template or ""
     sess["json_mode"] = json_mode == "1"
     sess["max_workers"] = requested_workers
     sess["send_model_params"] = send_model_params == "1"
@@ -714,8 +849,11 @@ async def run(
         "seed": seed or "",
         "reasoning_effort": reasoning_effort or "",
     }
+    if not api_key.strip():
+        _p, _m, api_key = resolve_ai(request, "runner", provider=provider, model=model or "", api_key=api_key, key_id=key_id)
+        sess["key_id"] = key_id
     if provider_requires_key(provider) and not api_key.strip():
-        return PlainTextResponse("API key is required for OpenAI/LangCC/Gemini.", status_code=400)
+        return PlainTextResponse("API key is required for OpenAI/LangCC/Gemini. Save one in Settings.", status_code=400)
 
     is_json_mode = json_mode == "1"
     model_params = parse_model_params(
@@ -723,11 +861,18 @@ async def run(
         presence_penalty, frequency_penalty, seed, reasoning_effort,
     )
     sess["progress"] = {"status": "running", "done": 0, "sent": 0, "total": len(rows), "error": ""}
+    # A batch is the expensive thing this tool does. Without a stop, a prompt
+    # aimed at the wrong column had to be ridden out or the server restarted.
+    sess["cancel"] = False
     key_once = api_key.strip()
+
+    def cancelled() -> bool:
+        return bool(sess.get("cancel"))
 
     def work_one(idx: int, row: Dict[str, Any]):
         out, row_keys, prompt, text = process_row(
-            row, csv_cols, prompt_template, provider, key_once, model, is_json_mode, model_params
+            row, csv_cols, prompt_template, provider, key_once, model, is_json_mode, model_params,
+            input_template, sess.get("column_map") or {},
         )
         storage.log_usage(user, provider, model, estimate_tokens(prompt), estimate_tokens(text))
         return idx, out, row_keys
@@ -741,7 +886,7 @@ async def run(
 
         def submit_next(exec_obj, q, fset, mapping):
             nonlocal sent_count
-            if not q:
+            if not q or cancelled():
                 return
             idx, r = q.popleft()
             fut = exec_obj.submit(work_one, idx, r)
@@ -791,11 +936,26 @@ async def run(
                         "llm_error": "",
                         "llm_latency_s": 0,
                     }
+            if cancelled():
+                # Keep whatever finished; a partial pass is still worth reading.
+                finished = [r for r in results if r is not None]
+                sess["results"] = finished
+                sess["detected_json_keys"] = sorted(detected_keys)
+                sess["progress"] = {
+                    "status": "cancelled",
+                    "done": done_count,
+                    "sent": sent_count,
+                    "total": len(rows),
+                    "error": "",
+                    "message": f"Stopped after {len(finished)} of {len(rows)} rows. Nothing was archived.",
+                }
+                return
             sess["results"] = results
             sess["detected_json_keys"] = sorted(detected_keys)
             run_id = storage.save_run_archive(
                 user, sess, rows, results, sorted(detected_keys),
                 provider, model, run_name, worker_count, model_params, prompt_template,
+                input_template,
             )
             sess["current_run_id"] = run_id
             sess["progress"] = {
@@ -820,6 +980,18 @@ async def run(
     return attach_session(resp, request, sid)
 
 
+@app.post("/run/cancel")
+async def cancel_run(request: Request, sid_token: Optional[str] = Form(None)):
+    sid, sess = resolve_work(request, sid_token)
+    progress = sess.get("progress") or {}
+    if progress.get("status") != "running":
+        return JSONResponse({"ok": True, "cancelled": False, "status": progress.get("status") or "idle"})
+    sess["cancel"] = True
+    # Rows already in flight finish; nothing further is dispatched.
+    resp = JSONResponse({"ok": True, "cancelled": True})
+    return attach_session(resp, request, sid)
+
+
 @app.post("/test", response_class=HTMLResponse)
 async def test_one(
     request: Request,
@@ -827,7 +999,9 @@ async def test_one(
     provider: str = Form(...),
     model: Optional[str] = Form(None),
     api_key: str = Form(""),
+    key_id: str = Form(""),
     prompt_template: str = Form(...),
+    input_template: str = Form(""),
     json_mode: Optional[str] = Form(None),
     test_cols: Optional[List[str]] = Form(None),
     test_row_idx: Optional[int] = Form(None),
@@ -857,6 +1031,7 @@ async def test_one(
         "provider": provider,
         "model": model,
         "prompt_template": prompt_template,
+        "input_template": input_template or "",
         "json_mode": json_mode == "1",
         "test_cols": selected_cols,
         "send_model_params": send_model_params == "1",
@@ -871,10 +1046,13 @@ async def test_one(
             "reasoning_effort": reasoning_effort or "",
         },
     })
-    if not _prompt_has_placeholder(prompt_template, ["row_json"] + csv_cols):
-        return PlainTextResponse("Prompt must include at least one column placeholder or {row_json}.", status_code=400)
+    missing_input = row_input_error(prompt_template, input_template, csv_cols, sess.get("column_map") or {})
+    if missing_input:
+        return PlainTextResponse(missing_input, status_code=400)
+    if not api_key.strip():
+        _p, _m, api_key = resolve_ai(request, "runner", provider=provider, model=model or "", api_key=api_key, key_id=key_id)
     if provider_requires_key(provider) and not api_key.strip():
-        return PlainTextResponse("API key is required for OpenAI/LangCC/Gemini.", status_code=400)
+        return PlainTextResponse("API key is required for OpenAI/LangCC/Gemini. Save one in Settings.", status_code=400)
     row_idx = test_row_idx if test_row_idx is not None and 0 <= test_row_idx < len(rows) else random.randrange(len(rows))
     sess["last_test_row_idx"] = row_idx
     row = rows[row_idx]
@@ -887,9 +1065,10 @@ async def test_one(
     latency = 0
     try:
         t0 = time.time()
-        text = call_provider(provider, api_key.strip(), model.strip(), render_prompt(prompt_template, row), json_mode == "1", model_params)
+        model_text = compose_model_input(prompt_template, row, input_template, column_map=sess.get("column_map") or {})
+        text = call_provider(provider, api_key.strip(), model.strip(), model_text, json_mode == "1", model_params)
         latency = round(time.time() - t0, 3)
-        storage.log_usage(request.state.user, provider, model, estimate_tokens(render_prompt(prompt_template, row)), estimate_tokens(text))
+        storage.log_usage(request.state.user, provider, model, estimate_tokens(model_text), estimate_tokens(text))
         raw_output = text or ""
     except Exception as e:
         err = str(e)
@@ -899,6 +1078,7 @@ async def test_one(
         "row": row,
         "output": raw_output,
         "prompt_template": prompt_template,
+        "input_template": input_template or "",
     }
     sess["test_fixer"] = _empty_test_fixer()
     test_saved_key = saved_key_for(request.state.user, provider)
@@ -919,9 +1099,9 @@ async def test_one(
             "row_json": json.dumps(row, ensure_ascii=False, indent=2),
             "raw_output": raw_output,
             "prompt_template": prompt_template,
+            "input_template": input_template or "",
             "json_mode": json_mode == "1",
             "sid_token": work_serializer.dumps(sid),
-            "saved_api_key": test_saved_key,
             "saved_key_exists": bool(test_saved_key),
             "accepted_name": sess.get("prompt_name") or "prompt",
         },
@@ -1095,6 +1275,7 @@ def download_saved_run(request: Request, run_id: str, kind: str):
         "results": "application/json",
         "metadata": "application/json",
         "prompt": "text/plain",
+        "input_template": "text/plain",
         "review": "application/json",
     }.get(kind, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=f"{run_id}-{path.name}")
@@ -1259,9 +1440,9 @@ def review(
             "verdict": note_rec.get("verdict", ""),
             "note": note_rec.get("note", ""),
             "prompt_draft": review_data.get("prompt_draft") or sess.get("prompt_template") or "",
+            "input_template": review_data.get("input_template") or sess.get("input_template") or "",
             "provider": review_provider,
             "model": sess.get("model", "gpt-5-mini"),
-            "saved_api_key": review_saved_key,
             "saved_key_exists": bool(review_saved_key),
             "proposed_prompt": fixer.get("proposed_prompt") or "",
             "diff_lines": fixer.get("diff") or [],
@@ -1311,8 +1492,12 @@ async def start_prompt_improve(
     sid, sess, run_id, review_data = _review_state(request)
     if not run_id:
         return PlainTextResponse("Open or finish a saved run first.", status_code=400)
+    if not api_key.strip():
+        _p, _m, api_key = resolve_ai(request, "fixer", provider=provider, model=model, api_key=api_key)
     if provider_requires_key(provider) and not api_key.strip():
-        return PlainTextResponse("API key is required to run the prompt fixer.", status_code=400)
+        return PlainTextResponse(
+            "No API key for this provider. Save one in Settings, or paste one here.", status_code=400
+        )
     results = sess.get("results") or []
     examples = build_examples(results, sess.get("csv_cols") or [], review_data.get("notes") or {})
     if not examples:
@@ -1333,7 +1518,18 @@ async def start_prompt_improve(
 
     def job():
         try:
-            result = improve_prompt(provider, key_once, model, prompt, examples)
+            prior = []
+            purpose = ""
+            if sess.get("prompt_id"):
+                ctx = catalogue.change_context(sess.get("prompt_id"))
+                prior = ctx.get("change_log") or []
+                purpose = ctx.get("purpose") or ""
+            result = improve_prompt(
+                provider, key_once, model, prompt, examples,
+                input_template=sess.get("input_template") or review_data.get("input_template") or "",
+                prior_changes=prior,
+                purpose=purpose,
+            )
             fix_id = ""
             try:
                 fix_id = storage.record_prompt_fix(
@@ -1361,6 +1557,9 @@ async def start_prompt_improve(
                 "error": "",
                 "fix_id": fix_id,
                 "source_name": source_name,
+                "unchanged": bool(result.get("unchanged")),
+                "warnings": result.get("warnings") or [],
+                "examples_used": result.get("examples_used") or 0,
             }
             storage.save_review(user, run_id, current)
         except Exception as e:
@@ -1387,13 +1586,62 @@ def prompt_improve_status(request: Request):
     sid, sess, run_id, review_data = _review_state(request)
     fixer = review_data.get("fixer") or {}
     status = fixer.get("status") or "idle"
+    done_message = (
+        "The fixer ran but did not change the prompt."
+        if fixer.get("unchanged")
+        else "Proposed update is ready."
+    )
     message = fixer.get("error") if status == "error" else {
         "idle": "Add notes, then run the fixer.",
         "running": "Analyst, editor, and critic are working…",
-        "done": "Proposed update is ready.",
+        "done": done_message,
     }.get(status, status)
-    resp = JSONResponse({"status": status, "message": message})
+    resp = JSONResponse({
+        "status": status,
+        "message": message,
+        "unchanged": bool(fixer.get("unchanged")),
+        "warnings": fixer.get("warnings") or [],
+    })
     return attach_session(resp, request, sid)
+
+
+def _publish_accepted_fix(
+    user: str,
+    sess: Dict[str, Any],
+    fixer: Dict[str, Any],
+    prompt_name: str,
+    proposed: str,
+    version_name: str,
+    origin: str,
+) -> Dict[str, Any]:
+    """Write an accepted fix somewhere a colleague can actually load it.
+
+    The .txt version keeps Fix history and the version list working; the
+    catalogue entry is what the New-run picker and the Catalogue page read.
+    Writing only the first is how agent_eval.v2 ended up on disk and nowhere
+    in the product.
+    """
+    bits = (fixer.get("editor") or {}).get("change_summary") if isinstance(fixer.get("editor"), dict) else None
+    summary = "; ".join(str(x) for x in (bits or []) if str(x).strip()) or f"Accepted a prompt fix from {origin}."
+    result = {"catalogue_id": "", "catalogue_name": "", "catalogue_mode": "", "catalogue_error": ""}
+    try:
+        published = catalogue.publish_version(
+            sess.get("prompt_id") or "",
+            user,
+            version_name,
+            proposed,
+            input_template=sess.get("input_template") or None,
+            summary=summary,
+        )
+        result["catalogue_id"] = published.get("published_to") or ""
+        result["catalogue_name"] = published.get("name") or version_name
+        result["catalogue_mode"] = published.get("mode") or ""
+        if result["catalogue_id"]:
+            sess["prompt_id"] = result["catalogue_id"]
+            storage.remember_last_prompt(user, result["catalogue_id"], result["catalogue_name"])
+    except Exception as e:
+        result["catalogue_error"] = str(e)
+    return result
 
 
 @app.post("/review/accept")
@@ -1403,11 +1651,19 @@ async def accept_prompt_version(request: Request, prompt_name: str = Form(...)):
     proposed = fixer.get("proposed_prompt") or ""
     if not proposed.strip():
         return PlainTextResponse("No proposed prompt to save. Run the fixer first.", status_code=400)
+    if proposed.strip() == (review_data.get("prompt_draft") or sess.get("prompt_template") or "").strip():
+        return PlainTextResponse(
+            "The fixer did not change the prompt, so there is no new version to save.",
+            status_code=400,
+        )
     try:
         version_name = storage.next_prompt_version(prompt_name)
         saved = storage.save_prompt(version_name, proposed)
     except Exception as e:
         return PlainTextResponse(str(e), status_code=400)
+    published = _publish_accepted_fix(
+        request.state.user, sess, fixer, prompt_name, proposed, saved, "review"
+    )
     review_data["prompt_draft"] = proposed
     review_data["fixer"]["accepted_name"] = saved
     storage.save_review(request.state.user, run_id, review_data)
@@ -1418,9 +1674,9 @@ async def accept_prompt_version(request: Request, prompt_name: str = Form(...)):
             status="accepted",
             new_version=saved,
         )
-    sess["prompt_name"] = saved
+    sess["prompt_name"] = published.get("catalogue_name") or saved
     sess["prompt_template"] = proposed
-    resp = JSONResponse({"ok": True, "name": saved})
+    resp = JSONResponse({"ok": True, "name": saved, **published})
     return attach_session(resp, request, sid)
 
 
@@ -1445,6 +1701,7 @@ def _empty_test_fixer() -> Dict[str, Any]:
     return {
         "status": "idle", "proposed_prompt": "", "diff": [], "analysis": "",
         "critic": "", "error": "", "fix_id": "", "source_name": "",
+        "unchanged": False, "warnings": [], "examples_used": 0,
     }
 
 
@@ -1465,8 +1722,12 @@ async def start_test_improve(
         return PlainTextResponse("Run a test row first, then improve from it.", status_code=400)
     if not (note.strip() or verdict.strip()):
         return PlainTextResponse("Add a note or a verdict on this test row first.", status_code=400)
+    if not api_key.strip():
+        _p, _m, api_key = resolve_ai(request, "fixer", provider=provider, model=model, api_key=api_key)
     if provider_requires_key(provider) and not api_key.strip():
-        return PlainTextResponse("API key is required to run the prompt fixer.", status_code=400)
+        return PlainTextResponse(
+            "No API key for this provider. Save one in Settings, or paste one here.", status_code=400
+        )
     prompt = prompt_draft or last_test.get("prompt_template") or sess.get("prompt_template") or ""
     if not prompt.strip():
         return PlainTextResponse("There is no prompt to improve.", status_code=400)
@@ -1488,7 +1749,18 @@ async def start_test_improve(
 
     def job():
         try:
-            result = improve_prompt(provider, key_once, model, prompt, [example])
+            prior = []
+            purpose = ""
+            if sess.get("prompt_id"):
+                ctx = catalogue.change_context(sess.get("prompt_id"))
+                prior = ctx.get("change_log") or []
+                purpose = ctx.get("purpose") or ""
+            result = improve_prompt(
+                provider, key_once, model, prompt, [example],
+                input_template=last_test.get("input_template") or sess.get("input_template") or "",
+                prior_changes=prior,
+                purpose=purpose,
+            )
             fix_id = ""
             try:
                 fix_id = storage.record_prompt_fix(
@@ -1515,6 +1787,9 @@ async def start_test_improve(
                 "error": "",
                 "fix_id": fix_id,
                 "source_name": source_name,
+                "unchanged": bool(result.get("unchanged")),
+                "warnings": result.get("warnings") or [],
+                "examples_used": result.get("examples_used") or 0,
             }
         except Exception as e:
             sess["test_fixer"] = {**_empty_test_fixer(), "status": "error", "error": str(e), "source_name": source_name}
@@ -1551,12 +1826,18 @@ def test_improve_status(request: Request, sid_token: Optional[str] = None):
     message = fixer.get("error") if status == "error" else {
         "idle": "Add a note, then run the fixer.",
         "running": "Analyst, editor, and critic are working…",
-        "done": "Proposed update is ready.",
+        "done": (
+            "The fixer ran but did not change the prompt."
+            if fixer.get("unchanged")
+            else "Proposed update is ready."
+        ),
     }.get(status, status)
     payload = {
         "status": status,
         "message": message,
-        "proposed": bool((fixer.get("proposed_prompt") or "").strip()),
+        "unchanged": bool(fixer.get("unchanged")),
+        "warnings": fixer.get("warnings") or [],
+        "proposed": bool((fixer.get("proposed_prompt") or "").strip()) and not fixer.get("unchanged"),
         "diff_html": _fixer_diff_html(fixer.get("diff") or []) if status == "done" else "",
         "analysis": analysis or "",
         "critic": critic or "",
@@ -1572,6 +1853,11 @@ async def accept_test_version(request: Request, sid_token: Optional[str] = Form(
     proposed = fixer.get("proposed_prompt") or ""
     if not proposed.strip():
         return PlainTextResponse("No proposed prompt to save. Run the fixer first.", status_code=400)
+    if fixer.get("unchanged"):
+        return PlainTextResponse(
+            "The fixer did not change the prompt, so there is no new version to save.",
+            status_code=400,
+        )
     try:
         version_name = storage.next_prompt_version(prompt_name)
         saved = storage.save_prompt(version_name, proposed)
@@ -1584,10 +1870,13 @@ async def accept_test_version(request: Request, sid_token: Optional[str] = Form(
             status="accepted",
             new_version=saved,
         )
+    published = _publish_accepted_fix(
+        request.state.user, sess, fixer, prompt_name, proposed, saved, "a test row"
+    )
     fixer["accepted_name"] = saved
-    sess["prompt_name"] = saved
+    sess["prompt_name"] = published.get("catalogue_name") or saved
     sess["prompt_template"] = proposed
-    resp = JSONResponse({"ok": True, "name": saved})
+    resp = JSONResponse({"ok": True, "name": saved, **published})
     return attach_session(resp, request, sid)
 
 
@@ -1659,11 +1948,980 @@ def prompts_history(request: Request, name: str = ""):
     return attach_session(resp, request, sid)
 
 
+def _builder_state(sess: Dict[str, Any]) -> Dict[str, Any]:
+    state = sess.get("builder")
+    if not isinstance(state, dict):
+        state = {}
+        sess["builder"] = state
+    state.setdefault("goal", "")
+    state.setdefault("content_col", "")
+    state.setdefault("meanings", "")
+    state.setdefault("plan", {})
+    state.setdefault("questions", [])
+    state.setdefault("question_log", [])
+    state.setdefault("discover_mode", "quick")
+    state.setdefault("answers", {})
+    state.setdefault("prompt_name", "")
+    state.setdefault("prompt", "")
+    state.setdefault("input_template", "")
+    state.setdefault("json_mode", True)
+    state.setdefault("summary", "")
+    state.setdefault("change_log", [])
+    return state
+
+
+def _builder_key(request: Request, provider: str, api_key: str, key_id: str = "", tool: str = "builder") -> str:
+    _provider, _model, key = resolve_ai(request, tool, provider=provider, api_key=api_key, key_id=key_id)
+    return key
+
+
+@app.get("/context", response_class=HTMLResponse)
+def context_page(request: Request):
+    sid, _ = get_work_session(request)
+    text = company_context.load_company_context()
+    resp = render(
+        request,
+        "company_context.html",
+        {
+            "nav": "context",
+            "user": request.state.user,
+            "context_text": text,
+            "context_chars": len(text),
+        },
+    )
+    return attach_session(resp, request, sid)
+
+
+@app.get("/context/text")
+def context_text(request: Request):
+    text = company_context.load_company_context()
+    return JSONResponse({"text": text, "chars": len(text)})
+
+
+@app.post("/context/save")
+async def context_save(request: Request, content: str = Form("")):
+    try:
+        stored = company_context.save_company_context(content)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(f"Could not save company info: {e}", status_code=500)
+    return JSONResponse({
+        "ok": True,
+        "chars": len(stored),
+        "message": "Saved. The prompt helper and the fixer will use this on the next call.",
+    })
+
+
+@app.get("/builder", response_class=HTMLResponse)
+def builder_page(request: Request):
+    sid, sess = get_work_session(request)
+    has_csv = "csv_cols" in sess
+    total_rows = len(sess.get("rows", [])) if has_csv else 0
+    last_test = sess.get("last_test_row_idx")
+    if not (has_csv and isinstance(last_test, int) and 0 <= last_test < total_rows):
+        last_test = None
+    builder_defaults = storage.tool_defaults(request.state.user, "builder")
+    current_provider = sess.get("provider") or builder_defaults.get("provider") or "langcc"
+    current_model = sess.get("model") or builder_defaults.get("model") or "gpt-5-mini"
+    saved_key = saved_key_for(request.state.user, current_provider, builder_defaults.get("key_id") or "")
+    state = _builder_state(sess)
+    last_builder_test = sess.get("builder_test") or {}
+    resp = render(
+        request,
+        "builder.html",
+        {
+            "nav": "builder",
+            "user": request.state.user,
+            "has_csv": has_csv,
+            "total_rows": total_rows,
+            "csv_cols": sess.get("csv_cols") or [],
+            "upload_note": sess.get("upload_note") or "",
+            "provider": current_provider,
+            "model": current_model,
+            "saved_key_exists": bool(saved_key),
+            "sid_token": work_serializer.dumps(sid),
+            "builder": state,
+            "last_test_row_idx": last_test,
+            "builder_test": last_builder_test,
+        },
+    )
+    return attach_session(resp, request, sid)
+
+
+def _parse_answers_json(answers_json: str) -> Dict[str, str]:
+    try:
+        raw = json.loads(answers_json or "{}")
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): str(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _merge_question_log(existing: List[Dict[str, Any]], questions: List[Dict[str, Any]], answers: Dict[str, str]) -> List[Dict[str, Any]]:
+    by_id = {str(item.get("id") or ""): dict(item) for item in existing if item.get("id")}
+    for q in questions:
+        qid = str(q.get("id") or "")
+        if not qid:
+            continue
+        row = by_id.get(qid) or {"id": qid, "text": q.get("text") or "", "answer": ""}
+        row["text"] = q.get("text") or row.get("text") or ""
+        if qid in answers:
+            row["answer"] = answers.get(qid) or ""
+        by_id[qid] = row
+    for qid, ans in answers.items():
+        if qid in by_id:
+            by_id[qid]["answer"] = ans
+    return list(by_id.values())
+
+
+@app.post("/builder/discover")
+async def builder_discover(
+    request: Request,
+    provider: str = Form("langcc"),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    goal: str = Form(""),
+    content_col: str = Form(""),
+    meanings: str = Form(""),
+    mode: str = Form("quick"),
+):
+    sid, sess = get_work_session(request)
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Pick a model first.", status_code=400)
+    rows = sess.get("rows") or []
+    cols = sess.get("csv_cols") or []
+    if not rows or not cols:
+        return PlainTextResponse("Upload a spreadsheet first.", status_code=400)
+    if content_col not in cols:
+        return PlainTextResponse("Click the column that holds the main text.", status_code=400)
+    key = _builder_key(request, provider, api_key)
+    if provider_requires_key(provider) and not key:
+        return PlainTextResponse("An API key is required for this provider.", status_code=400)
+    sample = sample_rows(rows, cols)
+    mode = "deep" if (mode or "").strip().lower() == "deep" else "quick"
+    try:
+        plan = discover_plan(provider, key, model, cols, sample, goal, content_col, meanings, mode=mode)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(f"Could not study the sample: {e}", status_code=502)
+    storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 400, 400)
+    state = _builder_state(sess)
+    state.update({
+        "goal": goal,
+        "content_col": content_col,
+        "meanings": meanings,
+        "plan": plan,
+        "questions": plan.get("questions") or [],
+        "question_log": [],
+        "discover_mode": mode,
+        "answers": {},
+    })
+    sess["provider"] = provider
+    sess["model"] = model
+    resp = JSONResponse({"ok": True, "plan": plan, "sample_size": len(sample), "mode": mode})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/builder/deep-next")
+async def builder_deep_next(
+    request: Request,
+    provider: str = Form("langcc"),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    goal: str = Form(""),
+    content_col: str = Form(""),
+    meanings: str = Form(""),
+    answers_json: str = Form("{}"),
+):
+    sid, sess = get_work_session(request)
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Pick a model first.", status_code=400)
+    rows = sess.get("rows") or []
+    cols = sess.get("csv_cols") or []
+    if not rows or not cols:
+        return PlainTextResponse("Upload a spreadsheet first.", status_code=400)
+    if content_col not in cols:
+        return PlainTextResponse("Click the column that holds the main text.", status_code=400)
+    key = _builder_key(request, provider, api_key)
+    if provider_requires_key(provider) and not key:
+        return PlainTextResponse("An API key is required for this provider.", status_code=400)
+    state = _builder_state(sess)
+    answers = _parse_answers_json(answers_json)
+    state["question_log"] = _merge_question_log(state.get("question_log") or [], state.get("questions") or [], answers)
+    if len(state["question_log"]) >= MAX_DEEP_TOTAL_QUESTIONS:
+        plan = dict(state.get("plan") or {})
+        plan["ready"] = True
+        plan["coverage"] = max(int(plan.get("coverage") or 0), 90)
+        plan["questions"] = []
+        state["plan"] = plan
+        state["questions"] = []
+        resp = JSONResponse({"ok": True, "plan": plan, "mode": "deep", "stopped": "limit"})
+        return attach_session(resp, request, sid)
+    sample = sample_rows(rows, cols)
+    prior = [
+        {"id": q.get("id"), "question": q.get("text"), "answer": q.get("answer")}
+        for q in state["question_log"]
+    ]
+    try:
+        plan = discover_plan(
+            provider, key, model, cols, sample, goal, content_col, meanings, mode="deep", prior_qa=prior
+        )
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(f"Could not continue the deep pass: {e}", status_code=502)
+    storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 400, 400)
+    if plan.get("ready"):
+        plan["questions"] = []
+    state.update({
+        "goal": goal,
+        "content_col": content_col,
+        "meanings": meanings,
+        "plan": plan,
+        "questions": plan.get("questions") or [],
+        "discover_mode": "deep",
+        "answers": answers,
+    })
+    sess["provider"] = provider
+    sess["model"] = model
+    resp = JSONResponse({"ok": True, "plan": plan, "mode": "deep"})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/builder/generate")
+async def builder_generate(
+    request: Request,
+    provider: str = Form("langcc"),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    goal: str = Form(""),
+    content_col: str = Form(""),
+    meanings: str = Form(""),
+    answers_json: str = Form("{}"),
+):
+    sid, sess = get_work_session(request)
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Pick a model first.", status_code=400)
+    cols = sess.get("csv_cols") or []
+    if content_col not in cols:
+        return PlainTextResponse("Click the column that holds the main text.", status_code=400)
+    key = _builder_key(request, provider, api_key)
+    if provider_requires_key(provider) and not key:
+        return PlainTextResponse("An API key is required for this provider.", status_code=400)
+    state = _builder_state(sess)
+    raw_answers = _parse_answers_json(answers_json)
+    state["question_log"] = _merge_question_log(state.get("question_log") or [], state.get("questions") or [], raw_answers)
+    logged = state.get("question_log") or []
+    answers = answers_from_form(logged, {str(q.get("id")): str(q.get("answer") or "") for q in logged})
+    try:
+        made = generate_prompt(
+            provider, key, model, cols, goal, content_col, meanings, state.get("plan") or {}, answers
+        )
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(f"Could not write the prompt: {e}", status_code=502)
+    storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 600, estimate_tokens(made["prompt"]))
+    state.update({
+        "goal": goal,
+        "content_col": content_col,
+        "meanings": meanings,
+        "answers": {str(q.get("id")): str(q.get("answer") or "") for q in (state.get("question_log") or [])},
+        "prompt_name": made["prompt_name"],
+        "prompt": made["prompt"],
+        "input_template": made.get("input_template") or "",
+        "json_mode": made.get("json_mode", True),
+        "summary": made.get("summary") or "",
+        "catalogue_id": "",
+    })
+    sess["prompt_name"] = made["prompt_name"]
+    sess["prompt_id"] = ""
+    sess["prompt_template"] = made["prompt"]
+    sess["input_template"] = made.get("input_template") or ""
+    sess["json_mode"] = bool(made.get("json_mode", True))
+    sess["provider"] = provider
+    sess["model"] = model
+    resp = JSONResponse({
+        "ok": True,
+        "name": made["prompt_name"],
+        "prompt": made["prompt"],
+        "input_template": made.get("input_template") or "",
+        "json_mode": bool(made.get("json_mode", True)),
+        "summary": made.get("summary") or "",
+        "saved": False,
+    })
+    return attach_session(resp, request, sid)
+
+
+@app.post("/builder/test")
+async def builder_test(
+    request: Request,
+    provider: str = Form("langcc"),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    test_row_idx: Optional[int] = Form(None),
+    input_template: Optional[str] = Form(None),
+):
+    sid, sess = get_work_session(request)
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Pick a model first.", status_code=400)
+    rows = [r for r in (sess.get("rows") or []) if not _row_is_empty_dict(r)]
+    if not rows:
+        return PlainTextResponse("Upload a spreadsheet first.", status_code=400)
+    state = _builder_state(sess)
+    prompt_template = state.get("prompt") or sess.get("prompt_template") or ""
+    used_input = input_template if input_template is not None else (state.get("input_template") or sess.get("input_template") or "")
+    csv_cols = sess.get("csv_cols") or []
+    missing_input = row_input_error(prompt_template, used_input, csv_cols, sess.get("column_map") or {})
+    if missing_input:
+        return PlainTextResponse(missing_input if prompt_template.strip() else "Generate a prompt first.", status_code=400)
+    key = _builder_key(request, provider, api_key)
+    if provider_requires_key(provider) and not key:
+        return PlainTextResponse("An API key is required for this provider.", status_code=400)
+    if test_row_idx is not None and 0 <= test_row_idx < len(rows):
+        row_idx = test_row_idx
+    else:
+        row_idx = random.randrange(len(rows))
+    row = rows[row_idx]
+    json_mode = bool(state.get("json_mode", True))
+    err = ""
+    text = ""
+    latency = 0.0
+    try:
+        t0 = time.time()
+        model_text = compose_model_input(prompt_template, row, used_input, column_map=sess.get("column_map") or {})
+        text = call_provider(provider, key, model, model_text, json_mode, None)
+        latency = round(time.time() - t0, 3)
+        storage.log_usage(request.state.user, provider, model, estimate_tokens(model_text), estimate_tokens(text))
+    except Exception as e:
+        err = str(e)
+    sess["last_test_row_idx"] = row_idx
+    preview = {c: row.get(c, "") for c in csv_cols[:6]}
+    if state.get("content_col") and state["content_col"] in row:
+        preview[state["content_col"]] = row.get(state["content_col"], "")
+    result = {
+        "ok": not bool(err),
+        "row_idx": row_idx,
+        "total": len(rows),
+        "preview": preview,
+        "output": text or "",
+        "error": err,
+        "latency": latency,
+    }
+    sess["builder_test"] = result
+    sess["provider"] = provider
+    sess["model"] = model
+    resp = JSONResponse(result)
+    return attach_session(resp, request, sid)
+
+
 def _iso_to_pretty(value: str) -> str:
     try:
         return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return value or ""
+
+
+@app.post("/builder/availability")
+async def builder_availability(
+    request: Request,
+    provider: str = Form("langcc"),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    goal: str = Form(""),
+    content_col: str = Form(""),
+    meanings: str = Form(""),
+):
+    sid, sess = get_work_session(request)
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Pick a model first.", status_code=400)
+    rows = sess.get("rows") or []
+    cols = sess.get("csv_cols") or []
+    if not rows or not cols:
+        return PlainTextResponse("Upload a spreadsheet first.", status_code=400)
+    if content_col not in cols:
+        return PlainTextResponse("Click the column that holds the main text.", status_code=400)
+    key = _builder_key(request, provider, api_key)
+    if provider_requires_key(provider) and not key:
+        return PlainTextResponse("An API key is required for this provider.", status_code=400)
+    sample = sample_rows(rows, cols)
+    state = _builder_state(sess)
+    try:
+        report = check_availability(
+            provider, key, model, cols, sample, goal, content_col, meanings, state.get("plan") or {}
+        )
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(f"Could not score the sheet: {e}", status_code=502)
+    storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 300, 300)
+    state["availability"] = report
+    resp = JSONResponse({"ok": True, "report": report})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/builder/save")
+async def builder_save_catalogue(request: Request, name: str = Form("")):
+    sid, sess = get_work_session(request)
+    state = _builder_state(sess)
+    prompt = state.get("prompt") or sess.get("prompt_template") or ""
+    extra = state.get("input_template") or sess.get("input_template") or ""
+    if not prompt.strip():
+        return PlainTextResponse("Write a prompt first.", status_code=400)
+    display = (name or state.get("prompt_name") or "analysis").strip()
+    existing_id = state.get("catalogue_id") or ""
+    try:
+        # Save is idempotent. It used to create a fresh catalogue entry on every
+        # click, so a normal build-test-tweak-save loop left four near-identical
+        # prompts in the shared list and nobody could tell which was current.
+        if existing_id and catalogue.load_meta(existing_id):
+            card = catalogue.update_prompt(
+                existing_id,
+                request.state.user,
+                prompt=prompt,
+                input_template=extra,
+                name=display,
+                content_column=state.get("content_col") or "",
+            )
+            created = False
+        else:
+            card = catalogue.create_prompt(
+                request.state.user,
+                display,
+                prompt,
+                extra,
+                visibility="personal",
+                content_column=state.get("content_col") or "",
+            )
+            created = True
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    state["catalogue_id"] = card["id"]
+    state["prompt_name"] = card["name"]
+    sess["prompt_id"] = card["id"]
+    sess["prompt_name"] = card["name"]
+    resp = JSONResponse({"ok": True, "id": card["id"], "name": card["name"], "created": created})
+    return attach_session(resp, request, sid)
+
+
+@app.post("/builder/fix")
+async def builder_fix(
+    request: Request,
+    provider: str = Form("langcc"),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    note: str = Form(""),
+):
+    sid, sess = get_work_session(request)
+    model = (model or "").strip()
+    if not model:
+        return PlainTextResponse("Pick a model first.", status_code=400)
+    if not (note or "").strip():
+        return PlainTextResponse("Write what you want changed.", status_code=400)
+    state = _builder_state(sess)
+    prompt = state.get("prompt") or sess.get("prompt_template") or ""
+    extra = state.get("input_template") or sess.get("input_template") or ""
+    if not prompt.strip():
+        return PlainTextResponse("Write a prompt first.", status_code=400)
+    key = _builder_key(request, provider, api_key)
+    if provider_requires_key(provider) and not key:
+        return PlainTextResponse("An API key is required for this provider.", status_code=400)
+    example = {
+        "row_index": 0,
+        "verdict": "wrong",
+        "note": note.strip(),
+        "input_excerpt": extra or "(input template)",
+        "output": "",
+    }
+    prior = []
+    purpose = ""
+    prompt_id = state.get("catalogue_id") or sess.get("prompt_id") or ""
+    if prompt_id:
+        ctx = catalogue.change_context(prompt_id)
+        prior = ctx.get("change_log") or []
+        purpose = ctx.get("purpose") or ""
+    prior.extend(state.get("change_log") or [])
+    try:
+        result = improve_prompt(
+            provider, key, model, prompt, [example], input_template=extra,
+            prior_changes=prior, purpose=purpose,
+        )
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(f"Could not fix the prompt: {e}", status_code=502)
+    proposed = result.get("proposed_prompt") or prompt
+    state["prompt"] = proposed
+    sess["prompt_template"] = proposed
+    summary_bits = result.get("change_summary") or (result.get("editor") or {}).get("change_summary") or []
+    summary = "; ".join(str(x) for x in summary_bits if str(x).strip())
+    log = list(state.get("change_log") or [])
+    if summary:
+        log.append({"at": datetime.utcnow().isoformat(), "by": request.state.user, "summary": summary, "purpose": result.get("purpose") or purpose})
+        state["change_log"] = log[-20:]
+    saved_to_catalogue = False
+    if prompt_id and catalogue.load_meta(prompt_id):
+        # The builder edited its own draft but never wrote it back, so a prompt
+        # already in the catalogue kept its old text while its change log
+        # recorded edits that had not happened to it.
+        try:
+            catalogue.update_prompt(prompt_id, request.state.user, prompt=proposed)
+            saved_to_catalogue = True
+            if summary:
+                catalogue.append_change(prompt_id, request.state.user, summary, result.get("purpose") or "")
+        except PermissionError:
+            saved_to_catalogue = False
+        except Exception:
+            saved_to_catalogue = False
+    resp = JSONResponse({
+        "ok": True,
+        "prompt": proposed,
+        "diff": result.get("diff") or [],
+        "summary": summary_bits,
+        "purpose": result.get("purpose") or purpose,
+        "unchanged": bool(result.get("unchanged")),
+        "warnings": result.get("warnings") or [],
+        "saved": saved_to_catalogue,
+    })
+    return attach_session(resp, request, sid)
+
+
+@app.post("/mapping/save")
+async def save_mapping(request: Request):
+    sid, sess = get_work_session(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw = body.get("mapping") if isinstance(body, dict) else {}
+    if isinstance(body, dict):
+        if "prompt_template" in body:
+            sess["prompt_template"] = str(body.get("prompt_template") or "")
+        if "input_template" in body:
+            sess["input_template"] = str(body.get("input_template") or "")
+    mapping = {}
+    cols = set(sess.get("csv_cols") or [])
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            key = str(k or "").strip()
+            val = str(v or "").strip()
+            if key and val in cols:
+                mapping[key] = val
+    sess["column_map"] = mapping
+    placeholders = required_placeholders(sess.get("prompt_template") or "", sess.get("input_template") or "")
+    resp = JSONResponse({"ok": True, "mapping": mapping, "required_inputs": placeholders, "mapping_needed": mapping_gaps(
+        placeholders,
+        sess.get("csv_cols") or [],
+        mapping,
+    )})
+    return attach_session(resp, request, sid)
+
+
+@app.get("/users/search")
+def users_search(request: Request, q: str = ""):
+    needle = (q or "").strip().lower()
+    names = [n for n in auth.list_users() if n != request.state.user]
+    if needle:
+        names = [n for n in names if needle in n.lower()]
+    return JSONResponse({"users": names[:20]})
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request):
+    sid, sess = get_work_session(request)
+    payload = settings_payload(request.state.user)
+    resp = render(
+        request,
+        "settings.html",
+        {
+            "nav": "settings",
+            "user": request.state.user,
+            **payload,
+            "providers": ["langcc", "openai", "gemini", "ollama"],
+            "tools": storage.AI_TOOLS,
+        },
+    )
+    return attach_session(resp, request, sid)
+
+
+@app.post("/settings/save")
+async def settings_save(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    saved = storage.save_user_settings(request.state.user, body)
+    return JSONResponse({"ok": True, "settings": saved})
+
+
+@app.post("/settings/keys")
+async def settings_add_key(
+    request: Request,
+    label: str = Form(""),
+    provider: str = Form(...),
+    api_key: str = Form(...),
+    key_id: str = Form(""),
+):
+    try:
+        card = storage.save_named_key(request.state.user, label, provider, api_key, key_id)
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception:
+        return PlainTextResponse("Could not save key.", status_code=500)
+    return JSONResponse({"ok": True, **card, "keys": storage.list_named_keys(request.state.user)})
+
+
+@app.post("/settings/keys/forget")
+async def settings_forget_key(request: Request, key_id: str = Form(...)):
+    deleted = storage.delete_named_key(request.state.user, key_id)
+    return JSONResponse({"ok": True, "deleted": deleted, "keys": storage.list_named_keys(request.state.user)})
+
+
+@app.get("/catalogue", response_class=HTMLResponse)
+def catalogue_page(request: Request):
+    sid, sess = get_work_session(request)
+    helper = storage.tool_defaults(request.state.user, "catalogue")
+    finder = storage.tool_defaults(request.state.user, "finder")
+    resp = render(
+        request,
+        "catalogue.html",
+        {
+            "nav": "catalogue",
+            "user": request.state.user,
+            "provider": helper.get("provider") or sess.get("provider", "langcc"),
+            "model": helper.get("model") or sess.get("model", "gpt-5-mini"),
+            "saved_key_exists": bool(
+                saved_key_for(
+                    request.state.user,
+                    helper.get("provider") or sess.get("provider", "langcc"),
+                    helper.get("key_id") or "",
+                )
+            ),
+            "finder_provider": finder.get("provider") or "langcc",
+            "finder_model": finder.get("model") or "",
+        },
+    )
+    return attach_session(resp, request, sid)
+
+
+@app.get("/catalogue/search")
+def catalogue_search(
+    request: Request,
+    q: str = "",
+    owner: str = "",
+    access: str = "",
+    page: int = 1,
+):
+    data = catalogue.search_visible(request.state.user, q=q, owner=owner, access=access, page=page)
+    return JSONResponse(data)
+
+
+@app.post("/catalogue/find")
+async def catalogue_find(
+    request: Request,
+    message: str = Form(""),
+    owner: str = Form(""),
+    provider: str = Form(""),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    key_id: str = Form(""),
+):
+    if not (message or "").strip():
+        return PlainTextResponse("Write what you are looking for.", status_code=400)
+    name, chosen, key = resolve_ai(request, "finder", provider, model, api_key, key_id)
+    if not chosen:
+        return PlainTextResponse("Set a model in Settings first.", status_code=400)
+    if provider_requires_key(name) and not key:
+        return PlainTextResponse("An API key is required for this provider.", status_code=400)
+    visible = catalogue.list_visible(request.state.user)
+    try:
+        turn = find_prompts_turn(name, key, chosen, message, visible, owner=owner)
+    except Exception as e:
+        return PlainTextResponse(f"The helper did not answer: {e}", status_code=502)
+    cards = []
+    by_id = {i.get("id"): i for i in visible}
+    for match in turn.get("matches") or []:
+        card = by_id.get(match.get("id"))
+        if card:
+            cards.append({**card, "why": match.get("why") or ""})
+    return JSONResponse({"reply": turn.get("reply") or "", "matches": cards})
+
+
+@app.get("/catalogue/{prompt_id}")
+def catalogue_get(request: Request, prompt_id: str):
+    try:
+        item = catalogue.get_visible(prompt_id, request.state.user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=404)
+    item["chat"] = catalogue.load_chat(prompt_id)
+    ctx = catalogue.change_context(prompt_id)
+    item["purpose"] = ctx.get("purpose") or item.get("purpose") or ""
+    item["change_log"] = ctx.get("change_log") or item.get("change_log") or []
+    return JSONResponse(item)
+
+
+@app.get("/catalogue/{prompt_id}/versions")
+def catalogue_versions(request: Request, prompt_id: str):
+    try:
+        history = catalogue.list_versions(prompt_id, request.state.user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=404)
+    # Index is the position in the stored list, which is what /restore expects.
+    cards = [
+        {
+            "index": i,
+            "at": _iso_to_pretty(str(item.get("at") or "")),
+            "by": item.get("by") or "",
+            "chars": len(item.get("prompt") or ""),
+            "prompt": item.get("prompt") or "",
+            "input_template": item.get("input_template") or "",
+        }
+        for i, item in enumerate(history)
+    ]
+    cards.reverse()
+    return JSONResponse({"versions": cards})
+
+
+@app.post("/catalogue/{prompt_id}/restore")
+async def catalogue_restore(request: Request, prompt_id: str, index: int = Form(...)):
+    try:
+        item = catalogue.restore_version(prompt_id, request.state.user, index)
+    except PermissionError:
+        return PlainTextResponse(
+            "You don't have edit access. Clone this prompt or request edit access from the owner.",
+            status_code=403,
+        )
+    except ValueError as e:
+        return PlainTextResponse(str(e), status_code=400)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    try:
+        catalogue.append_change(prompt_id, request.state.user, "Restored an earlier version of this prompt.")
+    except Exception:
+        pass
+    return JSONResponse({"ok": True, **item})
+
+
+@app.post("/catalogue/{prompt_id}/acl")
+async def catalogue_acl(
+    request: Request,
+    prompt_id: str,
+    visibility: str = Form("personal"),
+    everyone_role: str = Form("viewer"),
+    viewers: str = Form("[]"),
+    editors: str = Form("[]"),
+):
+    try:
+        view_list = json.loads(viewers or "[]")
+        edit_list = json.loads(editors or "[]")
+        if not isinstance(view_list, list):
+            view_list = []
+        if not isinstance(edit_list, list):
+            edit_list = []
+        card = catalogue.update_acl(
+            prompt_id,
+            request.state.user,
+            visibility=visibility,
+            everyone_role=everyone_role,
+            viewers=[str(x) for x in view_list],
+            editors=[str(x) for x in edit_list],
+        )
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    return JSONResponse({"ok": True, **card})
+
+
+@app.post("/catalogue/{prompt_id}/delete")
+async def catalogue_delete(request: Request, prompt_id: str):
+    try:
+        catalogue.delete_prompt(prompt_id, request.state.user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/catalogue/{prompt_id}/clone")
+async def catalogue_clone(request: Request, prompt_id: str):
+    try:
+        card = catalogue.clone_prompt(prompt_id, request.state.user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    return JSONResponse({"ok": True, **card})
+
+
+@app.post("/catalogue/{prompt_id}/use")
+async def catalogue_use(request: Request, prompt_id: str):
+    sid, sess = get_work_session(request)
+    try:
+        item = catalogue.get_visible(prompt_id, request.state.user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=404)
+    sess["prompt_id"] = item["id"]
+    sess["prompt_name"] = item["name"]
+    sess["prompt_template"] = item.get("prompt") or ""
+    sess["input_template"] = item.get("input_template") or ""
+    storage.remember_last_prompt(request.state.user, item["id"], item["name"])
+    gaps = mapping_gaps(
+        item.get("required_inputs") or [],
+        sess.get("csv_cols") or [],
+        sess.get("column_map") or {},
+    )
+    resp = JSONResponse({
+        "ok": True,
+        "id": item["id"],
+        "name": item["name"],
+        "mapping_needed": gaps,
+        "columns": sess.get("csv_cols") or [],
+        "required_inputs": item.get("required_inputs") or [],
+    })
+    return attach_session(resp, request, sid)
+
+
+@app.post("/catalogue/{prompt_id}/request-edit")
+async def catalogue_request_edit(request: Request, prompt_id: str):
+    try:
+        card = catalogue.request_edit(prompt_id, request.state.user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    return JSONResponse({"ok": True, **card})
+
+
+@app.post("/catalogue/{prompt_id}/grant-edit")
+async def catalogue_grant_edit(
+    request: Request,
+    prompt_id: str,
+    username: str = Form(...),
+    grant: str = Form("1"),
+):
+    try:
+        card = catalogue.resolve_edit_request(prompt_id, request.state.user, username, grant=grant != "0")
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    return JSONResponse({"ok": True, **card})
+
+
+@app.post("/catalogue/{prompt_id}/chat")
+async def catalogue_chat(
+    request: Request,
+    prompt_id: str,
+    message: str = Form(""),
+    provider: str = Form(""),
+    model: str = Form(""),
+    api_key: str = Form(""),
+    key_id: str = Form(""),
+    apply: str = Form("0"),
+):
+    user = request.state.user
+    try:
+        item = catalogue.get_visible(prompt_id, user)
+    except PermissionError as e:
+        return PlainTextResponse(str(e), status_code=403)
+    if not (message or "").strip():
+        return PlainTextResponse("Write a message.", status_code=400)
+    name, chosen, key = resolve_ai(request, "catalogue", provider, model, api_key, key_id)
+    if provider_requires_key(name) and not key:
+        return PlainTextResponse("An API key is required for this provider. Save one in Settings.", status_code=400)
+    if not chosen:
+        return PlainTextResponse("Set a model in Settings first.", status_code=400)
+    history = catalogue.load_chat(prompt_id)
+    ctx = catalogue.change_context(prompt_id)
+    can_edit = catalogue.can_edit(item, user)
+    try:
+        turn = catalogue_chat_turn(
+            name, key, chosen, item.get("prompt") or "", item.get("input_template") or "",
+            history, message, can_edit=can_edit,
+            purpose=ctx.get("purpose") or "",
+            prior_changes=ctx.get("change_log") or [],
+        )
+    except Exception as e:
+        return PlainTextResponse(f"The helper did not answer: {e}", status_code=502)
+    catalogue.append_chat(prompt_id, "user", message.strip())
+    catalogue.append_chat(prompt_id, "assistant", turn["reply"])
+    applied = False
+    if apply == "1" and (turn.get("updated_prompt") or turn.get("updated_input")):
+        if not can_edit:
+            turn["updated_prompt"] = ""
+            turn["updated_input"] = ""
+            turn["reply"] = (
+                "You don't have edit access. Clone this prompt or request edit access from the owner."
+            )
+        else:
+            catalogue.update_prompt(
+                prompt_id,
+                user,
+                prompt=turn.get("updated_prompt") or None,
+                input_template=turn.get("updated_input") or None,
+            )
+            if turn.get("change_summary"):
+                catalogue.append_change(prompt_id, user, turn["change_summary"], turn.get("purpose") or "")
+            applied = True
+    return JSONResponse({
+        **turn,
+        "applied": applied,
+        "can_edit": can_edit,
+        "owner": item.get("owner") or "",
+        "chat": catalogue.load_chat(prompt_id),
+    })
+
+
+@app.post("/catalogue/{prompt_id}/apply")
+async def catalogue_apply(
+    request: Request,
+    prompt_id: str,
+    prompt: str = Form(""),
+    input_template: str = Form(""),
+    summary: str = Form(""),
+    purpose: str = Form(""),
+):
+    user = request.state.user
+    try:
+        item = catalogue.get_visible(prompt_id, user)
+        if not catalogue.can_edit(item, user):
+            return PlainTextResponse(
+                "You don't have edit access. Clone this prompt or request edit access from the owner.",
+                status_code=403,
+            )
+        item = catalogue.update_prompt(
+            prompt_id, user, prompt=prompt, input_template=input_template
+        )
+        if summary.strip():
+            catalogue.append_change(prompt_id, user, summary.strip(), purpose)
+    except PermissionError as e:
+        return PlainTextResponse(
+            "You don't have edit access. Clone this prompt or request edit access from the owner.",
+            status_code=403,
+        )
+    except Exception as e:
+        return PlainTextResponse(str(e), status_code=400)
+    return JSONResponse({"ok": True, **item, "chat": catalogue.load_chat(prompt_id)})
 
 
 if __name__ == "__main__":

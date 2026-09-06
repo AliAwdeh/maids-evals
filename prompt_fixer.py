@@ -1,15 +1,32 @@
 import difflib
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from company_context import compose_helper_prompt
 from engine import call_provider, try_parse_json
+
+STRUCTURE_RULES = """
+Composition (read-only facts about how the runner works):
+- Instructions (the prompt you edit) and Input data (input_template) are SEPARATE.
+- When input_template is set, the model sees: instructions, then a line ===== INPUT =====, then the substituted input last.
+- Placeholders like {ColumnName} are replaced with the RAW cell. There is no automatic label.
+- Never use {row_json} (it duplicates columns already listed). Never put the same column in both parts.
+- Large conversation/content belongs only in input_template, never mid-instructions.
+- Short condition columns (nationality, status, skill) MAY stay in the instructions as {ColumnName} next to IF/THEN rules.
+- JSON output must stay strictly flat (top-level keys, scalar values). No nested objects.
+- Do not ask the model to echo input identifiers (Id, row_id, conversation id). Results are joined to the input row on export.
+- You edit INSTRUCTIONS only. Treat input_template as read-only context. Do not pull big data into the instructions.
+"""
 
 ANALYST_INSTRUCTIONS = """You are the Analyst in a prompt-repair pipeline for an evaluation prompt.
 
 You receive:
-1. The current evaluation prompt (may be long).
-2. Reviewer notes on specific rows, each with input excerpt, model output, verdict, and note.
+1. The current evaluation prompt / instructions (may be long).
+2. The input_template if one exists (read-only; this is how row data is appended).
+3. Reviewer notes on specific rows, each with input excerpt, model output, verdict, and note.
+4. prior_changes: summaries of what this prompt already is and what was already fixed. Do not undo those fixes. Do not re-introduce those issues.
+5. purpose: a short description of what the prompt is for. Keep that intent.
 
 Your job:
 - Cluster the notes into a small number of failure patterns (usually 2–8).
@@ -17,6 +34,8 @@ Your job:
 - Say what rule is missing, too weak, too strong, or contradictory.
 - Ignore one-off nits unless they repeat.
 - Do not rewrite the prompt.
+- Keep maids.cc vocabulary (CC, MV, PTC, Enchanters, Resolvers, prospect vs client vs maid).
+- Never add prices, salaries, counts, ratings, or nationality availability from company notes.
 
 Return JSON only:
 {
@@ -31,11 +50,11 @@ Return JSON only:
   ],
   "do_not_change": ["existing rules that must stay"]
 }
-"""
+""" + STRUCTURE_RULES
 
 EDITOR_INSTRUCTIONS = """You are the Editor in a prompt-repair pipeline.
 
-You receive the original prompt and the Analyst JSON.
+You receive the original instructions, a read-only input_template, and the Analyst JSON.
 
 Rules:
 - Make SURGICAL edits only. Do not rewrite the prompt.
@@ -44,13 +63,17 @@ Rules:
 - Do not drop existing rules listed in do_not_change unless they directly contradict a needed fix.
 - If a pattern can be fixed by adding one sentence under the existing heading, do that.
 - Return the FULL updated prompt, not a patch.
+- Keep maids.cc terms consistent. Do not bake volatile figures (prices, salaries, counts, ratings, nationality availability) into the prompt.
+- Edit INSTRUCTIONS only. Do not move the conversation into the instructions, reintroduce {row_json}, or add id-echo fields.
+- If JSON is requested, keep it an explicit, strictly flat object.
 
 Return JSON only:
 {
   "updated_prompt": "the full prompt text",
-  "change_summary": ["one line per edit"]
+  "change_summary": ["one line per edit"],
+  "purpose": "one or two sentences saying what this prompt is for now"
 }
-"""
+""" + STRUCTURE_RULES
 
 CRITIC_INSTRUCTIONS = """You are the Critic in a prompt-repair pipeline.
 
@@ -61,6 +84,8 @@ Reject or trim edits that:
 - Overfit a single row
 - Rewrite large unrelated sections
 - Weaken a rule that other notes still need
+- Introduce prices, salaries, counts, ratings, or nationality availability from company notes
+- Pull large input data into the instructions, add {row_json}, or ask the model to echo input identifiers
 
 If the update is mostly good, keep it and list remaining risks.
 If an edit is harmful, revert that part by returning a safer prompt.
@@ -72,7 +97,11 @@ Return JSON only:
   "rejected_edits": ["what you rejected and why"],
   "risks": ["residual risks"]
 }
-"""
+""" + STRUCTURE_RULES
+
+
+MAX_EXAMPLES = 40
+MAX_NOTES_CHARS = 60_000
 
 
 def _parse_agent_json(text: str) -> Dict[str, Any]:
@@ -80,6 +109,44 @@ def _parse_agent_json(text: str) -> Dict[str, Any]:
     if isinstance(parsed, dict):
         return parsed
     raise ValueError(f"Agent did not return JSON: {err or 'invalid payload'}")
+
+
+def select_examples(examples: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], str]:
+    """Trim a review batch down to a payload one model call can actually hold.
+
+    A run with 200 notes builds a ~330k-character request. Nothing rejects it
+    up front -- it fails at the provider, after the user has waited. Failures
+    the reviewer wrote about are what the Analyst needs, so keep those first and
+    say plainly what was left out.
+    """
+    if not examples:
+        return [], ""
+
+    def rank(item: Dict[str, Any]) -> tuple:
+        verdict = str(item.get("verdict") or "").lower()
+        has_note = 1 if str(item.get("note") or "").strip() else 0
+        weight = {"wrong": 0, "unclear": 1, "ok": 2}.get(verdict, 3)
+        return (1 - has_note, weight, item.get("row", 0))
+
+    ordered = sorted(examples, key=rank)
+    kept: List[Dict[str, Any]] = []
+    used = 0
+    for item in ordered:
+        size = len(json.dumps(item, ensure_ascii=False))
+        if kept and (len(kept) >= MAX_EXAMPLES or used + size > MAX_NOTES_CHARS):
+            continue
+        kept.append(item)
+        used += size
+    kept.sort(key=lambda i: i.get("row", 0))
+    dropped = len(examples) - len(kept)
+    if not dropped:
+        return kept, ""
+    note = (
+        f"Used {len(kept)} of {len(examples)} notes in this pass "
+        "(wrong and unclear rows with a written note come first). "
+        "Run the fixer again after accepting to work through the rest."
+    )
+    return kept, note
 
 
 def _excerpt(value: Any, limit: int = 1200) -> str:
@@ -158,10 +225,27 @@ def unified_diff(original: str, updated: str) -> List[str]:
     )
 
 
+RETRY_SUFFIX = (
+    "\n\nYour previous reply was not valid JSON and was rejected. "
+    "Reply again with the JSON object only: no prose before it, no prose after it, "
+    "no markdown fence."
+)
+
+
 def _ask(provider: str, api_key: str, model: str, system: str, payload: str) -> Dict[str, Any]:
-    prompt = f"{system}\n\n---\n\n{payload}"
+    """One agent turn. Retries once when the model answers in prose.
+
+    Each stage of this pipeline costs a model call, so losing a good Editor
+    result because the Critic opened with "Sure!" is expensive. One retry with
+    an explicit correction recovers the common case.
+    """
+    prompt = compose_helper_prompt(system, payload)
     raw = call_provider(provider, api_key, model, prompt, json_mode=True)
-    return _parse_agent_json(raw)
+    try:
+        return _parse_agent_json(raw)
+    except ValueError:
+        retry = call_provider(provider, api_key, model, prompt + RETRY_SUFFIX, json_mode=True)
+        return _parse_agent_json(retry)
 
 
 def improve_prompt(
@@ -170,20 +254,41 @@ def improve_prompt(
     model: str,
     prompt: str,
     examples: List[Dict[str, Any]],
+    input_template: str = "",
+    prior_changes: Optional[List[Dict[str, Any]]] = None,
+    purpose: str = "",
 ) -> Dict[str, Any]:
     if not examples:
         raise ValueError("Add at least one review note before improving the prompt.")
     if not (prompt or "").strip():
         raise ValueError("There is no prompt to improve.")
+    examples, sampling_note = select_examples(examples)
 
+    framing = {
+        "input_template": input_template or "",
+        "input_template_note": (
+            "Read-only. Substituted and appended after ===== INPUT =====. "
+            "Do not edit this; do not copy its placeholders into the instructions."
+            if (input_template or "").strip()
+            else "Empty — this run uses instructions-only (legacy)."
+        ),
+        "purpose": (purpose or "").strip(),
+        "prior_changes": prior_changes or [],
+        "prior_changes_note": (
+            "These changes already happened. Do not reverse them. "
+            "Do not re-introduce the same failure."
+            if prior_changes else
+            "No prior change log yet."
+        ),
+    }
     analyst_payload = json.dumps(
-        {"prompt": prompt, "notes": examples},
+        {"prompt": prompt, "notes": examples, **framing},
         ensure_ascii=False,
     )
     analysis = _ask(provider, api_key, model, ANALYST_INSTRUCTIONS, analyst_payload)
 
     editor_payload = json.dumps(
-        {"prompt": prompt, "analysis": analysis},
+        {"prompt": prompt, "analysis": analysis, **framing},
         ensure_ascii=False,
     )
     edited = _ask(provider, api_key, model, EDITOR_INSTRUCTIONS, editor_payload)
@@ -196,18 +301,47 @@ def improve_prompt(
             "analysis": analysis,
             "notes": examples,
             "change_summary": edited.get("change_summary") or [],
+            **framing,
         },
         ensure_ascii=False,
     )
-    critique = _ask(provider, api_key, model, CRITIC_INSTRUCTIONS, critic_payload)
+    warnings: List[str] = []
+    if sampling_note:
+        warnings.append(sampling_note)
+    try:
+        critique = _ask(provider, api_key, model, CRITIC_INSTRUCTIONS, critic_payload)
+    except Exception as e:
+        # The Editor already produced a usable prompt. Losing it because the
+        # Critic misbehaved would throw away two paid calls and the reviewer's
+        # whole batch of notes, so keep the edit and say it went unreviewed.
+        critique = {"accepted": False, "final_prompt": "", "rejected_edits": [], "risks": []}
+        warnings.append(
+            f"The critic did not return a usable review ({e}). "
+            "This proposal is the editor's version, unchecked. Read the diff closely before saving."
+        )
     final_prompt = critique.get("final_prompt") or updated
     if not str(final_prompt).strip():
         final_prompt = updated
 
+    purpose_out = str(edited.get("purpose") or purpose or "").strip()
+    summary = [str(x) for x in (edited.get("change_summary") or []) if str(x).strip()]
+    diff = unified_diff(prompt, final_prompt)
+    unchanged = str(final_prompt).strip() == str(prompt).strip()
+    if unchanged:
+        # A summary that claims edits next to an identical prompt is how a
+        # no-op gets saved as agent_eval.v2 and trusted as a real improvement.
+        warnings.append(
+            "The pass ended with the prompt unchanged. There is nothing to save as a new version."
+        )
     return {
         "analysis": analysis,
         "editor": edited,
         "critic": critique,
         "proposed_prompt": final_prompt,
-        "diff": unified_diff(prompt, final_prompt),
+        "diff": diff,
+        "change_summary": [] if unchanged else summary,
+        "purpose": purpose_out,
+        "unchanged": unchanged,
+        "warnings": warnings,
+        "examples_used": len(examples),
     }

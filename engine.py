@@ -13,17 +13,85 @@ OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "https://ai.aliawdeh.com/api")
 LANGCC_API_BASE = os.getenv("LANGCC_API_BASE", "https://langcc.maidstech.ai/v1")
 MAX_REQUEST_WORKERS_CAP = max(1, int(os.getenv("MAX_REQUEST_WORKERS_CAP", "64")))
 
+# A placeholder is {Column Name}. Real spreadsheet headers contain spaces, dots,
+# accents and Arabic, so the name cannot be restricted to Python identifiers --
+# doing that made {Client Id} invisible to the mapping check while still being
+# substituted at run time, which produced silent blank fields.
+# Characters that only ever appear in a literal JSON example ("  :  ,) are
+# excluded so the JSON schema an eval prompt asks the model to return is never
+# mistaken for a placeholder. Newlines are excluded for the same reason.
+PLACEHOLDER_RE = re.compile(r"\{([^{}\n\"':,]+)\}")
+
+
+def _placeholder_names(text: str) -> List[str]:
+    out = []
+    for raw in PLACEHOLDER_RE.findall(text or ""):
+        name = raw.strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def required_placeholders(prompt_template: str, input_template: str = "") -> List[str]:
+    names = _placeholder_names(prompt_template) + _placeholder_names(input_template)
+    out = []
+    for name in names:
+        if name == "row_json" or name in out:
+            continue
+        out.append(name)
+    return out
+
+
+def apply_column_map(row: Dict[str, Any], mapping: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """mapping: prompt placeholder -> spreadsheet column. Adds alias keys on a copy."""
+    out = dict(row or {})
+    for placeholder, column in (mapping or {}).items():
+        ph = str(placeholder or "").strip()
+        col = str(column or "").strip()
+        if not ph or not col:
+            continue
+        if col in out:
+            out[ph] = out[col]
+    return out
+
+
+def mapping_gaps(
+    placeholders: List[str],
+    columns: List[str],
+    mapping: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    cols = {str(c) for c in (columns or [])}
+    mapping = mapping or {}
+    missing = []
+    for name in placeholders:
+        mapped = (mapping.get(name) or "").strip()
+        if name in cols or (mapped and mapped in cols):
+            continue
+        missing.append(name)
+    return missing
+
 
 def safe_format(template: str, row: Dict[str, Any]) -> str:
-    class SafeDict(dict):
-        def __missing__(self, key):
-            return ""
+    """Substitute {Column} with the raw cell value.
 
-    try:
-        return template.format_map(SafeDict(row))
-    except ValueError:
-        pattern = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
-        return pattern.sub(lambda m: str(row.get(m.group(1), "")), template)
+    Deliberately does not use str.format_map: format() treats a literal JSON
+    example in the prompt as a field spec, so `{"topic": ""}` could be replaced
+    with nothing, silently deleting the output schema the prompt asks for. It
+    also raises IndexError on `{0}` and eats `{a, b}`. A single regex pass over
+    PLACEHOLDER_RE is predictable and matches exactly what required_placeholders
+    reports to the mapping UI.
+    """
+
+    def replace(match):
+        name = match.group(1).strip()
+        if name in row:
+            return str(row[name])
+        # Unknown field: leave the placeholder visible instead of blanking it,
+        # so a mismatch shows up in the Test preview rather than producing a
+        # clean-looking run over empty inputs.
+        return match.group(0)
+
+    return PLACEHOLDER_RE.sub(replace, template or "")
 
 
 def try_parse_json(text: str) -> Tuple[Optional[Any], Optional[str]]:
@@ -275,12 +343,87 @@ def _write_csv(path: str, df: pd.DataFrame):
     df.to_csv(path, index=False, quoting=csv.QUOTE_ALL, lineterminator="\n")
 
 
+# Instructions first, then this header, then substituted input data. Keep in sync with the UI copy.
+INPUT_SECTION_HEADER = "===== INPUT ====="
+
+
 def render_prompt(prompt_template: str, row: Dict[str, Any]) -> str:
     row_json = json.dumps(row, ensure_ascii=False)
     row_for_template = dict(row)
     row_for_template["row_json"] = row_json
-    tmp = prompt_template.replace("{{row_json}}", "{row_json}")
+    tmp = (prompt_template or "").replace("{{row_json}}", "{row_json}")
     return safe_format(tmp, row_for_template)
+
+
+def compose_model_input(
+    prompt_template: str,
+    row: Dict[str, Any],
+    input_template: str = "",
+    column_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """Build the text sent to the model.
+
+    Placeholders are replaced with the raw cell value (no automatic label).
+    If input_template is empty, this is exactly render_prompt(prompt_template, row).
+    Otherwise: substituted instructions, a blank line, ===== INPUT =====, then the data last.
+    """
+    used = apply_column_map(row, column_map)
+    instructions = render_prompt(prompt_template or "", used)
+    extra = input_template or ""
+    if not extra.strip():
+        return instructions
+    data = render_prompt(extra, used)
+    return f"{instructions.rstrip()}\n\n{INPUT_SECTION_HEADER}\n{data}"
+
+
+def templates_have_placeholder(
+    prompt_template: str,
+    input_template: str,
+    names: List[str],
+    column_map: Optional[Dict[str, str]] = None,
+) -> bool:
+    allowed = list(names or [])
+    colset = {str(n) for n in allowed}
+    for placeholder, column in (column_map or {}).items():
+        ph = str(placeholder or "").strip()
+        col = str(column or "").strip()
+        if ph and col in colset:
+            allowed.append(ph)
+    if _prompt_has_placeholder(prompt_template or "", allowed):
+        return True
+    if (input_template or "").strip() and _prompt_has_placeholder(input_template, allowed):
+        return True
+    placeholders = required_placeholders(prompt_template, input_template)
+    if not placeholders:
+        return False
+    return bool(
+        [p for p in placeholders if p in colset or ((column_map or {}).get(p) or "").strip() in colset]
+    )
+
+
+def row_input_error(
+    prompt_template: str,
+    input_template: str,
+    columns: List[str],
+    column_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """Empty if every placeholder resolves and the prompt actually gets row data.
+
+    Every unresolved placeholder is reported, not just the case where nothing
+    resolves at all. One good placeholder used to be enough to pass this gate,
+    so a prompt written against `{Client Id}` would run to completion against a
+    sheet that calls it `client_id` -- substituting nothing, reporting no error,
+    and billing the full batch for answers built on missing fields.
+    """
+    cols = list(columns or [])
+    gaps = mapping_gaps(required_placeholders(prompt_template, input_template), cols, column_map)
+    if gaps:
+        names = ", ".join("{" + g + "}" for g in gaps)
+        lead = "This prompt field is not" if len(gaps) == 1 else "These prompt fields are not"
+        return f"{lead} in your sheet: {names}. Map each one to a column, or fix the spelling."
+    if templates_have_placeholder(prompt_template, input_template, ["row_json"] + cols, column_map):
+        return ""
+    return "Add a {column} in Instructions or Input data, or map a prompt field to a sheet column."
 
 
 def process_row(
@@ -292,10 +435,12 @@ def process_row(
     model: str,
     is_json_mode: bool,
     model_params: Optional[Dict[str, Any]],
+    input_template: str = "",
+    column_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], set, str, str]:
     import time
 
-    prompt = render_prompt(prompt_template, row)
+    prompt = compose_model_input(prompt_template, row, input_template, column_map=column_map)
     t0 = time.time()
     try:
         text = call_provider(
@@ -336,24 +481,98 @@ def process_row(
     return out, row_keys, prompt, text
 
 
-def call_openai(api_key: str, model: str, prompt: str, model_params: Optional[Dict[str, Any]] = None) -> str:
+# Not every OpenAI-compatible gateway accepts the JSON response format, and a
+# rejection only shows up as an API error at call time. Probe once per
+# (base_url, model) and remember the answer so a gateway that cannot do it costs
+# one extra request in total rather than one per row.
+_json_mode_unsupported: set = set()
+_json_mode_lock = __import__("threading").Lock()
+
+
+def _json_mode_ok(scope: str) -> bool:
+    with _json_mode_lock:
+        return scope not in _json_mode_unsupported
+
+
+def _mark_json_mode_unsupported(scope: str) -> None:
+    with _json_mode_lock:
+        _json_mode_unsupported.add(scope)
+
+
+def _responses_call(
+    client: "OpenAI",
+    model: str,
+    prompt: str,
+    json_mode: bool,
+    model_params: Optional[Dict[str, Any]],
+    scope: str,
+) -> str:
+    params = dict(model_params or {})
+    if json_mode and _json_mode_ok(scope):
+        try:
+            resp = client.responses.create(
+                model=model,
+                input=prompt,
+                text={"format": {"type": "json_object"}},
+                **params,
+            )
+            return resp.output_text
+        except Exception:
+            # The gateway or model does not take a JSON response format. Fall
+            # back to plain text for this and every later call on this scope --
+            # the prompt still asks for JSON and try_parse_json still repairs it.
+            _mark_json_mode_unsupported(scope)
+    resp = client.responses.create(model=model, input=prompt, **params)
+    return resp.output_text
+
+
+def call_openai(
+    api_key: str,
+    model: str,
+    prompt: str,
+    json_mode: bool = False,
+    model_params: Optional[Dict[str, Any]] = None,
+) -> str:
     client = OpenAI(api_key=api_key)
-    resp = client.responses.create(model=model, input=prompt, **(model_params or {}))
-    return resp.output_text
+    return _responses_call(client, model, prompt, json_mode, model_params, f"openai::{model}")
 
 
-def call_langcc(api_key: str, model: str, prompt: str, model_params: Optional[Dict[str, Any]] = None) -> str:
+def call_langcc(
+    api_key: str,
+    model: str,
+    prompt: str,
+    json_mode: bool = False,
+    model_params: Optional[Dict[str, Any]] = None,
+) -> str:
     client = OpenAI(api_key=api_key, base_url=LANGCC_API_BASE)
-    resp = client.responses.create(model=model, input=prompt, **(model_params or {}))
-    return resp.output_text
+    return _responses_call(client, model, prompt, json_mode, model_params, f"{LANGCC_API_BASE}::{model}")
 
 
-def call_gemini(api_key: str, model: str, prompt: str, model_params: Optional[Dict[str, Any]] = None) -> str:
+def call_gemini(
+    api_key: str,
+    model: str,
+    prompt: str,
+    json_mode: bool = False,
+    model_params: Optional[Dict[str, Any]] = None,
+) -> str:
     client = genai.Client(api_key=api_key)
     config = {}
     for src, dst in (("temperature", "temperature"), ("top_p", "top_p"), ("max_output_tokens", "max_output_tokens")):
         if model_params and src in model_params:
             config[dst] = model_params[src]
+    scope = f"gemini::{model}"
+    if json_mode and _json_mode_ok(scope):
+        try:
+            return (
+                client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config={**config, "response_mime_type": "application/json"},
+                ).text
+                or ""
+            )
+        except Exception:
+            _mark_json_mode_unsupported(scope)
     resp = client.models.generate_content(model=model, contents=prompt, config=config or None)
     return resp.text or ""
 
@@ -413,11 +632,89 @@ def call_provider(
 ) -> str:
     p = provider.lower().strip()
     if p == "openai":
-        return call_openai(api_key, model, prompt, model_params=model_params)
+        return call_openai(api_key, model, prompt, json_mode=json_mode, model_params=model_params)
     if p == "langcc":
-        return call_langcc(api_key, model, prompt, model_params=model_params)
+        return call_langcc(api_key, model, prompt, json_mode=json_mode, model_params=model_params)
     if p == "gemini":
-        return call_gemini(api_key, model, prompt, model_params=model_params)
+        return call_gemini(api_key, model, prompt, json_mode=json_mode, model_params=model_params)
     if p == "ollama":
         return call_ollama(model, prompt, json_mode=json_mode, model_params=model_params)
     raise ValueError("Unsupported provider")
+
+
+def _stringify_headers(df: pd.DataFrame) -> pd.DataFrame:
+    new_cols = []
+    seen: Dict[str, int] = {}
+    for i, c in enumerate(df.columns):
+        name = "" if _is_empty_value(c) else str(c).strip()
+        if not name or name.lower().startswith("unnamed"):
+            name = f"column_{i + 1}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 1
+        new_cols.append(name)
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
+def _normalize_table(df: pd.DataFrame) -> pd.DataFrame:
+    df = _stringify_headers(df)
+    df = df.loc[~df.apply(_row_is_empty_series, axis=1)].reset_index(drop=True)
+    df = df.map(_normalize_value) if hasattr(df, "map") else df.applymap(_normalize_value)
+    return df
+
+
+def _looks_like_xlsx(raw: bytes, filename: str) -> bool:
+    name = (filename or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xlsm"):
+        return True
+    return raw[:2] == b"PK"
+
+
+def _looks_like_xls(raw: bytes, filename: str) -> bool:
+    name = (filename or "").lower()
+    if name.endswith(".xls"):
+        return True
+    return raw[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def load_tabular_file(raw: bytes, filename: str = "") -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Parse CSV or Excel into a normalized DataFrame. Always uses the first sheet."""
+    import io
+
+    name = (filename or "").lower()
+    meta: Dict[str, Any] = {"source": "csv", "sheets": [], "used_sheet": "", "note": ""}
+
+    if _looks_like_xlsx(raw, name) or _looks_like_xls(raw, name):
+        is_legacy = _looks_like_xls(raw, name) and not _looks_like_xlsx(raw, name)
+        engine = None if is_legacy else "openpyxl"
+        try:
+            xl = pd.ExcelFile(io.BytesIO(raw), engine=engine)
+        except Exception as e:
+            if is_legacy:
+                raise ValueError("This older .xls file could not be read. Save it as .xlsx and try again.") from e
+            raise ValueError(f"Could not read this Excel file: {e}") from e
+        sheets = [str(s) for s in (xl.sheet_names or [])]
+        if not sheets:
+            raise ValueError("This Excel file has no sheets.")
+        used = sheets[0]
+        df = xl.parse(used)
+        meta.update({"source": "xls" if is_legacy else "xlsx", "sheets": sheets, "used_sheet": used})
+        if len(sheets) > 1:
+            meta["note"] = f"This workbook has {len(sheets)} sheets. We used the first one ({used})."
+        df = _normalize_table(df)
+        if df.empty:
+            raise ValueError("The first sheet has no non-empty rows.")
+        return df, meta
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as e:
+        raise ValueError(f"Could not read this file as a spreadsheet: {e}") from e
+    df = _normalize_table(df)
+    if df.empty:
+        raise ValueError("This file has no non-empty rows.")
+    return df, meta

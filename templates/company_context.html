@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Company info · Maids Evals{% endblock %}
+{% block body %}
+  <div class="wizard-page">
+    <h1>Company info</h1>
+    <p class="lede">Shared notes about maids.cc. The prompt helper and the prompt fixer read this so they use the right names (Enchanters, Resolvers, CC, MV, PTC). It is not pasted into every analysis prompt — only used to ground those helpers.</p>
+
+    <section class="card">
+      <div class="kicker">Team notes</div>
+      <p class="empty-hint">Anyone logged in can view and edit this. Changes apply to the next helper or fixer call.</p>
+      <div class="notice" role="note">
+        <strong>Volatile facts are not a source of truth.</strong>
+        Prices, salaries, benefit amounts, employee or client counts, ratings, branch counts, and nationality availability must not be quoted from this page. If a figure is needed, the helper is told to say it must be pulled from the owning source.
+      </div>
+      <form id="context-form">
+        <label for="context-text">Company notes</label>
+        <textarea id="context-text" name="content" class="context-editor" spellcheck="false">{{ context_text }}</textarea>
+        <div class="actions">
+          <button type="submit" id="context-save">Save company info</button>
+          <button type="button" id="context-copy" class="secondary">Copy</button>
+          <a class="btn ghost" href="/builder">Back to Build prompt</a>
+        </div>
+        <p class="slot-msg" id="context-status">{{ context_chars }} characters. Last saved text is what the helpers see.</p>
+      </form>
+    </section>
+  </div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/company-context.js"></script>
+{% endblock %}

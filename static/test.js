@@ -40,7 +40,7 @@
       const resp = await fetch(`/credentials?provider=${encodeURIComponent(provider)}`, { credentials: "same-origin" });
       if (!resp.ok) return;
       const data = await resp.json();
-      if (llmPass && data.api_key) llmPass.value = data.api_key;
+      if (llmPass && data.saved && !llmPass.value) llmPass.placeholder = "Saved key in use — leave blank";
       if (keyForget) keyForget.disabled = !data.saved;
       if (data.saved) setStatus(keyStatus, "Saved for your account only.");
     } catch (_) {}
@@ -126,16 +126,21 @@
     body.append("api_key", llmPass?.value || "");
     body.append("verdict", verdict);
     body.append("note", note);
-    setStatus(fixerStatus, "Running analyst → editor → critic…", true);
-    const resp = await fetch("/test/improve", { method: "POST", body, credentials: "same-origin" });
-    if (!resp.ok) {
-      setStatus(fixerStatus, await resp.text(), false);
-      return;
-    }
-    let data = { status: "running" };
-    while (data.status === "running") {
-      await new Promise((r) => setTimeout(r, 800));
-      data = await pollFixer();
+    setStatus(fixerStatus, "Running analyst → editor → critic… this can take a minute.", true);
+    window.setBusy("improve-button", true, "Working…");
+    try {
+      const resp = await fetch("/test/improve", { method: "POST", body, credentials: "same-origin" });
+      if (!resp.ok) {
+        setStatus(fixerStatus, await resp.text(), false);
+        return;
+      }
+      let data = { status: "running" };
+      while (data.status === "running") {
+        await new Promise((r) => setTimeout(r, 800));
+        data = await pollFixer();
+      }
+    } finally {
+      window.setBusy("improve-button", false);
     }
   });
 

@@ -80,14 +80,17 @@
         <span>Prompt used for this run</span>
         <a class="small" href="/prompts/history{% if prompt_name %}?name={{ prompt_name }}{% endif %}">Fix history →</a>
       </div>
-      <label for="review-prompt">Edit if you already know the fix</label>
-      <textarea id="review-prompt" style="min-height:180px;">{{ prompt_draft }}</textarea>
-      <p class="small">This draft is stored on your run. Accepting an automated fix writes a new version into the shared library.</p>
+      <label for="review-prompt">Instructions (editable)</label>
+      <textarea id="review-prompt" class="instructions-box">{{ prompt_draft }}</textarea>
+      <label for="review-input-template">Input data (read-only)</label>
+      <p class="empty-hint">{% if input_template %}Added after the instructions, under ===== INPUT =====, when this run was sent.{% else %}This run used instructions only (no separate input section).{% endif %}</p>
+      <textarea id="review-input-template" class="input-data-box" readonly>{{ input_template }}</textarea>
+      <p class="small">The fixer edits instructions only. Accepting an automated fix writes a new version into the shared library.</p>
       <form id="llm-credentials" class="creds" method="post" action="/" autocomplete="on" style="margin-top:12px;">
         <label for="llm-username">Key name</label>
         <input id="llm-username" name="username" type="text" autocomplete="username" value="{{ provider }}" />
         <label for="llm-password">API key</label>
-        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="Needed only to improve the prompt" value="{{ saved_api_key }}" />
+        <input id="llm-password" name="password" type="password" autocomplete="current-password" placeholder="{% if saved_key_exists %}Saved key in use — leave blank{% else %}Needed only to improve the prompt{% endif %}" value="" />
         <div class="actions tight">
           <button type="button" id="key-save" class="secondary">Save key</button>
           <button type="button" id="key-forget" class="ghost" {% if not saved_key_exists %}disabled{% endif %}>Forget saved key</button>

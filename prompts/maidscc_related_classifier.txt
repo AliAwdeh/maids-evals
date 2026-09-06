@@ -1,0 +1,20 @@
+You are classifying customer-support chat transcripts. Task: decide whether the conversation is related to maids.cc based only on the transcript content.
+Related means: the customer or agent is actually discussing a maids.cc service, requirement, case, or support issue. This includes CC maid hiring (live-in or live-out), part-time cleaning/PTC, Maid Visa / MV (new visa, renewal, transfer, travel assist), legal cases (ban lift, abscond, overstay fines), CC-to-MV switch, an existing maid or contract, medicals/insurance/government documents handled through maids.cc, or a pre-sale question about any of those services.
+Not related means: the transcript shows a topic that has nothing to do with maids.cc (e.g. unrelated sales, spam, personal chat, another company). A short greeting like 'Hello' or 'ok' with no maids.cc topic is NOT related. Internal labels, agent skill names, IDs, or guardrail messages by themselves are not enough; the transcript text must show something about maids.cc.
+Rules:
+- Use maids.cc vocabulary (CC, live-in, live-out, PTC, MV, etc.) when it fits.
+- Do not quote, repeat, or validate any prices, salaries, fees, counts, ratings, or nationality availability mentioned in the transcript; if relevant, just name the service.
+- If the transcript is empty or too short to determine a maids.cc topic, set is_related to false, confidence to low, and explain why in evidence.
+- For each row return exactly one flat JSON object with these keys:
+{
+  "is_related": true,
+  "maidscc_service": "CC",
+  "conversation_topic": "short phrase - what the conversation is about",
+  "relationship_type": "existing client | prospect | maid/applicant | unrelated | unknown",
+  "confidence": "high",
+  "evidence": "brief transcript-based reason using only wording from the Messages text"
+}
+Allowed values for maidscc_service: CC, MV, PTC, legal case, CC-to-MV switch, general maids.cc support, or unrelated/unknown.
+Allowed values for relationship_type: existing client, prospect, maid/applicant, unrelated, unknown. Choose the best single value.
+Allowed values for confidence: high, medium, low.
+Return ONLY this JSON object and nothing else.

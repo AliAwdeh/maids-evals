@@ -14,26 +14,36 @@
     <header class="topbar">
       <a class="brand" href="/">
         <strong>Maids Evals</strong>
-        <span>Batch prompt review for support conversations</span>
+        <span>Run an analysis prompt over any text — chats, call transcripts, SMS, tickets</span>
       </a>
       <nav class="nav" aria-label="Main">
         <a href="/" class="{% if nav == 'run' %}active{% endif %}" {% if nav == 'run' %}aria-current="page"{% endif %}>New run</a>
+        <a href="/builder" class="{% if nav == 'builder' %}active{% endif %}" {% if nav == 'builder' %}aria-current="page"{% endif %}>Build prompt</a>
+        <a href="/catalogue" class="{% if nav == 'catalogue' %}active{% endif %}" {% if nav == 'catalogue' %}aria-current="page"{% endif %}>Prompts</a>
+        <span class="nav-gap" aria-hidden="true"></span>
         <a href="/export" class="{% if nav == 'results' %}active{% endif %}" {% if nav == 'results' %}aria-current="page"{% endif %}>Results</a>
         <a href="/review" class="{% if nav == 'review' %}active{% endif %}" {% if nav == 'review' %}aria-current="page"{% endif %}>Review</a>
-        <span class="nav-gap" aria-hidden="true"></span>
-        <a href="/prompts/history" class="{% if nav == 'prompts' %}active{% endif %}" {% if nav == 'prompts' %}aria-current="page"{% endif %}>Prompts</a>
-        <a href="/runs" class="{% if nav == 'history' %}active{% endif %}" {% if nav == 'history' %}aria-current="page"{% endif %}>History</a>
-        {% if is_admin %}
-        <a href="/admin/users" class="{% if nav == 'admin' %}active{% endif %}" {% if nav == 'admin' %}aria-current="page"{% endif %}>Admin</a>
-        {% endif %}
-        <span class="who">{{ user }}</span>
-        <form action="/logout" method="post" style="display:inline;">
-          <button type="submit" class="linkish">Log out</button>
-        </form>
+        <details class="nav-more">
+          <summary>More</summary>
+          <div class="nav-more-menu">
+            <a href="/runs" class="{% if nav == 'history' %}active{% endif %}">Run history</a>
+            <a href="/prompts/history" class="{% if nav == 'prompts' %}active{% endif %}">Prompt fix history</a>
+            <a href="/context" class="{% if nav == 'context' %}active{% endif %}">Company notes</a>
+            <a href="/settings" class="{% if nav == 'settings' %}active{% endif %}">Settings</a>
+            {% if is_admin %}
+            <a href="/admin/users" class="{% if nav == 'admin' %}active{% endif %}">Admin</a>
+            {% endif %}
+            <span class="nav-who">Signed in as {{ user }}</span>
+            <form action="/logout" method="post">
+              <button type="submit" class="linkish">Log out</button>
+            </form>
+          </div>
+        </details>
       </nav>
     </header>
     {% block body %}{% endblock %}
   </div>
+  <script src="/static/busy.js"></script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

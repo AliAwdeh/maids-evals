@@ -103,24 +103,37 @@ def _normalize_key_provider(provider: str) -> str:
 
 
 def _read_secrets_blob(username: str) -> Dict[str, str]:
+    return _read_secrets_full(username).get("keys") or {}
+
+
+def _read_secrets_full(username: str) -> Dict[str, Any]:
     path = secrets_path(username)
     if not path.is_file():
-        return {}
+        return {"v": 2, "keys": {}, "named": {}}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return {}
-    keys = data.get("keys") if isinstance(data, dict) else None
-    if not isinstance(keys, dict):
-        return {}
-    return {str(k): str(v) for k, v in keys.items() if v}
+        return {"v": 2, "keys": {}, "named": {}}
+    if not isinstance(data, dict):
+        return {"v": 2, "keys": {}, "named": {}}
+    keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
+    named = data.get("named") if isinstance(data.get("named"), dict) else {}
+    return {
+        "v": 2,
+        "keys": {str(k): str(v) for k, v in keys.items() if v},
+        "named": {str(k): v for k, v in named.items() if isinstance(v, dict)},
+    }
 
 
-def _write_secrets_blob(username: str, keys: Dict[str, str]) -> None:
+def _write_secrets_full(username: str, blob: Dict[str, Any]) -> None:
     path = secrets_path(username, create=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"v": 1, "keys": keys}
+    payload = {
+        "v": 2,
+        "keys": blob.get("keys") or {},
+        "named": blob.get("named") or {},
+    }
     tmp = path.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -130,6 +143,12 @@ def _write_secrets_blob(username: str, keys: Dict[str, str]) -> None:
         os.chmod(path, 0o600)
     except Exception:
         pass
+
+
+def _write_secrets_blob(username: str, keys: Dict[str, str]) -> None:
+    blob = _read_secrets_full(username)
+    blob["keys"] = keys
+    _write_secrets_full(username, blob)
 
 
 def load_user_secret(username: str, provider: str) -> Optional[str]:
@@ -160,12 +179,222 @@ def save_user_secret(username: str, provider: str, api_key: str) -> str:
 
 def delete_user_secret(username: str, provider: str) -> bool:
     name = _normalize_key_provider(provider)
-    blob = _read_secrets_blob(username)
-    if name not in blob:
+    blob = _read_secrets_full(username)
+    keys = blob.get("keys") or {}
+    if name not in keys:
         return False
-    del blob[name]
-    _write_secrets_blob(username, blob)
+    del keys[name]
+    blob["keys"] = keys
+    _write_secrets_full(username, blob)
     return True
+
+
+AI_TOOLS = ("runner", "builder", "fixer", "catalogue", "finder")
+
+
+def _encrypt_value(value: str) -> str:
+    return _fernet().encrypt((value or "").encode("utf-8")).decode("ascii")
+
+
+def _decrypt_value(token: str) -> Optional[str]:
+    if not token:
+        return None
+    try:
+        raw = _fernet().decrypt(token.encode("utf-8"))
+    except (InvalidToken, Exception):
+        return None
+    value = raw.decode("utf-8")
+    return value or None
+
+
+def save_named_key(username: str, label: str, provider: str, api_key: str, key_id: str = "") -> Dict[str, str]:
+    name = _normalize_key_provider(provider)
+    key = (api_key or "").strip()
+    if not key:
+        raise ValueError("API key is empty.")
+    display = (label or "").strip() or name
+    blob = _read_secrets_full(username)
+    named = blob.get("named") or {}
+    kid = (key_id or "").strip() or secrets.token_hex(4)
+    named[kid] = {
+        "id": kid,
+        "label": display,
+        "provider": name,
+        "token": _encrypt_value(key),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    blob["named"] = named
+    keys = blob.get("keys") or {}
+    keys[name] = named[kid]["token"]
+    blob["keys"] = keys
+    _write_secrets_full(username, blob)
+    return {"id": kid, "label": display, "provider": name}
+
+
+def list_named_keys(username: str) -> List[Dict[str, str]]:
+    blob = _read_secrets_full(username)
+    out: List[Dict[str, str]] = []
+    seen_providers = set()
+    for item in (blob.get("named") or {}).values():
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "")
+        out.append({
+            "id": str(item.get("id") or ""),
+            "label": str(item.get("label") or provider),
+            "provider": provider,
+        })
+        seen_providers.add(provider)
+    for provider, token in (blob.get("keys") or {}).items():
+        if provider in seen_providers or not token:
+            continue
+        out.append({"id": provider, "label": provider, "provider": provider, "legacy": "1"})
+    out.sort(key=lambda x: (x.get("provider") or "", x.get("label") or ""))
+    return out
+
+
+def load_named_key(username: str, key_id: str) -> Optional[str]:
+    kid = (key_id or "").strip()
+    if not kid:
+        return None
+    blob = _read_secrets_full(username)
+    item = (blob.get("named") or {}).get(kid)
+    if isinstance(item, dict):
+        return _decrypt_value(str(item.get("token") or ""))
+    if kid in (blob.get("keys") or {}):
+        return _decrypt_value(str(blob["keys"][kid]))
+    return None
+
+
+def delete_named_key(username: str, key_id: str) -> bool:
+    kid = (key_id or "").strip()
+    blob = _read_secrets_full(username)
+    named = blob.get("named") or {}
+    if kid in named:
+        provider = str((named.get(kid) or {}).get("provider") or "")
+        del named[kid]
+        blob["named"] = named
+        keys = blob.get("keys") or {}
+        still = any(str((v or {}).get("provider") or "") == provider for v in named.values())
+        if not still and provider in keys:
+            del keys[provider]
+            blob["keys"] = keys
+        _write_secrets_full(username, blob)
+        return True
+    keys = blob.get("keys") or {}
+    if kid in keys:
+        del keys[kid]
+        blob["keys"] = keys
+        _write_secrets_full(username, blob)
+        return True
+    return False
+
+
+def resolve_user_key(username: str, provider: str = "", key_id: str = "") -> str:
+    if key_id:
+        found = load_named_key(username, key_id)
+        if found:
+            return found
+    if provider:
+        found = load_user_secret(username, provider)
+        if found:
+            return found
+        for item in list_named_keys(username):
+            if item.get("provider") == (provider or "").strip().lower():
+                val = load_named_key(username, item.get("id") or "")
+                if val:
+                    return val
+    return ""
+
+
+def settings_path(username: str) -> Path:
+    return user_dir(username) / "settings.json"
+
+
+def default_settings() -> Dict[str, Any]:
+    empty_tool = {"provider": "", "model": "", "key_id": ""}
+    return {
+        "default_provider": "langcc",
+        "default_model": "gpt-5-mini",
+        "default_key_id": "",
+        "last_prompt_id": "",
+        "last_prompt_name": "",
+        "tools": {name: dict(empty_tool) for name in AI_TOOLS},
+    }
+
+
+def load_user_settings(username: str) -> Dict[str, Any]:
+    path = settings_path(username)
+    data = {}
+    if path.is_file():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+    base = default_settings()
+    base["default_provider"] = str(data.get("default_provider") or base["default_provider"]).strip().lower() or "langcc"
+    base["default_model"] = str(data.get("default_model") or base["default_model"]).strip() or "gpt-5-mini"
+    base["default_key_id"] = str(data.get("default_key_id") or "").strip()
+    base["last_prompt_id"] = str(data.get("last_prompt_id") or "").strip()
+    base["last_prompt_name"] = str(data.get("last_prompt_name") or "").strip()
+    tools = data.get("tools") if isinstance(data.get("tools"), dict) else {}
+    for name in AI_TOOLS:
+        raw = tools.get(name) if isinstance(tools.get(name), dict) else {}
+        base["tools"][name] = {
+            "provider": str(raw.get("provider") or "").strip().lower(),
+            "model": str(raw.get("model") or "").strip(),
+            "key_id": str(raw.get("key_id") or "").strip(),
+        }
+    return base
+
+
+def save_user_settings(username: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    current = load_user_settings(username)
+    if "default_provider" in payload:
+        current["default_provider"] = str(payload.get("default_provider") or "langcc").strip().lower() or "langcc"
+    if "default_model" in payload:
+        current["default_model"] = str(payload.get("default_model") or "").strip() or current["default_model"]
+    if "default_key_id" in payload:
+        current["default_key_id"] = str(payload.get("default_key_id") or "").strip()
+    if "last_prompt_id" in payload:
+        current["last_prompt_id"] = str(payload.get("last_prompt_id") or "").strip()
+    if "last_prompt_name" in payload:
+        current["last_prompt_name"] = str(payload.get("last_prompt_name") or "").strip()
+    tools = payload.get("tools") if isinstance(payload.get("tools"), dict) else {}
+    for name in AI_TOOLS:
+        raw = tools.get(name) if isinstance(tools.get(name), dict) else None
+        if not raw:
+            continue
+        current["tools"][name] = {
+            "provider": str(raw.get("provider") or "").strip().lower(),
+            "model": str(raw.get("model") or "").strip(),
+            "key_id": str(raw.get("key_id") or "").strip(),
+        }
+    path = settings_path(username)
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    return current
+
+
+def remember_last_prompt(username: str, prompt_id: str, prompt_name: str) -> None:
+    if not prompt_id:
+        return
+    save_user_settings(username, {"last_prompt_id": prompt_id, "last_prompt_name": prompt_name or ""})
+
+
+def tool_defaults(username: str, tool: str) -> Dict[str, str]:
+    settings = load_user_settings(username)
+    cfg = (settings.get("tools") or {}).get(tool) or {}
+    provider = (cfg.get("provider") or settings.get("default_provider") or "langcc").strip().lower()
+    model = (cfg.get("model") or settings.get("default_model") or "gpt-5-mini").strip()
+    key_id = (cfg.get("key_id") or settings.get("default_key_id") or "").strip()
+    return {"provider": provider, "model": model, "key_id": key_id}
 
 
 def prompt_path(name: str) -> Path:
@@ -195,6 +424,14 @@ def save_prompt(name: str, content: str) -> str:
     with open(path, "w", encoding="utf-8") as f:
         f.write(content or "")
     return safe_name
+
+
+def unique_prompt_name(name: str) -> str:
+    safe = _safe_prompt_name(name)
+    existing = set(list_prompts())
+    if safe not in existing:
+        return safe
+    return next_prompt_version(safe)
 
 
 def next_prompt_version(name: str) -> str:
@@ -460,6 +697,7 @@ def read_usage(username: str, since: Optional[datetime] = None) -> Dict[str, Any
 def _empty_review() -> Dict[str, Any]:
     return {
         "prompt_draft": "",
+        "input_template": "",
         "notes": {},
         "fixer": {
             "status": "idle",
@@ -510,6 +748,7 @@ def save_run_archive(
     worker_count: int,
     model_params: Dict[str, Any],
     prompt_template: str,
+    input_template: str = "",
 ) -> str:
     run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(4)
     path = run_dir(username, run_id)
@@ -537,6 +776,8 @@ def save_run_archive(
 
     with open(path / "prompt.txt", "w", encoding="utf-8") as f:
         f.write(prompt_template or "")
+    with open(path / "input_template.txt", "w", encoding="utf-8") as f:
+        f.write(input_template or "")
 
     failed_count = sum(1 for r in results if r.get("llm_api_failed"))
     valid_json_count = sum(1 for r in results if r.get("llm_json_valid"))
@@ -557,12 +798,14 @@ def save_run_archive(
         "json_mode": bool(sess.get("json_mode")),
         "model_params": model_params,
         "prompt_name": sess.get("prompt_name", ""),
+        "input_template": input_template or "",
     }
     with open(path / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2, default=_json_default)
 
     review = _empty_review()
     review["prompt_draft"] = prompt_template or ""
+    review["input_template"] = input_template or ""
     save_review(username, run_id, review)
     return run_id
 
@@ -636,6 +879,11 @@ def load_run_into_session(username: str, run_id: str, sess: Dict[str, Any]) -> N
     prompt = load_run_prompt(username, run_id)
     if prompt:
         sess["prompt_template"] = prompt
+    input_t = meta.get("input_template")
+    if input_t is None:
+        extra = run_dir(username, run_id) / "input_template.txt"
+        input_t = extra.read_text(encoding="utf-8") if extra.is_file() else ""
+    sess["input_template"] = input_t or ""
     sess.pop("progress", None)
 
 
@@ -646,6 +894,7 @@ def run_file(username: str, run_id: str, kind: str) -> Path:
         "results": "results.json",
         "metadata": "metadata.json",
         "prompt": "prompt.txt",
+        "input_template": "input_template.txt",
         "review": "review.json",
     }
     if kind not in file_map:

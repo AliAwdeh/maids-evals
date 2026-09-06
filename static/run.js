@@ -6,6 +6,9 @@
   const modelSearch = document.getElementById("model-search");
   const modelRefresh = document.getElementById("model-refresh");
   const promptBox = document.getElementById("prompt-template");
+  const inputBox = document.getElementById("input-template");
+  const chipTargetStatus = document.getElementById("chip-target-status");
+  let insertTarget = inputBox || promptBox;
   const promptSelect = document.getElementById("prompt-select");
   const promptName = document.getElementById("prompt-name");
   const promptLoad = document.getElementById("prompt-load");
@@ -87,8 +90,14 @@
     return "";
   }
 
+  let savedKeyExists = false;
+
   function apiKey() {
     return llmPass?.value || "";
+  }
+
+  function haveKey() {
+    return !!apiKey().trim() || savedKeyExists;
   }
 
   function show(el, on) {
@@ -101,7 +110,7 @@
   }
 
   function modelCacheKey(provider) {
-    const keyPart = provider === "langcc" || provider === "openai" ? apiKey() : "";
+    const keyPart = provider === "langcc" || provider === "openai" ? (apiKey() || (savedKeyExists ? "saved" : "")) : "";
     return `${provider}:${keyPart}`;
   }
 
@@ -119,12 +128,17 @@
     const needs = KEY_PROVIDERS.includes(provider);
     if (llmPass) {
       llmPass.disabled = !needs;
-      llmPass.placeholder = needs ? "Required for OpenAI, LangCC, Gemini" : "Not required for Ollama";
+      llmPass.placeholder = !needs
+        ? "Not required for Ollama"
+        : saved
+        ? "Saved key in use — leave blank"
+        : "Required for OpenAI, LangCC, Gemini";
       if (needs) llmPass.value = key || "";
       else llmPass.value = "";
     }
     if (llmUser && !llmUser.dataset.touched) llmUser.value = provider;
-    setKeyActions(!!saved && needs);
+    savedKeyExists = !!saved && needs;
+    setKeyActions(savedKeyExists);
     if (!needs) setKeyStatus("Ollama does not use an API key.");
     else if (saved) setKeyStatus("Saved for your account only.");
     else setKeyStatus("Optional: save to this account, or let your password manager remember it.");
@@ -149,7 +163,7 @@
         setKeyStatus("Log in to load a saved key.", true);
       } else if (resp.ok) {
         const data = await resp.json();
-        applyKeyField(provider, data.api_key || "", !!data.saved);
+        applyKeyField(provider, "", !!data.saved);
       }
     } catch (_) {
       /* keep whatever is already in the field */
@@ -175,6 +189,7 @@
     const resp = await fetch("/credentials", { method: "POST", body: form, credentials: "same-origin" });
     if (resp.status === 401) return setKeyStatus("Log in to save a key.", true);
     if (!resp.ok) return setKeyStatus("Could not save key.", true);
+    savedKeyExists = true;
     setKeyActions(true);
     setKeyStatus("Saved for your account only.");
     if (usesModelList()) loadProviderModels(provider, { force: true });
@@ -189,6 +204,7 @@
     if (resp.status === 401) return setKeyStatus("Log in to change saved keys.", true);
     if (!resp.ok) return setKeyStatus("Could not forget key.", true);
     if (llmPass) llmPass.value = "";
+    savedKeyExists = false;
     setKeyActions(false);
     setKeyStatus("Saved key removed from your account.");
     if (usesModelList()) loadProviderModels(provider);
@@ -236,7 +252,7 @@
     const force = !!opts.force;
     if (!usesModelList()) return;
     // Providers that need a key can't list models until one is available.
-    if (modelFetchNeedsKey(provider) && !apiKey().trim()) {
+    if (modelFetchNeedsKey(provider) && !haveKey()) {
       setModelPlaceholder("Add an API key, then Refresh");
       showModelError(`Enter or save your ${providerLabel(provider)} API key to load models, then use Refresh.`);
       return;
@@ -355,21 +371,36 @@
   syncModelForProvider();
   loadSavedKey(currentProvider());
 
+  function setInsertTarget(el) {
+    if (!el) return;
+    insertTarget = el;
+    if (chipTargetStatus) {
+      chipTargetStatus.textContent = el === inputBox
+        ? "Chips insert into Input data."
+        : "Chips insert into Instructions.";
+    }
+  }
+  promptBox?.addEventListener("focus", () => setInsertTarget(promptBox));
+  inputBox?.addEventListener("focus", () => setInsertTarget(inputBox));
+
   document.querySelectorAll(".chip").forEach((btn) => {
     btn.addEventListener("click", () => {
-      if (!promptBox) return;
+      const box = insertTarget || inputBox || promptBox;
+      if (!box) return;
       const text = btn.getAttribute("data-insert") || "";
-      const start = promptBox.selectionStart ?? promptBox.value.length;
-      const end = promptBox.selectionEnd ?? promptBox.value.length;
-      promptBox.value = promptBox.value.slice(0, start) + text + promptBox.value.slice(end);
-      promptBox.focus();
-      promptBox.setSelectionRange(start + text.length, start + text.length);
+      const start = box.selectionStart ?? box.value.length;
+      const end = box.selectionEnd ?? box.value.length;
+      box.value = box.value.slice(0, start) + text + box.value.slice(end);
+      box.focus();
+      box.setSelectionRange(start + text.length, start + text.length);
+      setInsertTarget(box);
       queueSaveState();
     });
   });
 
   ["input", "change"].forEach((evt) => {
     promptBox?.addEventListener(evt, () => queueSaveState());
+    inputBox?.addEventListener(evt, () => queueSaveState());
     promptName?.addEventListener(evt, () => queueSaveState());
     runNameInput?.addEventListener(evt, () => queueSaveState());
     modelInput?.addEventListener(evt, () => queueSaveState());
@@ -384,6 +415,7 @@
     if (providerSel) form.append("provider", providerSel.value);
     form.append("model", currentModel());
     if (promptBox) form.append("prompt_template", promptBox.value);
+    if (inputBox) form.append("input_template", inputBox.value);
     const jsonMode = document.querySelector('input[name="json_mode"]');
     form.append("json_mode", jsonMode?.checked ? "1" : "0");
     if (maxWorkersInput) form.append("max_workers", maxWorkersInput.value);
@@ -414,40 +446,190 @@
     promptStatus.style.color = isError ? "#8d2c2c" : (msg ? "#2a6b4e" : "");
   }
 
-  promptLoad?.addEventListener("click", async () => {
-    const name = promptSelect?.value || "";
-    if (!name) return setPromptStatus("Select a saved prompt to load.", true);
-    const resp = await fetch(`/prompts/get?name=${encodeURIComponent(name)}`, { credentials: "same-origin" });
-    if (!resp.ok) return setPromptStatus("Failed to load prompt.", true);
-    const data = await resp.json();
-    if (promptBox) promptBox.value = data.content || "";
-    if (promptName) promptName.value = data.name || name;
-    setPromptStatus(`Loaded "${data.name || name}"`);
-    queueSaveState();
+  const PLACEHOLDER_RE = /\{([a-zA-Z_][a-zA-Z0-9_]*)\}/g;
+  let columnMap = Object.assign({}, (window.MAIDS || {}).columnMap || {});
+
+  function placeholderNames() {
+    const text = `${promptBox?.value || ""}\n${inputBox?.value || ""}`;
+    const names = [];
+    let match;
+    PLACEHOLDER_RE.lastIndex = 0;
+    while ((match = PLACEHOLDER_RE.exec(text))) {
+      const name = match[1];
+      if (name === "row_json" || names.includes(name)) continue;
+      names.push(name);
+    }
+    return names;
+  }
+
+  function fillSelect(sel, name, columns) {
+    sel.innerHTML = "";
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "Pick a column";
+    sel.appendChild(blank);
+    const selected = columnMap[name] || ((columns || []).includes(name) ? name : "");
+    (columns || []).forEach((col) => {
+      const opt = document.createElement("option");
+      opt.value = col;
+      opt.textContent = col;
+      if (col === selected) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }
+
+  function renderMapRows(host, names, columns) {
+    if (!host) return;
+    host.innerHTML = "";
+    if (!names.length) {
+      host.innerHTML = `<p class="small">No {fields} in the prompt yet.</p>`;
+      return;
+    }
+    names.forEach((name) => {
+      const row = document.createElement("div");
+      row.className = "map-row";
+      const label = document.createElement("strong");
+      label.textContent = `{${name}}`;
+      const sel = document.createElement("select");
+      sel.dataset.placeholder = name;
+      fillSelect(sel, name, columns);
+      row.appendChild(label);
+      row.appendChild(sel);
+      host.appendChild(row);
+    });
+  }
+
+  function setMapTag(needed) {
+    const tag = document.getElementById("map-tag");
+    if (!tag) return;
+    if (needed && needed.length) {
+      tag.textContent = "Needs mapping";
+      tag.className = "tag warn";
+    } else if (Object.keys(columnMap).length) {
+      tag.textContent = "Mapped";
+      tag.className = "tag ok";
+    } else {
+      tag.textContent = "Match names or map";
+      tag.className = "tag";
+    }
+  }
+
+  function refreshMappingPanel(needed) {
+    const columns = (window.MAIDS || {}).csvCols || [];
+    const names = placeholderNames();
+    const extra = Object.keys(columnMap).filter((name) => !names.includes(name));
+    renderMapRows(document.getElementById("map-inline-rows"), names.concat(extra), columns);
+    renderMapRows(document.getElementById("map-rows"), needed && needed.length ? needed : names, columns);
+    setMapTag(needed);
+  }
+
+  function collectMapping(root) {
+    const mapping = Object.assign({}, columnMap);
+    (root || document).querySelectorAll("select[data-placeholder]").forEach((sel) => {
+      const name = sel.dataset.placeholder;
+      if (!name) return;
+      if (sel.value) mapping[name] = sel.value;
+      else delete mapping[name];
+    });
+    return mapping;
+  }
+
+  function showMapping(needed, columns) {
+    if (columns) window.MAIDS.csvCols = columns;
+    refreshMappingPanel(needed);
+    const overlay = document.getElementById("map-overlay");
+    if (overlay) overlay.style.display = needed && needed.length ? "flex" : "none";
+  }
+
+  function filterPromptOptions() {
+    const q = (document.getElementById("prompt-search")?.value || "").trim().toLowerCase();
+    if (!promptSelect) return;
+    Array.from(promptSelect.options).forEach((opt, idx) => {
+      if (idx === 0) return;
+      const hay = `${opt.dataset.name || ""} ${opt.dataset.owner || ""} ${opt.textContent || ""}`.toLowerCase();
+      opt.hidden = !!(q && !hay.includes(q));
+    });
+  }
+
+  document.getElementById("prompt-search")?.addEventListener("input", filterPromptOptions);
+
+  document.getElementById("prompt-last")?.addEventListener("click", async () => {
+    const id = (window.MAIDS || {}).lastPromptId || "";
+    if (!id) return setPromptStatus("No last used prompt yet.", true);
+    if (promptSelect) promptSelect.value = id;
+    promptLoad?.click();
   });
 
-  promptSave?.addEventListener("click", async () => {
-    const name = (promptName?.value || "").trim();
-    if (!name) return setPromptStatus("Enter a prompt name to save.", true);
-    const form = new FormData();
-    form.append("prompt_name", name);
-    form.append("prompt_content", promptBox?.value || "");
-    const resp = await fetch("/prompts/save", { method: "POST", body: form, credentials: "same-origin" });
-    if (!resp.ok) return setPromptStatus("Failed to save prompt.", true);
-    const data = await resp.json();
-    if (promptSelect) {
-      let opt = Array.from(promptSelect.options).find((o) => o.value === data.name);
-      if (!opt) {
-        opt = document.createElement("option");
-        opt.value = data.name;
-        opt.textContent = data.name;
-        promptSelect.appendChild(opt);
+  promptLoad?.addEventListener("click", async () => {
+    const id = promptSelect?.value || "";
+    if (!id) return setPromptStatus("Select a prompt to load.", true);
+    setPromptStatus("Loading prompt…");
+    await window.withBusy(promptLoad, "Loading…", async () => {
+      const resp = await fetch(`/prompts/get?id=${encodeURIComponent(id)}`, { credentials: "same-origin" });
+      if (!resp.ok) return setPromptStatus("Failed to load prompt.", true);
+      const data = await resp.json();
+      if (promptBox) promptBox.value = data.content || "";
+      if (inputBox) inputBox.value = data.input_template || "";
+      setPromptStatus(`Loaded "${data.name || id}"`);
+      showMapping(data.mapping_needed || [], data.columns || (window.MAIDS || {}).csvCols || []);
+      if ((data.mapping_needed || []).length) {
+        setPromptStatus("This prompt needs columns mapped to your sheet. You can change the mapping below.");
       }
-      promptSelect.value = data.name;
-    }
-    setPromptStatus(`Saved "${data.name}" to the shared library`);
-    queueSaveState();
+      queueSaveState();
+    });
   });
+
+  async function saveMapping(fromOverlay) {
+    const root = fromOverlay ? document.getElementById("map-overlay") : document.getElementById("map-panel");
+    const mapping = collectMapping(root);
+    const btn = fromOverlay ? document.getElementById("map-save") : document.getElementById("map-inline-save");
+    const status = document.getElementById(fromOverlay ? "map-status" : "map-inline-status");
+    if (status) status.textContent = "Saving mapping…";
+    return window.withBusy(btn, "Saving…", async () => {
+      const resp = await fetch("/mapping/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          mapping,
+          prompt_template: promptBox?.value || "",
+          input_template: inputBox?.value || "",
+        }),
+      });
+      if (!resp.ok) {
+        if (status) status.textContent = "Could not save mapping.";
+        return;
+      }
+      const data = await resp.json();
+      columnMap = data.mapping || mapping;
+      if (status) status.textContent = data.mapping_needed && data.mapping_needed.length
+        ? "Still missing: " + data.mapping_needed.join(", ")
+        : "Mapping saved. You can change it any time.";
+      const other = document.getElementById(fromOverlay ? "map-inline-status" : "map-status");
+      if (other && other !== status) other.textContent = status.textContent;
+      refreshMappingPanel(data.mapping_needed || []);
+      if (fromOverlay && !(data.mapping_needed || []).length) {
+        const overlay = document.getElementById("map-overlay");
+        if (overlay) overlay.style.display = "none";
+      }
+    });
+  }
+
+  document.getElementById("map-cancel")?.addEventListener("click", () => {
+    const overlay = document.getElementById("map-overlay");
+    if (overlay) overlay.style.display = "none";
+  });
+  document.getElementById("map-save")?.addEventListener("click", () => saveMapping(true));
+  document.getElementById("map-inline-save")?.addEventListener("click", () => saveMapping(false));
+
+  let mapTimer = null;
+  [promptBox, inputBox].forEach((box) => {
+    box?.addEventListener("input", () => {
+      clearTimeout(mapTimer);
+      mapTimer = setTimeout(() => refreshMappingPanel(), 250);
+    });
+  });
+  refreshMappingPanel((window.MAIDS || {}).mappingNeeded || []);
 
   window.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") queueSaveState(true);
@@ -455,10 +637,13 @@
 
   function attachApiKey(formData) {
     formData.set("api_key", apiKey());
+    const keyPick = document.getElementById("key-pick");
+    if (keyPick && keyPick.value) formData.set("key_id", keyPick.value);
     if (sidToken) formData.set("sid_token", sidToken);
     if (providerSel) formData.set("provider", providerSel.value);
     formData.set("model", currentModel());
     if (promptBox) formData.set("prompt_template", promptBox.value);
+    if (inputBox) formData.set("input_template", inputBox.value);
     if (runNameInput) formData.set("run_name", runNameInput.value);
     if (maxWorkersInput) formData.set("max_workers", maxWorkersInput.value);
     const jsonMode = document.querySelector('input[name="json_mode"]');
@@ -515,10 +700,14 @@
   }
 
   testBtn?.addEventListener("click", (e) => { e.preventDefault(); show(testOverlay, true); });
-  document.getElementById("test-confirm")?.addEventListener("click", () => submitTest(""));
+  document.getElementById("test-confirm")?.addEventListener("click", () => {
+    window.setBusy("test-confirm", true, "Starting…");
+    submitTest("");
+  });
   retestBtn?.addEventListener("click", (e) => {
     e.preventDefault();
     if (retestBtn.disabled) return;
+    window.setBusy(retestBtn, true, "Testing…");
     submitTest(window.MAIDS?.lastTestRow ?? "");
   });
   document.getElementById("test-cancel")?.addEventListener("click", () => show(testOverlay, false));
@@ -538,9 +727,39 @@
     set("progress-running", Math.max(sent - done, 0));
     set("progress-pending", Math.max(total - sent, 0));
     const err = document.getElementById("progress-error");
-    if (err) err.textContent = data?.status === "error" ? (data.error || "") : "";
+    if (err) {
+      if (data?.status === "error") err.textContent = data.error || "";
+      else if (data?.status === "cancelled") err.textContent = data.message || "Run stopped.";
+      else err.textContent = "";
+    }
     return data?.status ?? "idle";
   }
+
+  function showStopControls(running) {
+    const stop = document.getElementById("progress-stop");
+    const close = document.getElementById("progress-close");
+    if (stop) stop.hidden = !running;
+    if (close) close.hidden = !!running;
+  }
+
+  document.getElementById("progress-stop")?.addEventListener("click", async () => {
+    const body = new FormData();
+    if (sidToken) body.append("sid_token", sidToken);
+    window.setBusy("progress-stop", true, "Stopping…");
+    try {
+      await fetch("/run/cancel", { method: "POST", body, credentials: "same-origin" });
+      const err = document.getElementById("progress-error");
+      if (err) err.textContent = "Stopping. Rows already sent will finish.";
+    } finally {
+      window.setBusy("progress-stop", false);
+      showStopControls(false);
+    }
+  });
+
+  document.getElementById("progress-close")?.addEventListener("click", () => {
+    show(overlay, false);
+    window.setBusy("run-button", false);
+  });
 
   runForm?.addEventListener("submit", async (e) => {
     if (runForm.dataset.mode === "test") {
@@ -550,21 +769,31 @@
     e.preventDefault();
     const model = requireModel();
     if (!model) return;
+    window.setBusy("run-button", true, "Starting…");
     show(overlay, true);
     const formData = attachApiKey(new FormData(runForm));
     formData.set("model", model);
     const resp = await fetch("/run", { method: "POST", body: formData, credentials: "same-origin" }).catch(() => null);
     if (!resp || !resp.ok) {
+      // A rejected run used to leave the modal up and the button stuck on
+      // "Starting…", so the message explaining why was hidden behind it.
       const err = document.getElementById("progress-error");
       if (err) err.textContent = resp ? await resp.text() : "Run failed.";
+      window.setBusy("run-button", false);
+      showStopControls(false);
       return;
     }
+    showStopControls(true);
     let status = await pollProgress();
     while (status === "running") {
       await new Promise((r) => setTimeout(r, 500));
       status = await pollProgress();
     }
-    if (status === "error") return;
+    window.setBusy("run-button", false);
+    if (status === "error" || status === "cancelled") {
+      showStopControls(false);
+      return;
+    }
     window.location.href = "/export";
   });
 })();

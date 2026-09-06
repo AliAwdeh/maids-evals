@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}Settings · Maids Evals{% endblock %}
+{% block body %}
+  <h1>Settings</h1>
+  <p class="lede">Defaults for New run and the helpers. You can still change the model on a run. Keys stay on this account only.</p>
+
+  <section class="card">
+    <h2>Defaults</h2>
+    <label for="set-provider">Default provider</label>
+    <select id="set-provider">
+      {% for p in providers %}
+      <option value="{{ p }}" {% if settings.default_provider == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+    <label for="set-model">Default model</label>
+    <input id="set-model" type="text" value="{{ settings.default_model }}" autocomplete="off" />
+    <label for="set-key">Default key</label>
+    <select id="set-key">
+      <option value="">None — paste when needed</option>
+      {% for k in keys %}
+      <option value="{{ k.id }}" {% if settings.default_key_id == k.id %}selected{% endif %}>{{ k.label }} · {{ k.provider }}</option>
+      {% endfor %}
+    </select>
+    <div class="actions">
+      <button type="button" id="set-save">Save defaults</button>
+    </div>
+    <p class="slot-msg" id="set-status"></p>
+  </section>
+
+  <section class="card">
+    <h2>API keys</h2>
+    <p class="empty-hint">Save more than one. Pick which to use here and on New run. The field below works with a password manager.</p>
+    <div id="key-list" class="key-list">
+      {% for k in keys %}
+      <div class="key-row" data-id="{{ k.id }}">
+        <strong>{{ k.label }}</strong>
+        <span>{{ k.provider }}</span>
+        <button type="button" class="ghost key-forget" data-id="{{ k.id }}">Forget</button>
+      </div>
+      {% else %}
+      <p class="small" id="key-empty">No saved keys yet.</p>
+      {% endfor %}
+    </div>
+    <form id="key-form" class="creds" autocomplete="on">
+      <label for="key-label">Key name</label>
+      <input id="key-label" name="username" type="text" autocomplete="username" placeholder="e.g. Work LangCC" />
+      <label for="key-provider">Provider</label>
+      <select id="key-provider">
+        <option value="langcc">LangCC</option>
+        <option value="openai">OpenAI</option>
+        <option value="gemini">Gemini</option>
+      </select>
+      <label for="key-secret">API key</label>
+      <input id="key-secret" name="password" type="password" autocomplete="new-password" />
+      <div class="actions tight">
+        <button type="submit">Save key</button>
+      </div>
+    </form>
+    <p class="slot-msg" id="key-status"></p>
+  </section>
+
+  <section class="card">
+    <h2>Models for each helper</h2>
+    <p class="empty-hint">Leave blank to use the defaults above. This keeps New run and the helpers from asking for a key every time.</p>
+    {% for tool in tools %}
+    <div class="tool-row">
+      <h3>{{ tool }}</h3>
+      <label for="tool-{{ tool }}-provider">Provider</label>
+      <select id="tool-{{ tool }}-provider" data-tool="{{ tool }}" data-field="provider">
+        <option value="">Default</option>
+        {% for p in providers %}
+        <option value="{{ p }}" {% if settings.tools[tool].provider == p %}selected{% endif %}>{{ p }}</option>
+        {% endfor %}
+      </select>
+      <label for="tool-{{ tool }}-model">Model</label>
+      <input id="tool-{{ tool }}-model" type="text" data-tool="{{ tool }}" data-field="model" value="{{ settings.tools[tool].model }}" placeholder="Use default model" autocomplete="off" />
+      <label for="tool-{{ tool }}-key">Key</label>
+      <select id="tool-{{ tool }}-key" data-tool="{{ tool }}" data-field="key_id">
+        <option value="">Default key</option>
+        {% for k in keys %}
+        <option value="{{ k.id }}" {% if settings.tools[tool].key_id == k.id %}selected{% endif %}>{{ k.label }} · {{ k.provider }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endfor %}
+    <div class="actions">
+      <button type="button" id="tools-save" class="secondary">Save helper models</button>
+    </div>
+    <p class="slot-msg" id="tools-status"></p>
+  </section>
+{% endblock %}
+{% block scripts %}
+<script src="/static/settings.js"></script>
+{% endblock %}
