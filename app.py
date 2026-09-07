@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -114,6 +115,23 @@ DATA_EXACT = {
     "/settings/keys",
     "/settings/keys/forget",
 }
+
+AI_TOOL_ERROR_STATUS = 424
+
+
+def ai_tool_error(prefix: str, exc: Exception) -> PlainTextResponse:
+    """Return upstream AI failures without making Cloudflare show its 502 page."""
+    raw = str(exc or "").strip()
+    if "<html" in raw.lower() or "<!doctype html" in raw.lower():
+        title = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.I | re.S)
+        raw = title.group(1) if title else ""
+        raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        raw = "The AI provider or helper gateway did not return a usable response."
+    if len(raw) > 600:
+        raw = raw[:597].rstrip() + "..."
+    return PlainTextResponse(f"{prefix}: {raw}", status_code=AI_TOOL_ERROR_STATUS)
 
 
 def _session_secret() -> str:
@@ -553,7 +571,7 @@ def ollama_models():
     try:
         return {"models": fetch_ollama_models()}
     except Exception as e:
-        return PlainTextResponse(f"Failed to fetch Ollama models: {e}", status_code=502)
+        return ai_tool_error("Failed to fetch Ollama models", e)
 
 
 @app.post("/provider/models")
@@ -578,7 +596,7 @@ async def provider_models(request: Request, provider: str = Form(...), api_key: 
             return {"models": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]}
         return PlainTextResponse("Unsupported provider.", status_code=400)
     except Exception as e:
-        return PlainTextResponse(str(e), status_code=502)
+        return ai_tool_error("Failed to fetch models", e)
 
 
 @app.get("/progress")
@@ -2588,7 +2606,7 @@ async def builder_discover(
         except ValueError as e:
             return PlainTextResponse(str(e), status_code=400)
         except Exception as e:
-            return PlainTextResponse(f"Could not study the sample: {e}", status_code=502)
+            return ai_tool_error("Could not study the sample", e)
         try:
             availability = avail_future.result()
         except Exception:
@@ -2671,7 +2689,7 @@ async def builder_deep_next(
     except ValueError as e:
         return PlainTextResponse(str(e), status_code=400)
     except Exception as e:
-        return PlainTextResponse(f"Could not continue the deep pass: {e}", status_code=502)
+        return ai_tool_error("Could not continue the deep pass", e)
     storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 400, 400)
     if plan.get("ready"):
         plan["questions"] = []
@@ -2723,7 +2741,7 @@ async def builder_generate(
     except ValueError as e:
         return PlainTextResponse(str(e), status_code=400)
     except Exception as e:
-        return PlainTextResponse(f"Could not write the prompt: {e}", status_code=502)
+        return ai_tool_error("Could not write the prompt", e)
     storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 600, estimate_tokens(made["prompt"]))
     state.update({
         "goal": goal,
@@ -2861,7 +2879,7 @@ async def builder_availability(
     except ValueError as e:
         return PlainTextResponse(str(e), status_code=400)
     except Exception as e:
-        return PlainTextResponse(f"Could not score the sheet: {e}", status_code=502)
+        return ai_tool_error("Could not score the sheet", e)
     storage.log_usage(request.state.user, provider, model, estimate_tokens(goal) + 300, 300)
     state["availability"] = report
     resp = JSONResponse({"ok": True, "report": report})
@@ -2959,7 +2977,7 @@ async def builder_fix(
     except ValueError as e:
         return PlainTextResponse(str(e), status_code=400)
     except Exception as e:
-        return PlainTextResponse(f"Could not fix the prompt: {e}", status_code=502)
+        return ai_tool_error("Could not fix the prompt", e)
     proposed = result.get("proposed_prompt") or prompt
     state["prompt"] = proposed
     sess["prompt_template"] = proposed
@@ -3149,7 +3167,7 @@ async def catalogue_find(
     try:
         turn = find_prompts_turn(name, key, chosen, message, visible, owner=owner)
     except Exception as e:
-        return PlainTextResponse(f"The helper did not answer: {e}", status_code=502)
+        return ai_tool_error("The helper did not answer", e)
     cards = []
     by_id = {i.get("id"): i for i in visible}
     for match in turn.get("matches") or []:
@@ -3366,7 +3384,7 @@ async def catalogue_chat(
             prior_changes=ctx.get("change_log") or [],
         )
     except Exception as e:
-        return PlainTextResponse(f"The helper did not answer: {e}", status_code=502)
+        return ai_tool_error("The helper did not answer", e)
     catalogue.append_chat(prompt_id, user, "user", message.strip())
     catalogue.append_chat(prompt_id, user, "assistant", turn["reply"])
     applied = False
