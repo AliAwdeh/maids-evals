@@ -785,7 +785,54 @@ textarea { min-height: 110px; resize: vertical; line-height: 1.6; }
 .pager { display: flex; align-items: center; gap: 10px; justify-content: center; margin-top: 10px; }
 .pager span { font-size: 12.5px; color: var(--muted); }
 
-.answer-list { display: flex; flex-direction: column; gap: 8px; }
+.answer-list { display: flex; flex-direction: column; gap: 12px; }
+.answers-card > summary.answers-summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  user-select: none;
+}
+.answers-card > summary.answers-summary::-webkit-details-marker { display: none; }
+.answers-card > summary.answers-summary::before {
+  content: "";
+  width: 0; height: 0;
+  border-left: 6px solid var(--muted);
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  flex: 0 0 auto;
+  transition: transform .15s ease;
+}
+.answers-card[open] > summary.answers-summary::before { transform: rotate(90deg); }
+.answers-card[open] > summary.answers-summary { margin-bottom: 14px; }
+.answers-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.answers-toolbar__controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.answer-item {
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.answer-item__head {
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+  font-weight: 600;
+}
+.answer-item .ai-output { border: 0; border-radius: 0; }
 .tight-list { margin: 6px 0; padding-left: 18px; font-size: 13.5px; color: var(--muted); }
 .tight-list li { margin-bottom: 3px; }
 
@@ -800,6 +847,23 @@ textarea { min-height: 110px; resize: vertical; line-height: 1.6; }
   margin-bottom: 3px;
 }
 .col-val { font-size: 13.5px; white-space: pre-wrap; word-break: break-word; color: var(--ink-2); }
+
+.col-picker { margin: 4px 0 10px; }
+.col-picker-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 8px 0 10px;
+  max-height: 160px;
+  overflow: auto;
+}
+.col-picker-list label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 13px;
+}
 
 /* ==========================================================================
    Review
@@ -852,6 +916,17 @@ textarea { min-height: 110px; resize: vertical; line-height: 1.6; }
 .review-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .review-tools { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 16px; margin-top: 16px; align-items: start; }
 @media (max-width: 1180px) { .review-grid, .review-tools { grid-template-columns: 1fr; } }
+
+.review-return {
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+.review-return .ai-output__body.is-clamped { max-height: none; overflow: visible; }
+.review-return .ai-output__body.is-clamped::after { display: none; }
+.review-return .ai-output__more { display: none; }
+@media (max-width: 1180px) { .review-return { position: static; max-height: none; } }
 
 .verdicts { display: flex; gap: 7px; margin-bottom: 6px; }
 .verdicts button {
@@ -1210,6 +1285,13 @@ kbd {
   box-shadow: var(--shadow-3);
 }
 .modal h3 { margin-bottom: 10px; }
+.modal .box label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.modal .box label strong { display: block; }
+.modal .box label .small { display: block; }
 
 .progress-bar {
   height: 6px;
@@ -1492,6 +1574,41 @@ details.view-version > summary { cursor: pointer; font-size: 13px; color: var(--
 
 .ai-output__disclosure > summary { cursor: pointer; padding: 8px 11px; font-size: 13px; }
 .ai-output__summary-label { font-weight: 600; }
+
+.jt-obj { display: flex; flex-direction: column; gap: 2px; }
+.jt-row, .jt-node > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  flex-wrap: wrap;
+  padding: 2px 0;
+}
+.jt-node { margin-left: 2px; }
+.jt-node > .jt-obj { margin-left: 16px; padding-left: 10px; border-left: 1px solid var(--line-soft); }
+.jt-key {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.jt-sep {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--faint);
+  white-space: pre;
+}
+.jt-val {
+  font-size: 13.5px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.jt-str { white-space: pre-wrap; word-break: break-word; }
+.jt-true { color: var(--ok); }
+.jt-false { color: var(--bad); }
+.jt-null, .jt-empty { color: var(--faint); }
+.jt-num { font-family: var(--mono); font-size: 13px; }
+.jt-preview { font-size: 12px; color: var(--faint); }
+.jt-leaf { padding: 2px 0; }
 
 /* Drop a spreadsheet anywhere on the picker */
 .is-dropping input[type="file"], input[type="file"].is-dropping {

@@ -33,12 +33,17 @@ from engine import (
     _build_output_dataframe,
     compose_model_input,
     call_provider,
+    display_cell,
     mapping_gaps,
     required_placeholders,
     estimate_tokens,
     fetch_ollama_models,
     fetch_openai_compatible_models,
     filter_results_by_json,
+    json_key_profiles,
+    group_label,
+    _row_json_flat,
+    _stat_value_label,
     load_tabular_file,
     parse_model_params,
     process_row,
@@ -134,6 +139,8 @@ WORK_COOKIE = "me_sid"
 app = FastAPI(title="Maids Evals")
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+templates.env.filters["display_cell"] = display_cell
+templates.env.filters["group_label"] = group_label
 
 
 _STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -159,9 +166,16 @@ def render(request: Request, name: str, context: Dict[str, Any], status_code: in
     if "is_admin" not in ctx:
         user = getattr(request.state, "user", None) or ctx.get("user")
         ctx["is_admin"] = bool(user and auth.is_admin(user))
+    # Starlette renders the template inside TemplateResponse, so a plain
+    # `except TypeError` here also swallows every TypeError raised by the
+    # template itself and retries with the deprecated argument order -- which
+    # then fails somewhere unrecognisable inside Jinja's template cache. Only
+    # fall back when the *signature* was rejected.
     try:
         return templates.TemplateResponse(request, name, ctx, status_code=status_code)
-    except TypeError:
+    except TypeError as e:
+        if "positional argument" not in str(e) and "argument" not in str(e).split(":")[0]:
+            raise
         return templates.TemplateResponse(name, {"request": request, **ctx}, status_code=status_code)
 
 
@@ -1238,6 +1252,8 @@ def export_page(
     request: Request,
     filter_key: Optional[List[str]] = Query(None),
     filter_val: Optional[List[str]] = Query(None),
+    page: int = 1,
+    answers: str = "",
 ):
     sid, sess = get_work_session(request)
     if "csv_cols" not in sess:
@@ -1247,24 +1263,47 @@ def export_page(
     detected_keys = sess.get("detected_json_keys") or []
     pairs = filter_pairs(filter_key, filter_val)
     filtered_indices = filter_results_by_json(results, [p["key"] for p in pairs], [p["val"] for p in pairs])
+    page_size = 10
+    filtered_count = len(filtered_indices)
+    page_count = max(1, (filtered_count + page_size - 1) // page_size) if filtered_count else 1
+    page = max(1, min(int(page or 1), page_count))
+    start = (page - 1) * page_size
+    page_indices = filtered_indices[start:start + page_size]
     choices = []
     csv_cols = sess["csv_cols"]
-    for result_idx in filtered_indices[:200]:
+    for pos, result_idx in enumerate(page_indices, start=start):
         r = results[result_idx]
         label_parts = []
         for c in csv_cols[:3]:
-            val = str(r.get(c, ""))[:60]
+            val = display_cell(r.get(c, ""))[:60]
             if val:
                 label_parts.append(f"{c}: {val}")
         choices.append({
             "idx": result_idx,
+            "pos": pos,
             "label": " | ".join(label_parts) or f"Row {result_idx + 1}",
             "failed": bool(r.get("llm_api_failed")),
             "output": r.get("llm_output", "") or "",
         })
+    batch_choices = []
+    for result_idx in filtered_indices[:200]:
+        r = results[result_idx]
+        label_parts = []
+        for c in csv_cols[:3]:
+            val = display_cell(r.get(c, ""))[:60]
+            if val:
+                label_parts.append(f"{c}: {val}")
+        batch_choices.append({
+            "idx": result_idx,
+            "label": " | ".join(label_parts) or f"Row {result_idx + 1}",
+            "failed": bool(r.get("llm_api_failed")),
+        })
     current_run_id = sess.get("current_run_id", "")
     current_run_name = (sess.get("run_name") or "").strip()
     current_run_text = f"Saved run: {current_run_name or current_run_id}" if current_run_id else "Unsaved current dataset"
+    key_profiles = json_key_profiles(results, detected_keys)
+    shown_from = start + 1 if filtered_count else 0
+    shown_to = start + len(page_indices)
     resp = render(
         request,
         "results.html",
@@ -1276,11 +1315,30 @@ def export_page(
             "csv_cols": csv_cols,
             "detected_keys": detected_keys,
             "filter_pairs": pairs,
-            "filtered_count": len(filtered_indices),
+            "filter_qs": filter_qs(pairs),
+            "filtered_count": filtered_count,
             "result_choices": choices,
+            "batch_choices": batch_choices,
+            "page": page,
+            "page_count": page_count,
+            "page_size": page_size,
+            "shown_from": shown_from,
+            "shown_to": shown_to,
+            "prev_page": page - 1 if page > 1 else None,
+            "next_page": page + 1 if page < page_count else None,
             "current_run_id": current_run_id,
             "current_run_text": current_run_text,
             "stats_keys": sess.get("stats_keys") or [],
+            "key_profiles": key_profiles,
+            # Which values each countable field can take, so the filter's
+            # second dropdown offers the real answers instead of true/false.
+            "key_value_options": {
+                p["key"]: [{"label": v["label"], "count": v["count"]} for v in p["values"]]
+                for p in key_profiles
+                if p["selectable"]
+            },
+            "answers_open": page > 1 or str(answers).strip() in ("1", "true", "yes"),
+            "answers_qs": "&answers=1",
         },
     )
     return attach_session(resp, request, sid)
@@ -1449,27 +1507,32 @@ async def stats(
         filtered_results = tmp
         filter_notes.append(f"Filtered by {stats_date_col}.")
     detected = sess.get("detected_json_keys") or []
-    stats_filter_key = stats_filter_key if stats_filter_key in detected else ""
-    stats_filter_val = (stats_filter_val or "").lower().strip()
-    if stats_filter_key and stats_filter_val in ("true", "false"):
-        target = stats_filter_val == "true"
-        filtered_results = [
-            r for r in filtered_results
-            if _coerce_bool((r.get("_llm_json_flat", {}) or {}).get(stats_filter_key)) is target
-        ]
+    profiles = json_key_profiles(filtered_results, detected)
+    profile_by_key_pre = {p["key"]: p for p in profiles}
+    selectable = {p["key"] for p in profiles if p["selectable"]}
+    skipped = [p for p in profiles if not p["selectable"]]
+    selected_keys = [k for k in selected_keys if k in selectable]
+    sess["stats_keys"] = selected_keys
+    stats_filter_key = stats_filter_key if stats_filter_key in selectable else ""
+    stats_filter_val = (stats_filter_val or "").strip()
+    if stats_filter_key and stats_filter_val:
+        # For a grouped key the button says "low" while the rows still read
+        # "Low - no issue raised", so the click has to match the same way the
+        # count was made.
+        grouped_key = bool((profile_by_key_pre.get(stats_filter_key) or {}).get("grouped"))
+
+        def _matches(row: Dict[str, Any]) -> bool:
+            label = _stat_value_label(_row_json_flat(row).get(stats_filter_key))
+            if label is None:
+                return False
+            return (group_label(label) if grouped_key else label) == stats_filter_val
+
+        filtered_results = [r for r in filtered_results if _matches(r)]
         filter_notes.append(f"Filtered where {stats_filter_key} is {stats_filter_val}.")
+        profiles = json_key_profiles(filtered_results, detected)
     total_rows = len(filtered_results)
-    stat_rows = []
-    for key in selected_keys:
-        true_count = sum(1 for r in filtered_results if _coerce_bool((r.get("_llm_json_flat", {}) or {}).get(key)) is True)
-        false_count = total_rows - true_count
-        stat_rows.append({
-            "key": key,
-            "true_count": true_count,
-            "false_count": false_count,
-            "true_pct": (true_count / total_rows * 100) if total_rows else 0,
-            "false_pct": (false_count / total_rows * 100) if total_rows else 0,
-        })
+    profile_by_key = {p["key"]: p for p in profiles}
+    stat_rows = [profile_by_key[k] for k in selected_keys if k in profile_by_key]
     resp = render(
         request,
         "stats.html",
@@ -1482,7 +1545,9 @@ async def stats(
             "stats_date_from": stats_date_from,
             "stats_date_to": stats_date_to,
             "stats_filter_key": stats_filter_key,
+            "stats_filter_val": stats_filter_val,
             "stat_rows": stat_rows,
+            "skipped_keys": skipped,
             "total_rows": total_rows,
             "filter_note": " ".join(filter_notes) if filter_notes else "No filters applied.",
         },
@@ -1510,6 +1575,8 @@ def review(
         resp = RedirectResponse(url="/", status_code=303)
         return attach_session(resp, request, sid)
     csv_cols = sess.get("csv_cols") or []
+    saved_cols = [c for c in (sess.get("test_cols") or []) if c in csv_cols]
+    selected_cols = saved_cols or list(csv_cols)
     detected_keys = sess.get("detected_json_keys") or []
     pairs = filter_pairs(filter_key, filter_val)
     filtered_indices = filter_results_by_json(results, [p["key"] for p in pairs], [p["val"] for p in pairs])
@@ -1550,8 +1617,8 @@ def review(
     for pos, ridx in enumerate(filtered_indices):
         rec = notes_map.get(str(ridx)) or {}
         label = ""
-        for col in csv_cols:
-            value = str((results[ridx] or {}).get(col, "") or "").strip()
+        for col in selected_cols or csv_cols:
+            value = display_cell((results[ridx] or {}).get(col, "")).strip()
             if value:
                 label = value[:46]
                 break
@@ -1621,6 +1688,8 @@ def review(
             "filter_qs": qs,
             "detected_keys": detected_keys,
             "csv_cols": csv_cols,
+            "selected_cols": selected_cols,
+            "custom_cols": bool(saved_cols),
             "row": row,
             "pretty_text": pretty_text,
             "err": err,
@@ -1667,6 +1736,26 @@ def review(
             "recheck_summary": recheck.get("summary") or {},
         },
     )
+    return attach_session(resp, request, sid)
+
+
+@app.post("/review/cols")
+async def save_review_cols(
+    request: Request,
+    test_cols: Optional[List[str]] = Form(None),
+    show_all: str = Form(""),
+    idx: int = Form(0),
+    filter_key: Optional[List[str]] = Form(None),
+    filter_val: Optional[List[str]] = Form(None),
+):
+    sid, sess = get_work_session(request)
+    csv_cols = sess.get("csv_cols") or []
+    if show_all == "1":
+        sess["test_cols"] = []
+    else:
+        sess["test_cols"] = [c for c in (test_cols or []) if c in csv_cols]
+    qs = filter_qs(filter_pairs(filter_key, filter_val))
+    resp = RedirectResponse(url=f"/review?idx={max(0, idx)}{qs}", status_code=303)
     return attach_session(resp, request, sid)
 
 

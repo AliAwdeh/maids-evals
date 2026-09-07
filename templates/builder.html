@@ -213,7 +213,7 @@
       <div class="preview-box" id="test-preview">
         {% if builder_test.preview %}
           {% for k, v in builder_test.preview.items() %}
-          <div class="col-block"><div class="col-name">{{ k }}</div><div class="col-val">{{ v }}</div></div>
+          <div class="col-block"><div class="col-name">{{ k }}</div><div class="col-val">{{ v | display_cell }}</div></div>
           {% endfor %}
         {% endif %}
       </div>

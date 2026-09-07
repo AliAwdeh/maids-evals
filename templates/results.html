@@ -26,22 +26,22 @@
     <div class="kicker">Filter</div>
     <form action="/export" method="get">
       {% for pair in filter_pairs %}
-      <div class="grid-2" style="grid-template-columns:1fr 1fr;margin-top:8px;">
+      <div class="grid-2 filter-row" style="grid-template-columns:1fr 1fr;margin-top:8px;">
         <div>
-          <label>JSON attribute</label>
-          <select name="filter_key">
+          <label>Answer field</label>
+          <select name="filter_key" class="filter-key">
             <option value="">No filter</option>
-            {% for key in detected_keys %}
-            <option value="{{ key }}" {% if key == pair.key %}selected{% endif %}>{{ key }}</option>
+            {% for profile in key_profiles %}
+            <option value="{{ profile.key }}" {% if profile.key == pair.key %}selected{% endif %} {% if not profile.selectable %}disabled{% endif %}>
+              {{ profile.key }}{% if not profile.selectable %} — too many values{% endif %}
+            </option>
             {% endfor %}
           </select>
         </div>
         <div>
-          <label>Value</label>
-          <select name="filter_val">
-            <option value="">Any</option>
-            <option value="true" {% if pair.val == 'true' %}selected{% endif %}>True</option>
-            <option value="false" {% if pair.val == 'false' %}selected{% endif %}>False</option>
+          <label>is</label>
+          <select name="filter_val" class="filter-val" data-selected="{{ pair.val }}">
+            <option value="">Any value</option>
           </select>
         </div>
       </div>
@@ -55,17 +55,75 @@
   </section>
 
   {% if has_results %}
-  <section class="card" style="margin-top:14px;">
-    <div class="kicker">Answers</div>
-    <p class="small">First {{ result_choices|length }} of {{ filtered_count }} matching rows. Open a row to see its answer — JSON renders as a tree with a Pretty/Raw toggle.</p>
+  <details class="card answers-card" style="margin-top:14px;"{% if answers_open %} open{% endif %}>
+    <summary class="answers-summary">
+      <span>
+        <span class="kicker" style="margin:0;">Answers</span>
+        <span class="small" style="display:block;margin-top:4px;">
+          {% if filtered_count %}
+          {{ filtered_count }} matching rows — open to read them.
+          {% else %}
+          No rows match these filters.
+          {% endif %}
+        </span>
+      </span>
+    </summary>
+    <div class="answers-toolbar">
+      <p class="small" style="margin:0;">
+        {% if filtered_count %}
+        {{ shown_from }}–{{ shown_to }} of {{ filtered_count }}.
+        {% endif %}
+      </p>
+      <div class="answers-toolbar__controls">
+        <div class="ai-output__seg" id="answers-view" role="group" aria-label="Answer view">
+          <button type="button" data-pretty="1" class="is-active">Pretty</button>
+          <button type="button" data-pretty="0">Raw</button>
+        </div>
+        {% if page_count > 1 %}
+        <div class="pager">
+          {% if prev_page %}
+          <a class="btn secondary" href="/export?page={{ prev_page }}{{ filter_qs }}{{ answers_qs }}">Previous</a>
+          {% else %}
+          <button type="button" class="secondary" disabled>Previous</button>
+          {% endif %}
+          <span>Page {{ page }} of {{ page_count }}</span>
+          {% if next_page %}
+          <a class="btn secondary" href="/export?page={{ next_page }}{{ filter_qs }}{{ answers_qs }}">Next</a>
+          {% else %}
+          <button type="button" class="secondary" disabled>Next</button>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
     <div class="answer-list">
       {% for item in result_choices %}
-      {{ ai_output(item.output, mode='disclosure', label='#' ~ (item.idx + 1) ~ '  ' ~ item.label ~ (' · API failed' if item.failed else '')) }}
+      <article class="answer-item">
+        <div class="answer-item__head">
+          <a href="/review?idx={{ item.pos }}{{ filter_qs }}">#{{ item.idx + 1 }} {{ item.label }}{% if item.failed %} · API failed{% endif %}</a>
+        </div>
+        {{ ai_output(item.output, mode='list', label='Answer') }}
+      </article>
       {% else %}
       <div class="small">No rows match these filters.</div>
       {% endfor %}
     </div>
-  </section>
+    {% if page_count > 1 %}
+    <div class="pager" style="margin-top:14px;">
+      {% if prev_page %}
+      <a class="btn secondary" href="/export?page={{ prev_page }}{{ filter_qs }}{{ answers_qs }}">Previous</a>
+      {% else %}
+      <button type="button" class="secondary" disabled>Previous</button>
+      {% endif %}
+      <span>Page {{ page }} of {{ page_count }}</span>
+      {% if next_page %}
+      <a class="btn secondary" href="/export?page={{ next_page }}{{ filter_qs }}{{ answers_qs }}">Next</a>
+      {% else %}
+      <button type="button" class="secondary" disabled>Next</button>
+      {% endif %}
+    </div>
+    {% endif %}
+  </details>
   {% endif %}
 
   <details class="panel" style="margin-top:14px;">
@@ -82,7 +140,7 @@
         <button type="button" class="secondary toggle-btn" data-target="result_idx" data-action="none">Select none</button>
       </div>
       <div class="box">
-        {% for item in result_choices %}
+        {% for item in batch_choices %}
         <label><input type="checkbox" name="result_idx" value="{{ item.idx }}" checked /> #{{ item.idx + 1 }} {{ item.label }}{% if item.failed %} · API failed{% endif %}</label>
         {% else %}
         <div class="small">No rows match these filters.</div>
@@ -148,27 +206,47 @@
   <div class="overlay" id="stats-overlay">
     <div class="modal">
       <h3>Stats on JSON keys</h3>
+      <p class="empty-hint">Only keys with a short, repeating set of values. Free-text fields — a different sentence on every row — cannot be counted.</p>
       <form action="/stats" method="post" id="stats-form">
+        {% set selectable = key_profiles|selectattr('selectable')|list %}
+        {% if selectable %}
         <div class="actions">
-          <button type="button" class="secondary toggle-btn" data-target="stats_keys" data-action="all">All</button>
+          <button type="button" class="secondary toggle-btn" data-target="stats_keys" data-action="all">All closed sets</button>
           <button type="button" class="secondary toggle-btn" data-target="stats_keys" data-action="none">None</button>
         </div>
         <div class="box">
-          {% for key in detected_keys %}
-          <label><input type="checkbox" name="stats_keys" value="{{ key }}" {% if key in stats_keys %}checked{% endif %} /> {{ key }}</label>
-          {% else %}
-          <div class="small">No JSON keys yet.</div>
+          {% for profile in selectable %}
+          <label>
+            <input type="checkbox" name="stats_keys" value="{{ profile.key }}" {% if profile.key in stats_keys %}checked{% endif %} />
+            <span>
+              <strong>{{ profile.key }}</strong>
+              <span class="small">{{ profile.unique }} value{{ '' if profile.unique == 1 else 's' }}{% if profile.grouped %} <span class="tag warn">tidied from {{ profile.collapsed_from }} spellings</span>{% endif %}{% if profile['values'] %} — {{ profile['values'][:6]|map(attribute='label')|join(', ') }}{% if profile['values']|length > 6 %}…{% endif %}{% endif %}</span>
+            </span>
+          </label>
           {% endfor %}
         </div>
+        {% else %}
+        <p class="small">No key in this batch has a closed set of values.</p>
+        {% endif %}
+        {% set skipped = key_profiles|rejectattr('selectable')|list %}
+        {% if skipped %}
+        <p class="small" style="margin-top:12px;">Not available — each row is too different:</p>
+        <ul class="tight-list">
+          {% for profile in skipped %}
+          <li><code>{{ profile.key }}</code> · {{ profile.reason }}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
         <div class="actions">
           <button type="button" id="stats-cancel" class="secondary">Cancel</button>
-          <button type="submit">Run stats</button>
+          <button type="submit" {% if not selectable %}disabled{% endif %}>Run stats</button>
         </div>
       </form>
     </div>
   </div>
 {% endblock %}
 {% block scripts %}
+<script>window.MAIDS_KEY_VALUES = {{ key_value_options|tojson }};</script>
 <script src="{{ asset('ai-output.js') if asset else '/static/ai-output.js' }}"></script>
 <script src="{{ asset('app.js') if asset else '/static/app.js' }}"></script>
 {% endblock %}

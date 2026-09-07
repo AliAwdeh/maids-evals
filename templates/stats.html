@@ -9,11 +9,13 @@
       <input type="hidden" name="stats_date_col" value="{{ stats_date_col }}" />
       <input type="hidden" name="stats_date_from" value="{{ stats_date_from }}" />
       <input type="hidden" name="stats_date_to" value="{{ stats_date_to }}" />
-      <button type="submit" class="secondary">Clear stat filter</button>
+      <button type="submit" class="secondary">Clear value filter</button>
     </form>
     {% endif %}
   </div>
   <h1>Stats</h1>
+  <p class="lede">Counts for keys that share a short list of values. {{ filter_note }} {{ total_rows }} rows in this cut.</p>
+
   <section class="card">
     <form action="/stats" method="post">
       {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
@@ -39,51 +41,85 @@
       <div class="actions"><button type="submit">Apply filter</button></div>
     </form>
   </section>
-  <table class="plain" style="margin-top:16px;">
-    <thead>
-      <tr>
-        <th>JSON key</th>
-        <th>Rows</th>
-        <th>True</th>
-        <th>False</th>
-        <th>% True</th>
-        <th>% False</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for row in stat_rows %}
-      <tr>
-        <td>{{ row.key }}</td>
-        <td>{{ total_rows }}</td>
-        <td>
-          <form action="/stats" method="post" style="display:inline;">
-            {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
-            <input type="hidden" name="stats_date_col" value="{{ stats_date_col }}" />
-            <input type="hidden" name="stats_date_from" value="{{ stats_date_from }}" />
-            <input type="hidden" name="stats_date_to" value="{{ stats_date_to }}" />
-            <input type="hidden" name="stats_filter_key" value="{{ row.key }}" />
-            <input type="hidden" name="stats_filter_val" value="true" />
-            <button type="submit" class="secondary">{{ row.true_count }}</button>
-          </form>
-        </td>
-        <td>
-          <form action="/stats" method="post" style="display:inline;">
-            {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
-            <input type="hidden" name="stats_date_col" value="{{ stats_date_col }}" />
-            <input type="hidden" name="stats_date_from" value="{{ stats_date_from }}" />
-            <input type="hidden" name="stats_date_to" value="{{ stats_date_to }}" />
-            <input type="hidden" name="stats_filter_key" value="{{ row.key }}" />
-            <input type="hidden" name="stats_filter_val" value="false" />
-            <button type="submit" class="secondary">{{ row.false_count }}</button>
-          </form>
-        </td>
-        <td>{{ "%.2f"|format(row.true_pct) }}%</td>
-        <td>{{ "%.2f"|format(row.false_pct) }}%</td>
-      </tr>
-      {% else %}
-      <tr><td colspan="6">No JSON keys selected.</td></tr>
+
+  {% for row in stat_rows %}
+  <section class="card" style="margin-top:14px;">
+    <div class="step-head">
+      <div class="step-title"><h2 style="margin:0;">{{ row.key }}</h2></div>
+      <span class="tag">{{ row.unique }} value{{ '' if row.unique == 1 else 's' }}{% if row.missing %} · {{ row.missing }} empty{% endif %}</span>
+    </div>
+    {% if row.grouped %}
+    <div class="fixer-callout warn" style="margin-top:10px;">
+      <span class="ico">!</span>
+      <span>The model wrote <strong>{{ row.collapsed_from }} different spellings</strong> of these {{ row.unique }} values, so they were tidied into buckets before counting — “Low - no issue raised” counts as <code>low</code>. Every spelling is listed below. If you want clean values, tell the prompt to answer with one word.</span>
+    </div>
+    {% endif %}
+    {% if row['values'] %}
+    <table class="plain" style="margin-top:12px;">
+      <thead>
+        <tr>
+          <th>Value</th>
+          <th>Rows</th>
+          <th>Share</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in row['values'] %}
+        <tr>
+          <td><code>{{ item.label }}</code></td>
+          <td>
+            <form action="/stats" method="post" style="display:inline;">
+              {% for key in selected_keys %}<input type="hidden" name="stats_keys" value="{{ key }}" />{% endfor %}
+              <input type="hidden" name="stats_date_col" value="{{ stats_date_col }}" />
+              <input type="hidden" name="stats_date_from" value="{{ stats_date_from }}" />
+              <input type="hidden" name="stats_date_to" value="{{ stats_date_to }}" />
+              <input type="hidden" name="stats_filter_key" value="{{ row.key }}" />
+              <input type="hidden" name="stats_filter_val" value="{{ item.label }}" />
+              <button type="submit" class="secondary">{{ item.count }}</button>
+            </form>
+          </td>
+          <td>{{ "%.1f"|format(item.pct) }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="empty-hint">No values in this cut.</p>
+    {% endif %}
+    {% if row.grouped and row['raw_values'] %}
+    <details class="adv">
+      <summary>Every spelling the model used ({{ row['raw_values']|length }})</summary>
+      <table class="plain">
+        <thead><tr><th>Exactly as written</th><th>Rows</th><th>Counted as</th></tr></thead>
+        <tbody>
+          {% for item in row['raw_values'] %}
+          <tr>
+            <td><code>{{ item.label }}</code></td>
+            <td>{{ item.count }}</td>
+            <td><code>{{ item.label | group_label }}</code></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+    {% endif %}
+  </section>
+  {% else %}
+  <section class="card empty" style="margin-top:14px;">
+    <h2>Nothing to count</h2>
+    <p class="empty-hint">Pick a key with a closed set of values from Answers → Stats.</p>
+  </section>
+  {% endfor %}
+
+  {% if skipped_keys %}
+  <section class="card" style="margin-top:14px;">
+    <h2>Not counted</h2>
+    <p class="empty-hint">These keys change on almost every row, so they are not a predefined set.</p>
+    <ul class="tight-list">
+      {% for profile in skipped_keys %}
+      <li><code>{{ profile.key }}</code> · {{ profile.reason }}</li>
       {% endfor %}
-    </tbody>
-  </table>
-  <p class="small">Missing or non-boolean values count as false. {{ filter_note }} Total rows: {{ total_rows }}.</p>
+    </ul>
+  </section>
+  {% endif %}
 {% endblock %}

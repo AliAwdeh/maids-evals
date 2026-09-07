@@ -33,14 +33,38 @@
       <div class="review-grid">
         <section class="card">
           <div class="kicker">What you sent</div>
-          {% for col in csv_cols %}
+          <form action="/review/cols" method="post" class="col-picker">
+            <input type="hidden" name="idx" value="{{ idx }}" />
+            {% for pair in filter_pairs %}
+              {% if pair.key and pair.val %}
+              <input type="hidden" name="filter_key" value="{{ pair.key }}" />
+              <input type="hidden" name="filter_val" value="{{ pair.val }}" />
+              {% endif %}
+            {% endfor %}
+            <details class="adv" {% if custom_cols %}open{% endif %}>
+              <summary>Columns to show</summary>
+              <p class="empty-hint">Pick the fields you need. This stays as you move between rows.</p>
+              <div class="col-picker-list">
+                {% for col in csv_cols %}
+                <label><input type="checkbox" name="test_cols" value="{{ col }}" {% if col in selected_cols %}checked{% endif %} /> {{ col }}</label>
+                {% endfor %}
+              </div>
+              <div class="actions tight">
+                <button type="submit" class="secondary">Show these</button>
+                <button type="submit" class="ghost" name="show_all" value="1">Show all</button>
+              </div>
+            </details>
+          </form>
+          {% for col in selected_cols %}
           <div class="col-block">
             <div class="col-name">{{ col }}</div>
-            <div class="col-val">{{ row.get(col, '') }}</div>
+            <div class="col-val">{{ row.get(col, '') | display_cell }}</div>
           </div>
+          {% else %}
+          <p class="empty-hint">No columns selected. Open “Columns to show” and pick some.</p>
           {% endfor %}
         </section>
-        <section class="card">
+        <section class="card review-return">
           <div class="kicker">What came back</div>
           {% if err %}<p class="flash-err">{{ err }}</p>{% endif %}
           {{ ai_output(row.get('llm_output', '') or pretty_text, mode='inline', label='Answer') }}
@@ -61,7 +85,7 @@
           <p class="small" style="margin-top:12px;">
             <kbd>←</kbd> <kbd>→</kbd> move between rows · <kbd>1</kbd> right · <kbd>2</kbd> wrong · <kbd>3</kbd> not sure
           </p>
-          <details class="adv">
+          <details class="adv"{% if filter_pairs|selectattr('key')|list %} open{% endif %}>
             <summary>Filter which rows you see</summary>
             <form action="/review" method="get">
               <input type="hidden" name="idx" value="0" />

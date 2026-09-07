@@ -1,4 +1,4 @@
-from engine import INPUT_SECTION_HEADER, compose_model_input, row_input_error, templates_have_placeholder
+from engine import INPUT_SECTION_HEADER, compose_model_input, display_cell, row_input_error, templates_have_placeholder
 from prompt_builder import _sanitize_generated
 
 
@@ -74,3 +74,11 @@ def test_sanitize_keeps_condition_columns_in_instructions():
     assert "{row_json}" not in clean_prompt
     assert "{nationality}" not in clean_input
     assert "{Messages}" in clean_input
+
+
+def test_display_cell_turns_escaped_breaks_into_real_ones():
+    assert display_cell("hello\\nworld") == "hello\nworld"
+    assert display_cell("a\\tb") == "a\tb"
+    assert display_cell("already\nbroken") == "already\nbroken"
+    assert display_cell(None) == ""
+    assert display_cell("  ") == ""

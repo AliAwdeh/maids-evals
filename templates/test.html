@@ -18,7 +18,7 @@
       {% for col in selected_cols %}
       <div class="col-block">
         <div class="col-name">{{ col }}</div>
-        <div class="col-val">{{ row.get(col, '') }}</div>
+        <div class="col-val">{{ row.get(col, '') | display_cell }}</div>
       </div>
       {% else %}
       <p class="small">No columns selected.</p>

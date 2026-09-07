@@ -3,6 +3,7 @@ import json
 import os
 import re
 import threading
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -147,6 +148,19 @@ def _normalize_value(v: Any) -> Any:
     return "" if _is_empty_value(v) else v
 
 
+def display_cell(value: Any) -> str:
+    """Show a spreadsheet cell the way it was written.
+
+    Chat exports often store a real line break as the two characters \\n.
+    Those have to become actual breaks, or the transcript reads as one line.
+    """
+    if value is None or _is_empty_value(value):
+        return ""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\\n", "\n").replace("\\t", "\t")
+    return text
+
+
 def _row_is_empty_dict(row: Dict[str, Any]) -> bool:
     return all(_is_empty_value(v) for v in row.values())
 
@@ -177,6 +191,159 @@ def _parse_date(value: str):
         return datetime.strptime(value, "%Y-%m-%d").date()
     except Exception:
         return None
+
+
+def _row_json_flat(row: Dict[str, Any]) -> Dict[str, Any]:
+    flat = row.get("_llm_json_flat")
+    if isinstance(flat, dict) and flat:
+        return flat
+    parsed, _ = try_parse_json(str(row.get("llm_output") or ""))
+    if parsed is None:
+        return {}
+    return flatten_json(parsed, sep=".")
+
+
+def _stat_value_label(value: Any) -> Optional[str]:
+    """Group a JSON cell into a stable label, or None if it is missing."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        coerced = _coerce_bool(value)
+        if coerced is not None:
+            return "true" if coerced else "false"
+        if isinstance(value, float) and value != value:
+            return None
+        return str(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    coerced = _coerce_bool(text)
+    if coerced is not None:
+        return "true" if coerced else "false"
+    return text
+
+
+
+# Separators a model reaches for when it answers a category question with a
+# category *and* a justification: "Low - no issue raised", "high: wants to cancel".
+# A dash only separates when it is spaced, so "live-in" and "e-mail" survive.
+# A colon or semicolon needs no leading space: models write "Medium: chasing".
+_QUALIFIER_RE = re.compile(r"\s+[-\u2013\u2014]\s|[:;]\s|\s+\(")
+_GROUP_MAX_LABELS = 12
+_GROUP_MIN_COVERAGE = 0.80
+
+
+def group_label(label: str) -> str:
+    """Collapse a labelled-with-commentary answer to the label itself.
+
+    Not a guess about meaning -- it lowercases, trims, and drops anything after
+    the first qualifier separator. "Low - no issue raised" and "low" become the
+    same bucket; "Payment / billing" is left alone because the slash has no
+    space-dash shape around it.
+    """
+    text = (label or "").strip()
+    if not text:
+        return text
+    cut = _QUALIFIER_RE.split(text, 1)[0]
+    return cut.strip().strip(".").lower() or text.lower()
+
+
+def _grouping_for(counts: "Counter") -> Optional[Dict[str, Any]]:
+    """A viable grouping, or None when normalising does not actually help."""
+    if not counts:
+        return None
+    grouped: "Counter" = Counter()
+    for label, n in counts.items():
+        grouped[group_label(label)] += n
+    total = sum(counts.values())
+    if len(grouped) >= len(counts):
+        return None                      # nothing collapsed
+    if len(grouped) > _GROUP_MAX_LABELS:
+        return None                      # still not a closed set
+    covered = sum(n for _, n in grouped.most_common(_GROUP_MAX_LABELS))
+    if total and covered / total < _GROUP_MIN_COVERAGE:
+        return None
+    return {"counts": grouped, "unique": len(grouped), "collapsed_from": len(counts)}
+
+
+def json_key_profiles(results: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
+    """Decide which output keys are closed sets that stats can count.
+
+    A key is selectable when the same few labels keep coming back (true/false,
+    low/medium/high, a short category list). If almost every row invents its
+    own wording, it is free text and cannot be selected.
+    """
+    rows = results or []
+    n = len(rows)
+    profiles: List[Dict[str, Any]] = []
+    for key in keys or []:
+        labels: List[Optional[str]] = []
+        lengths: List[int] = []
+        for row in rows:
+            label = _stat_value_label(_row_json_flat(row).get(key))
+            labels.append(label)
+            if label is not None:
+                lengths.append(len(label))
+        present = [lab for lab in labels if lab is not None]
+        missing = n - len(present)
+        counts = Counter(present)
+        unique = len(counts)
+        avg_len = (sum(lengths) / len(lengths)) if lengths else 0
+        boolish = bool(present) and all(lab in ("true", "false") for lab in present)
+        present_n = len(present)
+        unique_ratio = (unique / present_n) if present_n else 0
+
+        selectable = False
+        reason = ""
+        if not present:
+            reason = "No values in this batch"
+        elif boolish:
+            selectable = True
+        elif unique <= 1:
+            selectable = True
+        elif unique > 24:
+            reason = f"{unique} different values"
+        elif present_n >= 8 and unique_ratio > 0.5:
+            reason = f"almost every row is different ({unique} of {present_n})"
+        elif avg_len > 70 and unique > 6:
+            reason = "free-text answers"
+        else:
+            selectable = True
+
+        # Models decorate category answers: escalation_risk came back as 101
+        # spellings of three values. Counting "Low - no issue raised" apart
+        # from "low" is wrong however few spellings there are, so grouping is
+        # tried on every key -- _grouping_for returns None unless it genuinely
+        # collapses labels into a closed set, which leaves real categories like
+        # "Payment / billing" untouched. Every raw spelling is still reported.
+        grouping = None if boolish else _grouping_for(counts)
+        if grouping:
+            selectable = True
+            reason = ""
+
+        def _rows_of(source: "Counter") -> List[Dict[str, Any]]:
+            return [
+                {"label": label, "count": count, "pct": (count / n * 100) if n else 0}
+                for label, count in source.most_common()
+            ]
+
+        profiles.append({
+            "key": key,
+            "selectable": selectable,
+            "reason": reason,
+            "unique": grouping["unique"] if grouping else unique,
+            "raw_unique": unique,
+            "grouped": bool(grouping),
+            "collapsed_from": grouping["collapsed_from"] if grouping else 0,
+            "missing": missing,
+            "present": present_n,
+            "boolish": boolish,
+            "values": _rows_of(grouping["counts"]) if grouping else _rows_of(counts),
+            "raw_values": _rows_of(counts),
+        })
+    return profiles
 
 
 def _coerce_bool(value: Any) -> Optional[bool]:
@@ -255,23 +422,46 @@ def filter_results_by_json(
     filter_keys: Optional[List[str]],
     filter_vals: Optional[List[str]],
 ) -> List[int]:
+    """Rows matching every key=value pair. Any value, not only true/false.
+
+    Booleans keep their old behaviour so existing links still work. Anything
+    else is matched on the same label the stats page counts -- including the
+    tidied bucket, so filtering on `low` finds the rows that said
+    "Low - no issue raised".
+    """
     keys = filter_keys or []
     vals = filter_vals or []
     filters = []
     for key, val in zip(keys, vals):
         key = (key or "").strip()
-        val = (val or "").strip().lower()
-        if key and val in ("true", "false"):
-            filters.append((key, val == "true"))
+        val = (val or "").strip()
+        if key and val:
+            filters.append((key, val))
     if not filters:
         return list(range(len(results)))
 
+    # Whether a key needed tidying is a property of the whole batch, so work it
+    # out once rather than per row.
+    grouped_keys = {
+        p["key"] for p in json_key_profiles(results, [k for k, _ in filters]) if p.get("grouped")
+    }
+
     matched = []
     for i, row in enumerate(results):
-        flat = row.get("_llm_json_flat", {}) or {}
+        flat = _row_json_flat(row)
         ok = True
         for key, target in filters:
-            if _coerce_bool(flat.get(key)) is not target:
+            low = target.lower()
+            if low in ("true", "false"):
+                if _coerce_bool(flat.get(key)) is not (low == "true"):
+                    ok = False
+                    break
+                continue
+            label = _stat_value_label(flat.get(key))
+            if label is None:
+                ok = False
+                break
+            if (group_label(label) if key in grouped_keys else label) != target:
                 ok = False
                 break
         if ok:

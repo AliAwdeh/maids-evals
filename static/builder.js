@@ -712,7 +712,7 @@
       name.textContent = k;
       const val = document.createElement("div");
       val.className = "col-val";
-      val.textContent = v == null ? "" : String(v);
+      val.textContent = v == null ? "" : String(v).replace(/\\n/g, "\n").replace(/\\t/g, "\t");
       block.appendChild(name);
       block.appendChild(val);
       host.appendChild(block);

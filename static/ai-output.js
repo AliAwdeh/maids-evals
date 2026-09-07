@@ -51,8 +51,24 @@
     } else {
       cls += " jt-str";
       text = String(value);
+      if (text === "") text = '""';
     }
     return el("span", cls, text);
+  }
+
+  function preferredPretty() {
+    try {
+      return localStorage.getItem("maids-ai-pretty") !== "0";
+    } catch (_) {
+      return true;
+    }
+  }
+
+  function rememberPretty(pretty) {
+    try {
+      localStorage.setItem("maids-ai-pretty", pretty ? "1" : "0");
+    } catch (_) {}
+    document.documentElement.dataset.aiPretty = pretty ? "1" : "0";
   }
 
   function isContainer(v) {
@@ -83,6 +99,7 @@
         const details = el("details", "jt-node");
         const summary = el("summary");
         summary.appendChild(el("span", "jt-key", key));
+        summary.appendChild(el("span", "jt-sep", ": "));
         summary.appendChild(el("span", "jt-preview", previewCount(val)));
         details.appendChild(summary);
         details.appendChild(renderNode(val));
@@ -90,6 +107,7 @@
       } else {
         const row = el("div", "jt-row");
         row.appendChild(el("span", "jt-key", key));
+        row.appendChild(el("span", "jt-sep", ": "));
         row.appendChild(isContainer(val) ? el("span", "jt-val jt-empty", Array.isArray(val) ? "[ ]" : "{ }") : scalarSpan(val));
         wrap.appendChild(row);
       }
@@ -126,6 +144,7 @@
   function buildViewer(raw, parsed, mode) {
     const viewer = el("div", "ai-output__viewer");
     const bar = el("div", "ai-output__bar");
+    const sharedToggle = mode === "list";
 
     let badgeCls = "ai-output__badge";
     let badgeText;
@@ -148,29 +167,44 @@
     pre.textContent = raw || "(empty)";
     rawView.appendChild(pre);
 
+    const setView = (pretty) => {
+      if (prettyView) {
+        prettyView.hidden = !pretty;
+        rawView.hidden = pretty;
+      }
+      viewer.querySelectorAll(".ai-output__seg button").forEach((btn) => {
+        btn.classList.toggle("is-active", btn.dataset.view === (pretty ? "pretty" : "raw"));
+      });
+    };
+    viewer._setPretty = setView;
+
     if (parsed.ok) {
       prettyView = el("div", "ai-output__view ai-output__view--pretty");
       prettyView.appendChild(renderNode(parsed.value));
       body.appendChild(prettyView);
       body.appendChild(rawView);
-      rawView.hidden = true;
+      setView(preferredPretty());
 
-      const seg = el("div", "ai-output__seg");
-      const bPretty = el("button", "is-active", "Pretty");
-      const bRaw = el("button", null, "Raw");
-      bPretty.type = "button";
-      bRaw.type = "button";
-      const setView = (pretty) => {
-        prettyView.hidden = !pretty;
-        rawView.hidden = pretty;
-        bPretty.classList.toggle("is-active", pretty);
-        bRaw.classList.toggle("is-active", !pretty);
-      };
-      bPretty.addEventListener("click", () => setView(true));
-      bRaw.addEventListener("click", () => setView(false));
-      seg.appendChild(bPretty);
-      seg.appendChild(bRaw);
-      bar.appendChild(seg);
+      if (!sharedToggle) {
+        const seg = el("div", "ai-output__seg");
+        const bPretty = el("button", preferredPretty() ? "is-active" : "", "Pretty");
+        const bRaw = el("button", preferredPretty() ? "" : "is-active", "Raw");
+        bPretty.type = "button";
+        bRaw.type = "button";
+        bPretty.dataset.view = "pretty";
+        bRaw.dataset.view = "raw";
+        bPretty.addEventListener("click", () => {
+          rememberPretty(true);
+          setView(true);
+        });
+        bRaw.addEventListener("click", () => {
+          rememberPretty(false);
+          setView(false);
+        });
+        seg.appendChild(bPretty);
+        seg.appendChild(bRaw);
+        bar.appendChild(seg);
+      }
     } else {
       body.appendChild(rawView);
     }
@@ -188,8 +222,7 @@
     viewer.appendChild(bar);
     viewer.appendChild(body);
 
-    if (mode !== "disclosure") {
-      // Inline: clamp tall content and offer an expand toggle.
+    if (mode === "inline") {
       requestAnimationFrame(() => {
         if (body.scrollHeight > CLAMP_PX + 40) {
           body.classList.add("is-clamped");
@@ -215,7 +248,9 @@
     const label = labelNode ? labelNode.textContent : "";
     const mode = container.dataset.mode || "inline";
 
-    if (mode === "disclosure") {
+    if (mode === "list") {
+      container.appendChild(buildViewer(raw, parseMaybeJson(raw), "list"));
+    } else if (mode === "disclosure") {
       const parsedForBadge = parseMaybeJson(raw);
       const details = el("details", "ai-output__disclosure");
       const summary = el("summary");
@@ -253,9 +288,38 @@
   }
 
   window.initAiOutputs = initAll;
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => initAll());
-  } else {
+  window.setAiOutputPretty = function setAiOutputPretty(pretty) {
+    rememberPretty(pretty);
+    document.querySelectorAll(".ai-output__viewer").forEach((viewer) => {
+      if (typeof viewer._setPretty === "function") viewer._setPretty(pretty);
+    });
+    document.querySelectorAll("#answers-view [data-pretty]").forEach((btn) => {
+      btn.classList.toggle("is-active", (btn.getAttribute("data-pretty") === "1") === pretty);
+    });
+  };
+
+  function bindAnswersToggle() {
+    const bar = document.getElementById("answers-view");
+    if (!bar || bar.dataset.bound === "1") return;
+    bar.dataset.bound = "1";
+    const pretty = preferredPretty();
+    bar.querySelectorAll("[data-pretty]").forEach((btn) => {
+      btn.classList.toggle("is-active", (btn.getAttribute("data-pretty") === "1") === pretty);
+    });
+    bar.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-pretty]");
+      if (!btn) return;
+      window.setAiOutputPretty(btn.getAttribute("data-pretty") === "1");
+    });
+  }
+
+  function boot() {
     initAll();
+    bindAnswersToggle();
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
   }
 })();
