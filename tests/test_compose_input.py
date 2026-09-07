@@ -1,5 +1,10 @@
 from engine import INPUT_SECTION_HEADER, compose_model_input, display_cell, row_input_error, templates_have_placeholder
-from prompt_builder import _sanitize_generated
+from prompt_builder import (
+    ANSWER_SHAPE_RULES,
+    DISCOVER_INSTRUCTIONS,
+    GENERATE_INSTRUCTIONS,
+    _sanitize_generated,
+)
 
 
 def test_legacy_empty_input_is_instructions_only():
@@ -74,6 +79,36 @@ def test_sanitize_keeps_condition_columns_in_instructions():
     assert "{row_json}" not in clean_prompt
     assert "{nationality}" not in clean_input
     assert "{Messages}" in clean_input
+
+
+def test_sanitize_adds_boolean_justification_to_generated_schema():
+    prompt = (
+        "Classify the conversation.\n"
+        "Return ONLY this JSON object and nothing else.\n"
+        '{"needs_follow_up": false, "risk_level": "low"}'
+    )
+    clean_prompt, clean_input = _sanitize_generated(prompt, "", "Messages", ["Messages"])
+    assert '"needs_follow_up": false' in clean_prompt
+    assert '"needs_follow_up_justification": "Brief evidence-based justification."' in clean_prompt
+    assert '"risk_level": "low"' in clean_prompt
+    assert "For every boolean field" in clean_prompt
+    assert clean_input == "Messages:\n{Messages}"
+
+
+def test_sanitize_does_not_duplicate_existing_boolean_justification():
+    prompt = (
+        "Return ONLY this JSON object and nothing else.\n"
+        '{"is_relevant": true, "is_relevant_justification": "The message asks about maids.cc."}'
+    )
+    clean_prompt, _ = _sanitize_generated(prompt, "Messages:\n{Messages}", "Messages", ["Messages"])
+    assert clean_prompt.count("is_relevant_justification") == 1
+
+
+def test_builder_ai_contract_mentions_boolean_justifications_and_known_categories():
+    assert "<boolean_key>_justification" in ANSWER_SHAPE_RULES
+    assert "predefined values" in ANSWER_SHAPE_RULES
+    assert "<field>_justification" in DISCOVER_INSTRUCTIONS
+    assert "Allowed values" in GENERATE_INSTRUCTIONS
 
 
 def test_display_cell_turns_escaped_breaks_into_real_ones():

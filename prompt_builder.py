@@ -1,5 +1,6 @@
 """Guided analysis-prompt builder. Thin two-call orchestration on the user's LLM."""
 
+import json
 import random
 import re
 from typing import Any, Dict, List, Optional
@@ -16,6 +17,16 @@ DEEP_READY_COVERAGE = 85
 
 TOOL_LIMITS = """
 You can ONLY write or update an analysis prompt (instructions + input template). You cannot edit the spreadsheet, add columns, join rows, run the batch, or use any other tool. If needed data is missing, say the user should add a column to the file — do not invent a join or a lookup.
+"""
+
+ANSWER_SHAPE_RULES = """
+Answer-shape rules:
+- Prefer boolean fields for yes/no checks, flags, violations, compliance findings, and "did this happen?" answers.
+- Every boolean field MUST have a sibling explanation field named exactly <boolean_key>_justification. The justification must be a short evidence-based sentence explaining why the boolean is true or false.
+- Do not output bare booleans without their justification fields. The prompt fixer relies on those explanations later to understand why a row passed or failed.
+- For non-boolean categorical fields, use a closed set of predefined values whenever the values are known (for example low/medium/high/unclear, or relevant/irrelevant/unclear). State the allowed values in the instructions and in the JSON example.
+- If a useful categorical field does not have known allowed values from the goal, sample, column meanings, or user answers, ask what values it should use before writing the prompt.
+- Use free-text fields only for explanations, evidence, and short summaries, not for values that should be counted or filtered later.
 """
 
 DISCOVER_INSTRUCTIONS = TOOL_LIMITS + """You help a non-technical person plan an analysis of spreadsheet rows.
@@ -39,15 +50,17 @@ Rules:
 - Guess column meanings from the sample, even if the user already labeled some.
 - condition_columns: short scalar columns used as IF/THEN rules in the instructions (nationality, status, skill, channel, plan type). Exact spreadsheet names only. Never the main content column.
 - If a condition column is already clear from its name or sample values (e.g. a column of Filipino/Kenyan/Indian), do NOT ask about it.
-- Ask only when a column is unclear OR a rule the user mentioned cannot be mapped to a column. AT MOST 3 questions. Prefer 0.
+- Ask only when a column is unclear, a rule the user mentioned cannot be mapped to a column, OR a categorical output field's allowed values are not clear. AT MOST 3 questions. Prefer 0.
 - suggested_fields should be 3–8 short snake_case keys for NEW analysis answers only.
+- Prefer boolean suggested_fields for yes/no checks, and include the matching <field>_justification field in suggested_fields.
+- If you suggest a non-boolean categorical field, only do it when its allowed values are obvious from the user's goal, answers, or sample; otherwise ask what values it should use.
 - Never suggest echoing a column that already exists (no id, row_id, conversation id, or any input column). Those stay on the row at export.
 - Each spreadsheet row is analyzed ON ITS OWN. The runner cannot group, join, or stitch rows that share a Client Id, Contract Id, Conversation Id, or any other key. Do not ask whether to combine rows into a journey. If the user wants journey-level scoring, tell them in the approach that they must pre-merge those rows in the spreadsheet; the tool cannot do it.
 - Do not write the analysis prompt yet.
 - Do not mention tokens, schemas, or APIs.
 - Use maids.cc vocabulary from the company notes (CC, MV, PTC, Enchanters, Resolvers, prospect vs client vs maid).
 - Never treat prices, salaries, counts, ratings, or nationality availability from those notes as facts.
-"""
+""" + ANSWER_SHAPE_RULES
 
 DEEP_DISCOVER_INSTRUCTIONS = TOOL_LIMITS + """You help a non-technical person plan an EXTENSIVE analysis prompt with multiple conditions.
 
@@ -75,11 +88,11 @@ Rules:
 - Ask 1–5 NEW questions this round. Never repeat a previous question. Stop asking when ready.
 - Each spreadsheet row is analyzed ON ITS OWN. The runner cannot group or stitch rows by Client Id, Contract Id, Conversation Id, or any other key. NEVER ask whether to combine related rows into a customer journey. If journey-level scoring is wanted, say in the approach that the sheet must already have one row per journey.
 - If a scalar column is already clear (name + sample values), do not ask about it — put it in condition_columns.
-- Ask about unclear columns, missing thresholds the user mentioned, edge cases, and which outcomes to flag.
+- Ask about unclear columns, missing thresholds the user mentioned, edge cases, which outcomes to flag, and any categorical output whose allowed values are not already clear.
 - Never ask the user to invent volatile company figures (prices, salaries, nationality availability). If a rule needs a number, ask them to type the rule they want, or say it must come from the owning source.
-- suggested_fields: NEW analysis keys only. Never echo input columns.
+- suggested_fields: NEW analysis keys only. Prefer boolean checks with matching <field>_justification fields. Never echo input columns.
 - Use maids.cc vocabulary. Do not write the analysis prompt yet.
-"""
+""" + ANSWER_SHAPE_RULES
 
 GENERATE_INSTRUCTIONS = TOOL_LIMITS + """You write TWO pieces for a spreadsheet analysis: instructions, and a separate input-data template.
 
@@ -114,10 +127,16 @@ Hard rules:
 - Do not put identifier columns (Id, row_id, conversation id) in either part as something to output, and do not put them in the instructions unless a rule truly needs them.
 - Output JSON must be EXPLICIT. Include a literal JSON object with every key and a sample value type, then say: Return ONLY this JSON object and nothing else.
 - JSON must be strictly FLAT: top-level keys only, scalar values (string, number, or boolean). No nested objects. Avoid arrays.
+- Prefer boolean fields for checks and flags. Every boolean key in the JSON object MUST be followed by a string key named <boolean_key>_justification that explains the evidence for that true/false value in one sentence.
+- For categorical fields that are not boolean, write an "Allowed values:" rule with the complete closed set when those values are known.
+- If the allowed values are NOT known from the goal, answers or sample, do not invent a set and do not leave the field open. You cannot ask a question at this stage. Do one of these instead, in order of preference:
+    1. Reframe it as one or more booleans with their _justification fields.
+    2. Use a closed set you can defend from the sample, always including "unclear", and add a line saying the values need confirming with the person who asked.
+  An open-ended category produces a different wording on every row and cannot be counted or filtered afterwards.
 - Do NOT ask the model to output any field that already exists in the input. Results are joined back to the input row on export. Output only NEW analysis fields.
 - Use maids.cc vocabulary when it fits. Never write specific prices, salaries, counts, ratings, or nationality availability from company notes as if they were facts — if the USER gave a threshold in their goal or answers, you MAY write that user-supplied rule.
 - Keep instructions specific. Deep / extensive plans may be longer (up to ~120 lines) when several conditions are needed.
-"""
+""" + ANSWER_SHAPE_RULES
 
 
 def _parse_agent_json(text: str) -> Dict[str, Any]:
@@ -215,6 +234,10 @@ _PASSTHROUGH_KEY = re.compile(
     r"^(id|row_id|rowid|conversation_id|chat_id|ticket_id|message_id|uuid)$",
     re.I,
 )
+_BOOLEAN_JUSTIFICATION_RULE = (
+    "For every boolean field, include the matching *_justification field and "
+    "explain the evidence for the true/false decision in one sentence."
+)
 
 
 def _placeholders(text: str) -> List[str]:
@@ -250,6 +273,86 @@ def _default_input_template(content_column: str, extra: Optional[List[str]] = No
     return "\n".join(lines)
 
 
+def _json_object_spans(text: str) -> List[tuple[int, int]]:
+    spans: List[tuple[int, int]] = []
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text or ""):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                spans.append((start, i + 1))
+                start = -1
+    return spans
+
+
+def _ensure_boolean_justifications(prompt: str) -> str:
+    """Add missing justification siblings to every flat JSON example in a draft.
+
+    The model-facing instructions already ask for this; this is the final
+    safety pass. It is scoped to spans that parse as a JSON object, so
+    placeholders like {Messages} are never touched.
+
+    Every object is visited, not just the last one. A prompt commonly carries
+    more than one -- the output schema plus an illustrative row -- and stopping
+    at the first parseable object meant the schema went unfixed whenever an
+    example happened to sit after it.
+    """
+    text = prompt or ""
+    # Whether the prompt explains the rule has to be judged before we start
+    # inserting the word ourselves.
+    already_explains = "justification" in text.lower()
+    changed_any = False
+
+    # Reverse order keeps the earlier spans' offsets valid as we splice.
+    for start, end in reversed(_json_object_spans(text)):
+        snippet = text[start:end]
+        if '":' not in snippet:
+            continue
+        try:
+            obj = json.loads(snippet)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        existing = {str(k).lower() for k in obj}
+        out: Dict[str, Any] = {}
+        changed = False
+        for key, value in obj.items():
+            out[key] = value
+            if not isinstance(value, bool):
+                continue
+            justification_key = f"{key}_justification"
+            if justification_key.lower() in existing:
+                continue
+            out[justification_key] = "Brief evidence-based justification."
+            changed = True
+        if not changed:
+            continue
+        text = text[:start] + json.dumps(out, ensure_ascii=False, indent=2) + text[end:]
+        changed_any = True
+
+    if changed_any and not already_explains:
+        text = text.rstrip() + "\n\n" + _BOOLEAN_JUSTIFICATION_RULE
+    return text
+
+
 def _sanitize_generated(
     prompt: str,
     input_template: str,
@@ -280,6 +383,7 @@ def _sanitize_generated(
     input_template = _default_input_template(content_column, extra)
     prompt = re.sub(r"[ \t]+\n", "\n", prompt)
     prompt = re.sub(r"\n{3,}", "\n\n", prompt).strip()
+    prompt = _ensure_boolean_justifications(prompt)
     return prompt, input_template.strip()
 
 
@@ -576,7 +680,8 @@ Return JSON only:
 
 If the user did not ask to change the prompt, leave updated_prompt empty.
 Keep JSON output flat if you edit the prompt. Never use {row_json}. Put the conversation column only in input_template.
-"""
+If you edit a prompt, prefer boolean output fields for yes/no checks and make every boolean key include a sibling <boolean_key>_justification string key. For categorical fields, define the allowed values when known; if the user asks for a category and the values are unclear, ask what values it should use instead of inventing them.
+""" + ANSWER_SHAPE_RULES
 
 NO_EDIT_ACCESS = (
     "You don't have edit access. Clone this prompt to keep the conversation and edit your copy, "

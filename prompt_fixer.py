@@ -15,6 +15,9 @@ Composition (read-only facts about how the runner works):
 - Large conversation/content belongs only in input_template, never mid-instructions.
 - Short condition columns (nationality, status, skill) MAY stay in the instructions as {ColumnName} next to IF/THEN rules.
 - JSON output must stay strictly flat (top-level keys, scalar values). No nested objects.
+- Prefer boolean fields for yes/no checks, flags, violations, compliance findings, and "did this happen?" answers.
+- Every boolean output key must have a sibling string key named exactly <boolean_key>_justification that explains the evidence for the true/false value in one sentence. Do not leave bare booleans without justification.
+- For non-boolean categorical output keys, keep or add a closed "Allowed values:" rule when the values are known. Do not invent categories that are not supported by the prompt, notes, or user-provided context.
 - Do not ask the model to echo input identifiers (Id, row_id, conversation id). Results are joined to the input row on export.
 - You edit INSTRUCTIONS only. Treat input_template as read-only context. Do not pull big data into the instructions.
 """
@@ -42,6 +45,8 @@ Your job:
 - If the notes conflict with each other, say so in the problem field instead of
   siding with whichever row you read last.
 - Do not rewrite the prompt.
+- Treat missing boolean justifications as a real repair target: if an answer contains a boolean with no explanation field, identify that as weakening later review/fixing.
+- For categorical fields, check whether the prompt defines allowed values. If reviewer notes show confusion caused by open-ended categories, identify the missing or unclear value set.
 - Keep maids.cc vocabulary (CC, MV, PTC, Enchanters, Resolvers, prospect vs client vs maid).
 - Never add prices, salaries, counts, ratings, or nationality availability from company notes.
 
@@ -74,6 +79,8 @@ Rules:
 - Keep maids.cc terms consistent. Do not bake volatile figures (prices, salaries, counts, ratings, nationality availability) into the prompt.
 - Edit INSTRUCTIONS only. Do not move the conversation into the instructions, reintroduce {row_json}, or add id-echo fields.
 - If JSON is requested, keep it an explicit, strictly flat object.
+- If the prompt uses booleans, ensure every boolean key in the explicit JSON object has a matching <boolean_key>_justification string key. Add a short rule telling the model to justify both true and false decisions with row evidence.
+- If the prompt uses categorical fields and the allowed values are known from the prompt or notes, state those values explicitly. If the allowed values are not known, leave a concise warning/risk instead of inventing them.
 
 Return JSON only:
 {
@@ -100,6 +107,8 @@ Reject or trim edits that:
 - Weaken a rule that other notes still need
 - Introduce prices, salaries, counts, ratings, or nationality availability from company notes
 - Pull large input data into the instructions, add {row_json}, or ask the model to echo input identifiers
+- Remove a boolean field's matching *_justification key, or add a boolean key without a justification sibling
+- Invent categorical allowed values that the prompt, notes, or user-provided context do not support
 
 For each pattern, weigh how many rows support it against how much of the prompt
 the edit changes. A one-row pattern that rewrites a core rule is the most
@@ -328,6 +337,56 @@ def _ask(provider: str, api_key: str, model: str, system: str, payload: str) -> 
         return _parse_agent_json(retry)
 
 
+
+_BOOL_KEY_RE = re.compile(r'"([A-Za-z0-9_.\- ]+)"\s*:\s*(true|false)\b', re.I)
+_ANY_KEY_RE = re.compile(r'"([A-Za-z0-9_.\- ]+)"\s*:')
+
+
+def _boolean_keys(text: str) -> set:
+    return {m.group(1).strip() for m in _BOOL_KEY_RE.finditer(text or "")}
+
+
+def _declared_keys(text: str) -> set:
+    return {m.group(1).strip() for m in _ANY_KEY_RE.finditer(text or "")}
+
+
+def contract_warnings(original: str, proposed: str) -> List[str]:
+    """Check the edit kept the shape the whole loop depends on.
+
+    Every boolean is supposed to carry a <key>_justification sibling, because
+    that sentence is the evidence the Analyst reads on the next pass. The
+    Critic is told to reject edits that break it, but the Critic is the same
+    kind of model that just wrote the edit -- this check does not depend on it.
+    """
+    warnings: List[str] = []
+    before_keys = _declared_keys(original)
+    after_keys = _declared_keys(proposed)
+
+    bare = sorted(
+        key for key in _boolean_keys(proposed)
+        if f"{key}_justification" not in after_keys
+    )
+    if bare:
+        listed = ", ".join(f"{k}" for k in bare[:4])
+        warnings.append(
+            f"{len(bare)} boolean field(s) in the new prompt have no matching "
+            f"_justification ({listed}). Without that sentence the next fix has no "
+            "evidence for why a row passed or failed."
+        )
+
+    dropped = sorted(
+        key for key in before_keys
+        if key.endswith("_justification") and key not in after_keys
+    )
+    if dropped:
+        listed = ", ".join(dropped[:4])
+        warnings.append(
+            f"The edit removed {len(dropped)} justification field(s) that the old "
+            f"prompt asked for ({listed}). Put them back before saving."
+        )
+    return warnings
+
+
 def improve_prompt(
     provider: str,
     api_key: str,
@@ -409,6 +468,7 @@ def improve_prompt(
     unchanged = str(final_prompt).strip() == str(prompt).strip()
     if not unchanged:
         warnings.extend(overfit_warnings(prompt, final_prompt, examples, analysis))
+        warnings.extend(contract_warnings(prompt, final_prompt))
     if unchanged:
         # A summary that claims edits next to an identical prompt is how a
         # no-op gets saved as agent_eval.v2 and trusted as a real improvement.
